@@ -1,0 +1,116 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap');
+
+:root {
+  --bg:       #0a0a0b;
+  --surface:  #111113;
+  --border:   #222226;
+  --border-hi:#2e2e35;
+  --text:     #e8e8ed;
+  --muted:    #6b6b78;
+  --amber:    #f59e0b;
+  --amber-dim:#78490a;
+  --indigo:   #6366f1;
+  --indigo-dim:#1e1f4a;
+  --green:    #10b981;
+  --green-dim:#052e1c;
+  --red:      #ef4444;
+  --red-dim:  #2d0707;
+}
+
+html { font-family: 'IBM Plex Sans', sans-serif; background: var(--bg); color: var(--text); }
+* { box-sizing: border-box; }
+
+/* scrollbar */
+::-webkit-scrollbar { width: 4px; }
+::-webkit-scrollbar-track { background: var(--bg); }
+::-webkit-scrollbar-thumb { background: var(--border-hi); border-radius: 2px; }
+
+@layer components {
+  .mono { font-family: 'IBM Plex Mono', monospace; }
+
+  .surface {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+  }
+
+  .btn-primary {
+    @apply px-5 py-2.5 rounded-md text-sm font-semibold transition-all duration-150;
+    background: var(--indigo);
+    color: #fff;
+  }
+  .btn-primary:hover:not(:disabled) { background: #818cf8; }
+  .btn-primary:disabled { opacity: 0.35; cursor: not-allowed; }
+
+  .btn-ghost {
+    @apply px-4 py-2 rounded-md text-sm font-medium transition-all duration-150;
+    border: 1px solid var(--border-hi);
+    color: var(--muted);
+  }
+  .btn-ghost:hover { color: var(--text); border-color: #44444f; }
+
+  .field {
+    @apply w-full px-3 py-2.5 rounded-md text-sm transition-colors duration-150;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    color: var(--text);
+    outline: none;
+  }
+  .field::placeholder { color: var(--muted); }
+  .field:focus { border-color: var(--indigo); }
+
+  .chip {
+    @apply text-xs px-2 py-0.5 rounded font-mono;
+    background: var(--border);
+    color: var(--muted);
+    border: 1px solid transparent;
+  }
+  .chip-amber {
+    background: var(--amber-dim);
+    color: var(--amber);
+    border-color: #92520d;
+  }
+  .chip-green {
+    background: var(--green-dim);
+    color: var(--green);
+    border-color: #065f46;
+  }
+  .chip-indigo {
+    background: var(--indigo-dim);
+    color: #a5b4fc;
+    border-color: #312e81;
+  }
+
+  /* Step progress bar */
+  .step-dot {
+    @apply w-7 h-7 rounded-full flex items-center justify-center text-xs font-semibold transition-all duration-300;
+  }
+  .step-active  { background: var(--indigo); color: #fff; }
+  .step-done    { background: var(--green);  color: #fff; }
+  .step-pending { background: var(--border); color: var(--muted); }
+
+  .cursor-blink {
+    display: inline-block;
+    width: 2px;
+    height: 1em;
+    background: var(--indigo);
+    margin-left: 1px;
+    vertical-align: text-bottom;
+    animation: blink 1s step-end infinite;
+  }
+  @keyframes blink { 0%,100%{opacity:1} 50%{opacity:0} }
+
+  .fade-in {
+    animation: fadeIn 0.25s ease-out forwards;
+  }
+  @keyframes fadeIn { from{opacity:0;transform:translateY(6px)} to{opacity:1;transform:none} }
+
+  .slide-in {
+    animation: slideIn 0.3s cubic-bezier(.16,1,.3,1) forwards;
+  }
+  @keyframes slideIn { from{opacity:0;transform:translateX(-8px)} to{opacity:1;transform:none} }
+}

@@ -1,0 +1,162 @@
+"""
+CVonRAG — models.py
+All Pydantic v2 schemas used across the API and internal pipeline.
+
+The Content/Style Firewall is enforced at the data layer:
+  • CoreFact  = CONTENT  (user-supplied, immutable)
+  • StyleExemplar = STYLE  (RAG-retrieved, never used as content)
+"""
+
+from __future__ import annotations
+from enum import StrEnum
+from typing import Annotated, Any
+
+from pydantic import BaseModel, Field, field_validator, model_validator
+
+
+# ── Enums ─────────────────────────────────────────────────────────────────────
+
+class RoleType(StrEnum):
+    SOFTWARE_ENGINEERING = "software_engineering"
+    DATA_SCIENCE         = "data_science"
+    ML_ENGINEERING       = "ml_engineering"
+    PRODUCT_MANAGEMENT   = "product_management"
+    QUANT_FINANCE        = "quant_finance"
+    GENERAL              = "general"
+
+
+class JDTone(StrEnum):
+    HIGHLY_QUANTITATIVE = "highly_quantitative"
+    ENGINEERING_FOCUSED = "engineering_focused"
+    LEADERSHIP_FOCUSED  = "leadership_focused"
+    RESEARCH_FOCUSED    = "research_focused"
+    BALANCED            = "balanced"
+
+
+class StreamEventType(StrEnum):
+    TOKEN    = "token"
+    BULLET   = "bullet"
+    METADATA = "metadata"
+    ERROR    = "error"
+    DONE     = "done"
+
+
+# ── User content (Phase 1 input) ──────────────────────────────────────────────
+
+class CoreFact(BaseModel):
+    """One atomic fact. All fields are CONTENT — never altered by the pipeline."""
+
+    fact_id: str = Field(..., description="Stable ID for traceability")
+    text: str    = Field(..., min_length=5)
+    tools: list[str]   = Field(default_factory=list)
+    metrics: list[str] = Field(default_factory=list)
+    outcome: str       = Field(default="")
+
+    @field_validator("text")
+    @classmethod
+    def strip_whitespace(cls, v: str) -> str:
+        return v.strip()
+
+
+class ProjectData(BaseModel):
+    project_id: str
+    title: str
+    core_facts: Annotated[list[CoreFact], Field(min_length=1, max_length=12)]
+
+
+class FormattingConstraints(BaseModel):
+    target_char_limit: Annotated[int, Field(ge=60, le=300)] = 130
+    tolerance: Annotated[int, Field(ge=1, le=5)]            = 2
+    bullet_prefix: str                                       = "•"
+    max_bullets_per_project: Annotated[int, Field(ge=1, le=8)] = 3
+
+    @property
+    def lower_bound(self) -> int:
+        return self.target_char_limit - self.tolerance
+
+    @property
+    def upper_bound(self) -> int:
+        return self.target_char_limit + self.tolerance
+
+
+# ── Top-level API request ─────────────────────────────────────────────────────
+
+class OptimizationRequest(BaseModel):
+    job_description: Annotated[str, Field(min_length=50, max_length=10_000)]
+    projects: Annotated[list[ProjectData], Field(min_length=1, max_length=20)]
+    constraints: FormattingConstraints = Field(default_factory=FormattingConstraints)
+    target_role_type: RoleType = RoleType.GENERAL
+    total_bullets_requested: Annotated[int, Field(ge=1, le=50)] | None = None
+
+    @model_validator(mode="after")
+    def cap_total_bullets(self) -> "OptimizationRequest":
+        if self.total_bullets_requested is None:
+            self.total_bullets_requested = (
+                len(self.projects) * self.constraints.max_bullets_per_project
+            )
+        return self
+
+
+# ── Internal pipeline models ──────────────────────────────────────────────────
+
+class ScoredFact(BaseModel):
+    fact: CoreFact
+    project_id: str
+    relevance_score: float = Field(ge=0.0, le=1.0)
+    matched_jd_keywords: list[str] = Field(default_factory=list)
+
+
+class StyleExemplar(BaseModel):
+    """STYLE ONLY — content from this object must never appear in output."""
+    exemplar_id: str
+    text: str
+    role_type: RoleType
+    similarity_score: float = Field(ge=0.0, le=1.0)
+    uses_separator: str | None = None
+    uses_arrow: bool = False
+    uses_abbreviations: list[str] = Field(default_factory=list)
+    sentence_structure: str | None = None
+
+
+class BulletDraft(BaseModel):
+    text: str
+    char_count: int
+    iteration: int
+    within_tolerance: bool
+    source_fact_ids: list[str]
+
+
+class BulletMetadata(BaseModel):
+    bullet_index: int
+    project_id: str
+    source_fact_ids: list[str]
+    char_count: int
+    char_target: int
+    iterations_taken: int
+    exemplar_ids_used: list[str]
+    jd_tone: JDTone
+    within_tolerance: bool
+
+
+class GeneratedBullet(BaseModel):
+    text: str
+    metadata: BulletMetadata
+
+
+# ── SSE envelope ─────────────────────────────────────────────────────────────
+
+class StreamChunk(BaseModel):
+    event_type: StreamEventType
+    data: Any = None
+    error_message: str | None = None
+
+
+# ── Health ────────────────────────────────────────────────────────────────────
+
+class HealthResponse(BaseModel):
+    status: str = "ok"
+    model: str
+    qdrant_connected: bool
+    collection_exists: bool
+    vector_count: int = 0
+    ollama_ok: bool = False
