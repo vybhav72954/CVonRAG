@@ -1,116 +1,378 @@
+/* ── Fonts (must precede @tailwind) ──────────────────────────────────────── */
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap');
+
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
 
-@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap');
-
+/* ── Design Tokens ──────────────────────────────────────────────────────── */
 :root {
-  --bg:       #0a0a0b;
-  --surface:  #111113;
-  --border:   #222226;
-  --border-hi:#2e2e35;
-  --text:     #e8e8ed;
-  --muted:    #6b6b78;
-  --amber:    #f59e0b;
-  --amber-dim:#78490a;
-  --indigo:   #6366f1;
-  --indigo-dim:#1e1f4a;
-  --green:    #10b981;
-  --green-dim:#052e1c;
-  --red:      #ef4444;
-  --red-dim:  #2d0707;
+  --bg:           #06060a;
+  --bg-subtle:    #0c0c14;
+  --surface:      rgba(14, 14, 24, 0.65);
+  --surface-solid:#0e0e18;
+  --glass:        rgba(18, 18, 32, 0.55);
+  --glass-border: rgba(255, 255, 255, 0.06);
+  --glass-hover:  rgba(255, 255, 255, 0.09);
+  --border:       rgba(255, 255, 255, 0.06);
+  --border-hi:    rgba(255, 255, 255, 0.1);
+  --text:         #e8eaf0;
+  --text-secondary: #a0a3b1;
+  --muted:        #5c5f73;
+  --accent:       #7c3aed;
+  --accent-light: #a78bfa;
+  --accent-dim:   rgba(124, 58, 237, 0.12);
+  --accent-glow:  rgba(124, 58, 237, 0.25);
+  --cyan:         #06b6d4;
+  --cyan-dim:     rgba(6, 182, 212, 0.1);
+  --green:        #10b981;
+  --green-dim:    rgba(16, 185, 129, 0.1);
+  --green-border: rgba(16, 185, 129, 0.25);
+  --amber:        #f59e0b;
+  --amber-dim:    rgba(245, 158, 11, 0.1);
+  --amber-border: rgba(245, 158, 11, 0.25);
+  --red:          #ef4444;
+  --red-dim:      rgba(239, 68, 68, 0.1);
+  --red-border:   rgba(239, 68, 68, 0.25);
+  --gradient-primary: linear-gradient(135deg, #7c3aed 0%, #06b6d4 100%);
+  --gradient-text:    linear-gradient(135deg, #a78bfa 0%, #22d3ee 100%);
+  --gradient-surface: linear-gradient(145deg, rgba(124, 58, 237, 0.05) 0%, rgba(6, 182, 212, 0.03) 100%);
+  --radius:       12px;
+  --radius-lg:    16px;
+  --radius-sm:    8px;
 }
 
-html { font-family: 'IBM Plex Sans', sans-serif; background: var(--bg); color: var(--text); }
+/* ── Base ────────────────────────────────────────────────────────────────── */
+html {
+  font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
 * { box-sizing: border-box; }
 
-/* scrollbar */
-::-webkit-scrollbar { width: 4px; }
-::-webkit-scrollbar-track { background: var(--bg); }
-::-webkit-scrollbar-thumb { background: var(--border-hi); border-radius: 2px; }
+::selection {
+  background: rgba(124, 58, 237, 0.35);
+  color: #fff;
+}
 
+/* ── Scrollbar ──────────────────────────────────────────────────────────── */
+::-webkit-scrollbar { width: 5px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.08); border-radius: 10px; }
+::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,0.14); }
+
+/* ── Component Layer ────────────────────────────────────────────────────── */
 @layer components {
-  .mono { font-family: 'IBM Plex Mono', monospace; }
 
-  .surface {
+  /* ── Typography ─────────────────────────────────────────────────────── */
+  .mono { font-family: 'JetBrains Mono', monospace; }
+
+  .gradient-text {
+    background: var(--gradient-text);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+  }
+
+  /* ── Glass panels ──────────────────────────────────────────────────── */
+  .glass {
+    background: var(--glass);
+    backdrop-filter: blur(20px) saturate(1.3);
+    -webkit-backdrop-filter: blur(20px) saturate(1.3);
+    border: 1px solid var(--glass-border);
+    border-radius: var(--radius);
+  }
+
+  .glass-lg {
+    background: var(--glass);
+    backdrop-filter: blur(24px) saturate(1.4);
+    -webkit-backdrop-filter: blur(24px) saturate(1.4);
+    border: 1px solid var(--glass-border);
+    border-radius: var(--radius-lg);
+  }
+
+  .glass:hover, .glass-lg:hover {
+    border-color: var(--glass-hover);
+  }
+
+  .surface-card {
     background: var(--surface);
     border: 1px solid var(--border);
-    border-radius: 8px;
+    border-radius: var(--radius);
+    position: relative;
+    overflow: hidden;
   }
 
-  .btn-primary {
-    @apply px-5 py-2.5 rounded-md text-sm font-semibold transition-all duration-150;
-    background: var(--indigo);
-    color: #fff;
+  .surface-card::before {
+    content: '';
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    height: 1px;
+    background: var(--gradient-primary);
+    opacity: 0.4;
   }
-  .btn-primary:hover:not(:disabled) { background: #818cf8; }
-  .btn-primary:disabled { opacity: 0.35; cursor: not-allowed; }
+
+  /* ── Buttons ───────────────────────────────────────────────────────── */
+  .btn-primary {
+    @apply px-6 py-3 rounded-xl text-sm font-semibold transition-all duration-200;
+    background: var(--gradient-primary);
+    color: #fff;
+    border: none;
+    position: relative;
+    overflow: hidden;
+    box-shadow: 0 0 20px rgba(124, 58, 237, 0.2), 0 0 60px rgba(124, 58, 237, 0.06);
+  }
+  .btn-primary::before {
+    content: '';
+    position: absolute;
+    inset: 0;
+    background: linear-gradient(135deg, rgba(255,255,255,0.12) 0%, transparent 50%);
+    opacity: 0;
+    transition: opacity 0.2s;
+  }
+  .btn-primary:hover:not(:disabled)::before { opacity: 1; }
+  .btn-primary:hover:not(:disabled) {
+    box-shadow: 0 0 30px rgba(124, 58, 237, 0.35), 0 0 80px rgba(124, 58, 237, 0.1);
+    transform: translateY(-1px);
+  }
+  .btn-primary:active:not(:disabled) {
+    transform: translateY(0);
+  }
+  .btn-primary:disabled {
+    opacity: 0.3;
+    cursor: not-allowed;
+    box-shadow: none;
+  }
 
   .btn-ghost {
-    @apply px-4 py-2 rounded-md text-sm font-medium transition-all duration-150;
+    @apply px-4 py-2 rounded-lg text-sm font-medium transition-all duration-200;
+    background: transparent;
     border: 1px solid var(--border-hi);
-    color: var(--muted);
+    color: var(--text-secondary);
   }
-  .btn-ghost:hover { color: var(--text); border-color: #44444f; }
+  .btn-ghost:hover {
+    color: var(--text);
+    border-color: rgba(255,255,255,0.16);
+    background: rgba(255,255,255,0.03);
+  }
 
+  /* ── Form fields ───────────────────────────────────────────────────── */
   .field {
-    @apply w-full px-3 py-2.5 rounded-md text-sm transition-colors duration-150;
-    background: var(--bg);
+    @apply w-full px-4 py-3 rounded-xl text-sm transition-all duration-200;
+    background: rgba(255,255,255,0.03);
     border: 1px solid var(--border);
     color: var(--text);
     outline: none;
+    font-family: 'Inter', sans-serif;
   }
   .field::placeholder { color: var(--muted); }
-  .field:focus { border-color: var(--indigo); }
-
-  .chip {
-    @apply text-xs px-2 py-0.5 rounded font-mono;
-    background: var(--border);
-    color: var(--muted);
-    border: 1px solid transparent;
+  .field:focus {
+    border-color: var(--accent);
+    box-shadow: 0 0 0 3px var(--accent-dim), 0 0 20px rgba(124, 58, 237, 0.08);
+    background: rgba(255,255,255,0.04);
   }
-  .chip-amber {
-    background: var(--amber-dim);
-    color: var(--amber);
-    border-color: #92520d;
+
+  /* ── Chips / Badges ────────────────────────────────────────────────── */
+  .chip {
+    @apply text-xs px-2.5 py-1 rounded-full font-medium;
+    background: rgba(255,255,255,0.05);
+    color: var(--text-secondary);
+    border: 1px solid transparent;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.6875rem;
+  }
+  .chip-accent {
+    background: var(--accent-dim);
+    color: var(--accent-light);
+    border-color: rgba(124, 58, 237, 0.2);
   }
   .chip-green {
     background: var(--green-dim);
     color: var(--green);
-    border-color: #065f46;
+    border-color: var(--green-border);
+  }
+  .chip-amber {
+    background: var(--amber-dim);
+    color: var(--amber);
+    border-color: var(--amber-border);
   }
   .chip-indigo {
-    background: var(--indigo-dim);
-    color: #a5b4fc;
-    border-color: #312e81;
+    background: var(--accent-dim);
+    color: var(--accent-light);
+    border-color: rgba(124, 58, 237, 0.2);
+  }
+  .chip-cyan {
+    background: var(--cyan-dim);
+    color: var(--cyan);
+    border-color: rgba(6, 182, 212, 0.2);
   }
 
-  /* Step progress bar */
+  /* ── Step progress ─────────────────────────────────────────────────── */
   .step-dot {
-    @apply w-7 h-7 rounded-full flex items-center justify-center text-xs font-semibold transition-all duration-300;
+    @apply w-8 h-8 rounded-full flex items-center justify-center text-xs font-semibold transition-all duration-400;
+    font-family: 'JetBrains Mono', monospace;
   }
-  .step-active  { background: var(--indigo); color: #fff; }
-  .step-done    { background: var(--green);  color: #fff; }
-  .step-pending { background: var(--border); color: var(--muted); }
+  .step-active {
+    background: var(--gradient-primary);
+    color: #fff;
+    box-shadow: 0 0 16px var(--accent-glow), 0 0 40px rgba(124, 58, 237, 0.1);
+  }
+  .step-done {
+    background: var(--green);
+    color: #fff;
+    box-shadow: 0 0 12px rgba(16, 185, 129, 0.2);
+  }
+  .step-pending {
+    background: rgba(255,255,255,0.05);
+    color: var(--muted);
+    border: 1px solid var(--border);
+  }
 
+  /* ── Cursor blink ──────────────────────────────────────────────────── */
   .cursor-blink {
     display: inline-block;
     width: 2px;
-    height: 1em;
-    background: var(--indigo);
-    margin-left: 1px;
+    height: 1.1em;
+    background: var(--accent);
+    margin-left: 2px;
     vertical-align: text-bottom;
+    border-radius: 1px;
+    box-shadow: 0 0 8px var(--accent-glow);
     animation: blink 1s step-end infinite;
   }
   @keyframes blink { 0%,100%{opacity:1} 50%{opacity:0} }
 
+  /* ── Animations ────────────────────────────────────────────────────── */
   .fade-in {
-    animation: fadeIn 0.25s ease-out forwards;
+    animation: fadeIn 0.4s cubic-bezier(.16,1,.3,1) forwards;
   }
-  @keyframes fadeIn { from{opacity:0;transform:translateY(6px)} to{opacity:1;transform:none} }
+  @keyframes fadeIn {
+    from { opacity: 0; transform: translateY(12px); }
+    to   { opacity: 1; transform: none; }
+  }
 
   .slide-in {
-    animation: slideIn 0.3s cubic-bezier(.16,1,.3,1) forwards;
+    animation: slideIn 0.35s cubic-bezier(.16,1,.3,1) forwards;
   }
-  @keyframes slideIn { from{opacity:0;transform:translateX(-8px)} to{opacity:1;transform:none} }
+  @keyframes slideIn {
+    from { opacity: 0; transform: translateX(-12px); }
+    to   { opacity: 1; transform: none; }
+  }
+
+  .scale-in {
+    animation: scaleIn 0.3s cubic-bezier(.16,1,.3,1) forwards;
+  }
+  @keyframes scaleIn {
+    from { opacity: 0; transform: scale(0.95); }
+    to   { opacity: 1; transform: scale(1); }
+  }
+
+  /* ── Drop zone rotating border ─────────────────────────────────────── */
+  .dropzone-wrapper {
+    position: relative;
+    padding: 2px;
+    border-radius: var(--radius-lg);
+    background: var(--border);
+    transition: all 0.3s ease;
+  }
+  .dropzone-wrapper.active {
+    background: conic-gradient(from var(--angle, 0deg),
+      var(--accent), var(--cyan), var(--accent));
+    animation: rotateBorder 3s linear infinite;
+  }
+  @property --angle {
+    syntax: '<angle>';
+    initial-value: 0deg;
+    inherits: false;
+  }
+  @keyframes rotateBorder {
+    to { --angle: 360deg; }
+  }
+  .dropzone-inner {
+    background: var(--surface-solid);
+    border-radius: calc(var(--radius-lg) - 2px);
+    padding: 3.5rem 2rem;
+    text-align: center;
+    cursor: pointer;
+    transition: background 0.2s;
+  }
+  .dropzone-inner:hover {
+    background: rgba(14, 14, 24, 0.85);
+  }
+
+  /* ── Floating icon animation ───────────────────────────────────────── */
+  .float-icon {
+    animation: floatY 3s ease-in-out infinite;
+  }
+  @keyframes floatY {
+    0%, 100% { transform: translateY(0); }
+    50%      { transform: translateY(-6px); }
+  }
+
+  /* ── Pulse glow (AI processing) ────────────────────────────────────── */
+  .pulse-glow {
+    animation: pulseGlow 2s ease-in-out infinite;
+  }
+  @keyframes pulseGlow {
+    0%, 100% { box-shadow: 0 0 10px var(--accent-dim); }
+    50%      { box-shadow: 0 0 25px var(--accent-glow), 0 0 50px rgba(124, 58, 237, 0.08); }
+  }
+
+  /* ── Spinner ───────────────────────────────────────────────────────── */
+  .spinner {
+    width: 18px;
+    height: 18px;
+    border: 2px solid rgba(124, 58, 237, 0.2);
+    border-top-color: var(--accent);
+    border-radius: 50%;
+    animation: spin 0.8s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  /* ── Stagger children ──────────────────────────────────────────────── */
+  .stagger > * {
+    opacity: 0;
+    animation: fadeIn 0.4s cubic-bezier(.16,1,.3,1) forwards;
+  }
+  .stagger > *:nth-child(1) { animation-delay: 0.04s; }
+  .stagger > *:nth-child(2) { animation-delay: 0.08s; }
+  .stagger > *:nth-child(3) { animation-delay: 0.12s; }
+  .stagger > *:nth-child(4) { animation-delay: 0.16s; }
+  .stagger > *:nth-child(5) { animation-delay: 0.20s; }
+  .stagger > *:nth-child(6) { animation-delay: 0.24s; }
+  .stagger > *:nth-child(7) { animation-delay: 0.28s; }
+  .stagger > *:nth-child(8) { animation-delay: 0.32s; }
+
+  /* ── Score ring (SVG-based) ────────────────────────────────────────── */
+  .score-ring {
+    transform: rotate(-90deg);
+    transition: stroke-dashoffset 0.8s cubic-bezier(.16,1,.3,1);
+  }
+
+  /* ── Gradient border card ──────────────────────────────────────────── */
+  .gradient-border {
+    position: relative;
+    background: var(--surface);
+    border-radius: var(--radius);
+    overflow: hidden;
+  }
+  .gradient-border::before {
+    content: '';
+    position: absolute;
+    top: 0; left: 0; right: 0;
+    height: 2px;
+    background: var(--gradient-primary);
+    opacity: 0.6;
+  }
+
+  /* ── Background dots ───────────────────────────────────────────────── */
+  .bg-dots {
+    background-image: radial-gradient(rgba(255,255,255,0.03) 1px, transparent 1px);
+    background-size: 24px 24px;
+  }
 }
