@@ -1,5 +1,5 @@
 /**
- * CVonRAG — API client
+ * CVonRAG — api.js
  * Set VITE_API_URL in frontend/.env (defaults to http://localhost:8000)
  */
 
@@ -8,9 +8,9 @@ const BASE = import.meta.env.VITE_API_URL ?? 'http://localhost:8000';
 // ── SSE frame parser ──────────────────────────────────────────────────────────
 
 function parseSSEFrames(buffer) {
-  const frames = buffer.split('\n\n');
+  const frames    = buffer.split('\n\n');
   const remaining = frames.pop() ?? '';
-  const events = [];
+  const events    = [];
   for (const frame of frames) {
     if (!frame.trim()) continue;
     let eventType = 'message', dataLine = '';
@@ -25,7 +25,7 @@ function parseSSEFrames(buffer) {
   return { events, remaining };
 }
 
-// ── POST /parse — file upload → SSE project stream ───────────────────────────
+// ── POST /parse — upload CV → SSE project stream ──────────────────────────────
 
 /**
  * Upload a .docx or .pdf and stream back parsed projects.
@@ -67,6 +67,26 @@ export async function parseCV(file, callbacks = {}) {
       if (type === 'error')    onError?.(data.error_message ?? 'Unknown error');
     }
   }
+}
+
+// ── POST /recommend — score all projects against JD ───────────────────────────
+
+/**
+ * Ask the AI which projects are most relevant to this JD.
+ * @param {{ projects: Array, job_description: string, top_k: number }} payload
+ * @returns {Promise<{ recommendations: Array } | null>}
+ */
+export async function recommendProjects(payload) {
+  const resp = await fetch(`${BASE}/recommend`, {
+    method:  'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body:    JSON.stringify(payload),
+  });
+  if (!resp.ok) {
+    const detail = await resp.json().catch(() => ({ detail: resp.statusText }));
+    throw new Error(detail.detail ?? `HTTP ${resp.status}`);
+  }
+  return resp.json();
 }
 
 // ── POST /optimize — JSON → SSE bullet stream ─────────────────────────────────
