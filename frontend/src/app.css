@@ -214,7 +214,7 @@ html {
 
   /* ── Step progress ─────────────────────────────────────────────────── */
   .step-dot {
-    @apply w-8 h-8 rounded-full flex items-center justify-center text-xs font-semibold transition-all duration-400;
+    @apply w-8 h-8 rounded-full flex items-center justify-center text-xs font-semibold transition-all duration-300;
     font-family: 'JetBrains Mono', monospace;
   }
   .step-active {

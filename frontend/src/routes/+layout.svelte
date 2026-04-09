@@ -75,9 +75,9 @@
 
   <!-- ── Footer ───────────────────────────────────────────────────────── -->
   <footer class="app-footer">
-    <span>Powered by RAG + Local LLM</span>
+    <span>Powered by Hopes, Dreams and Prayers</span>
     <span class="footer-dot">·</span>
-    <span>Built with Qdrant + Ollama</span>
+    <span>Built with Coffee, Regret and No Sleep</span>
   </footer>
 </div>
 
