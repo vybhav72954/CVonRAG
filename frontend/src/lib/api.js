@@ -5,6 +5,9 @@
 
 const BASE = import.meta.env.VITE_API_URL ?? 'http://localhost:8000';
 
+/** Default timeout for non-streaming requests (ms). */
+const REQUEST_TIMEOUT_MS = 90_000;
+
 // ── SSE frame parser ──────────────────────────────────────────────────────────
 
 function parseSSEFrames(buffer) {
@@ -20,9 +23,34 @@ function parseSSEFrames(buffer) {
     }
     if (!dataLine) continue;
     try { events.push({ type: eventType, data: JSON.parse(dataLine) }); }
-    catch { /* skip malformed */ }
+    catch { /* skip malformed SSE frame */ }
   }
   return { events, remaining };
+}
+
+/**
+ * Read an SSE stream safely. Catches mid-stream disconnects and fires onError.
+ * @param {Response} resp
+ * @param {(event: {type: string, data: any}) => void} onEvent
+ * @param {(msg: string) => void} [onError]
+ */
+async function readSSEStream(resp, onEvent, onError) {
+  const reader  = resp.body.getReader();
+  const decoder = new TextDecoder();
+  let   buffer  = '';
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const { events, remaining } = parseSSEFrames(buffer);
+      buffer = remaining;
+      for (const ev of events) onEvent(ev);
+    }
+  } catch (err) {
+    onError?.(`Stream interrupted: ${err.message}`);
+  }
 }
 
 // ── POST /parse — upload CV → SSE project stream ──────────────────────────────
@@ -50,43 +78,47 @@ export async function parseCV(file, callbacks = {}) {
     return;
   }
 
-  const reader  = resp.body.getReader();
-  const decoder = new TextDecoder();
-  let   buffer  = '';
-
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
-    const { events, remaining } = parseSSEFrames(buffer);
-    buffer = remaining;
-    for (const { type, data } of events) {
-      if (type === 'progress') onProgress?.(data);
-      if (type === 'project')  onProject?.(data);
-      if (type === 'done')     onDone?.(data);
-      if (type === 'error')    onError?.(data.error_message ?? 'Unknown error');
-    }
-  }
+  await readSSEStream(resp, ({ type, data }) => {
+    if (type === 'progress') onProgress?.(data);
+    if (type === 'project')  onProject?.(data);
+    if (type === 'done')     onDone?.(data);
+    if (type === 'error')    onError?.(data.error_message ?? 'Unknown error');
+  }, onError);
 }
 
 // ── POST /recommend — score all projects against JD ───────────────────────────
 
 /**
  * Ask the AI which projects are most relevant to this JD.
+ * Times out after REQUEST_TIMEOUT_MS to prevent infinite hangs.
  * @param {{ projects: Array, job_description: string, top_k: number }} payload
  * @returns {Promise<{ recommendations: Array } | null>}
  */
 export async function recommendProjects(payload) {
-  const resp = await fetch(`${BASE}/recommend`, {
-    method:  'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body:    JSON.stringify(payload),
-  });
-  if (!resp.ok) {
-    const detail = await resp.json().catch(() => ({ detail: resp.statusText }));
-    throw new Error(detail.detail ?? `HTTP ${resp.status}`);
+  const controller = new AbortController();
+  const timer      = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+
+  try {
+    const resp = await fetch(`${BASE}/recommend`, {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify(payload),
+      signal:  controller.signal,
+    });
+    clearTimeout(timer);
+
+    if (!resp.ok) {
+      const detail = await resp.json().catch(() => ({ detail: resp.statusText }));
+      throw new Error(detail.detail ?? `HTTP ${resp.status}`);
+    }
+    return resp.json();
+  } catch (err) {
+    clearTimeout(timer);
+    if (err.name === 'AbortError') {
+      throw new Error('JD analysis timed out — the AI took too long. Try again or shorten the JD.');
+    }
+    throw err;
   }
-  return resp.json();
 }
 
 // ── POST /optimize — JSON → SSE bullet stream ─────────────────────────────────
@@ -116,23 +148,12 @@ export async function optimizeResume(payload, callbacks = {}) {
     return;
   }
 
-  const reader  = resp.body.getReader();
-  const decoder = new TextDecoder();
-  let   buffer  = '';
-
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
-    const { events, remaining } = parseSSEFrames(buffer);
-    buffer = remaining;
-    for (const { type, data } of events) {
-      if (type === 'token')  onToken?.(data.data);
-      if (type === 'bullet') onBullet?.(data.data);
-      if (type === 'done')   onDone?.(data.data);
-      if (type === 'error')  onError?.(data.error_message ?? 'Unknown error');
-    }
-  }
+  await readSSEStream(resp, ({ type, data }) => {
+    if (type === 'token')  onToken?.(data.data);
+    if (type === 'bullet') onBullet?.(data.data);
+    if (type === 'done')   onDone?.(data.data);
+    if (type === 'error')  onError?.(data.error_message ?? 'Unknown error');
+  }, onError);
 }
 
 /** GET /health */

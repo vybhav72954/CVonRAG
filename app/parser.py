@@ -239,7 +239,7 @@ async def extract_facts(project: RawProject, http_client=None) -> list[CoreFact]
 async def parse_and_stream(
     file_bytes: bytes,
     filename:   str,
-    http_client,
+    http_client=None,        # DEPRECATED — kept for backward compat, unused
 ) -> AsyncGenerator[tuple[str, dict], None]:
     """
     Full parse pipeline as an async generator.
