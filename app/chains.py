@@ -72,7 +72,7 @@ async def _ollama_chat(
     if system:
         payload["system"] = system
 
-    r = await get_http().post(f"{settings.ollama_base_url}/api/chat", json=payload)
+    r = await get_http().post(f"{settings.ollama_base_url}/api/chat", json=payload, timeout=120.0)
     r.raise_for_status()
     return r.json()["message"]["content"].strip()
 

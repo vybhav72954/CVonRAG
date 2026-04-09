@@ -29,10 +29,14 @@ from app.models import (
     GeneratedBullet,
     HealthResponse,
     OptimizationRequest,
+    ProjectRecommendation,
+    RecommendRequest,
+    RecommendResponse,
     StreamChunk,
     StreamEventType,
 )
 from app.parser import parse_and_stream
+from app.recommender import recommend_projects as _do_recommend
 from app.vector_store import (
     collection_info,
     ensure_collection_exists,
@@ -199,6 +203,48 @@ async def parse_cv(file: UploadFile = File(...)):
             yield f"event: {event_type}\ndata: {json.dumps(data)}\n\n"
 
     return StreamingResponse(_stream(), media_type="text/event-stream", headers=_SSE_HEADERS)
+
+
+# ── Project recommendation ────────────────────────────────────────────────────
+
+@app.post(
+    "/recommend",
+    response_model=RecommendResponse,
+    tags=["generation"],
+    summary="Score and rank all uploaded projects against a job description",
+)
+async def recommend(body: RecommendRequest):
+    """
+    **Project recommendation endpoint.**
+
+    Given all projects parsed from a CV + a job description, returns every
+    project scored (0–1) against the JD, with the top `top_k` marked as
+    recommended and a one-sentence reason explaining why.
+
+    Call this after `/parse` and before `/optimize`. The frontend uses the
+    response to pre-select the best projects and show reasoning to the user.
+    """
+    recs = await _do_recommend(
+        projects=body.projects,
+        job_description=body.job_description,
+        top_k=body.top_k,
+    )
+    return RecommendResponse(
+        recommendations=[
+            ProjectRecommendation(
+                project_id    =r.project_id,
+                title         =r.title,
+                score         =r.score,
+                rank          =r.rank,
+                reason        =r.reason,
+                matched_skills=r.matched_skills,
+                top_metrics   =r.top_metrics,
+                recommended   =r.recommended,
+                core_facts    =r.core_facts,
+            )
+            for r in recs
+        ]
+    )
 
 
 # ── Bullet generation ─────────────────────────────────────────────────────────

@@ -151,6 +151,32 @@ class StreamChunk(BaseModel):
     error_message: str | None = None
 
 
+# ── Project recommendation ───────────────────────────────────────────────────
+
+class ProjectRecommendation(BaseModel):
+    """One project scored and ranked against a JD."""
+    project_id:     str
+    title:          str
+    score:          float = Field(ge=0.0, le=1.0)
+    rank:           int
+    reason:         str
+    matched_skills: list[str] = Field(default_factory=list)
+    top_metrics:    list[str] = Field(default_factory=list)
+    recommended:    bool      = True
+    core_facts:     list[Any] = Field(default_factory=list)
+
+
+class RecommendRequest(BaseModel):
+    job_description: Annotated[str, Field(min_length=50, max_length=10_000)]
+    projects:        Annotated[list[ProjectData], Field(min_length=1, max_length=20)]
+    top_k:           Annotated[int, Field(ge=1, le=6)] = 3
+
+
+class RecommendResponse(BaseModel):
+    recommendations: list[ProjectRecommendation]
+    jd_summary:      str = ""   # brief LLM-generated JD summary for UI display
+
+
 # ── Health ────────────────────────────────────────────────────────────────────
 
 class HealthResponse(BaseModel):
