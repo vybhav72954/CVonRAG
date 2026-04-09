@@ -165,7 +165,7 @@ class TestExtractFacts:
             "outcome":  "reduced forecasting error",
         }])
         project = RawProject("Time Series", ["Built SARIMA model reducing RMSE to 0.250"])
-        with patch("app.parser._ollama_chat", new=_mock_llm(raw)):
+        with patch("app.chains._ollama_chat", new=_mock_llm(raw)):
             facts = await extract_facts(project)
 
         assert len(facts) == 1
@@ -184,7 +184,7 @@ class TestExtractFacts:
             "outcome":  "",
         }])
         project = RawProject("My Project", ["RMSE 0.250, AUC 0.944"])
-        with patch("app.parser._ollama_chat", new=_mock_llm(raw)):
+        with patch("app.chains._ollama_chat", new=_mock_llm(raw)):
             facts = await extract_facts(project)
 
         assert "RMSE=0.250" in facts[0].metrics
@@ -196,7 +196,7 @@ class TestExtractFacts:
             "Built a model with 87% accuracy using XGBoost",
             "Reduced latency by 40ms at p99",
         ])
-        with patch("app.parser._ollama_chat", new=_mock_llm("not valid json {{")):
+        with patch("app.chains._ollama_chat", new=_mock_llm("not valid json {{")):
             facts = await extract_facts(project)
 
         assert len(facts) >= 1
@@ -205,7 +205,7 @@ class TestExtractFacts:
     @pytest.mark.asyncio
     async def test_network_error_falls_back(self):
         project = RawProject("Network Project", ["Built something with RMSE 0.5"])
-        with patch("app.parser._ollama_chat", new=AsyncMock(side_effect=Exception("connection refused"))):
+        with patch("app.chains._ollama_chat", new=AsyncMock(side_effect=Exception("connection refused"))):
             facts = await extract_facts(project)
 
         assert len(facts) >= 1
@@ -214,7 +214,7 @@ class TestExtractFacts:
     async def test_non_list_response_falls_back(self):
         raw     = json.dumps({"error": "unexpected object"})
         project = RawProject("My Project", ["A bullet with 42% improvement"])
-        with patch("app.parser._ollama_chat", new=_mock_llm(raw)):
+        with patch("app.chains._ollama_chat", new=_mock_llm(raw)):
             facts = await extract_facts(project)
 
         assert len(facts) >= 1
@@ -227,7 +227,7 @@ class TestExtractFacts:
             {"fact_id": "p-3", "text": "Fact three","tools": [],        "metrics": [],       "outcome": ""},
         ])
         project = RawProject("Multi", ["b1", "b2", "b3"])
-        with patch("app.parser._ollama_chat", new=_mock_llm(raw)):
+        with patch("app.chains._ollama_chat", new=_mock_llm(raw)):
             facts = await extract_facts(project)
 
         assert len(facts) == 3
@@ -239,7 +239,7 @@ class TestExtractFacts:
         raw = json.dumps([
             {"fact_id": "bp-1", "text": "Summary fact", "tools": [], "metrics": ["5%"], "outcome": ""}
         ])
-        with patch("app.parser._ollama_chat", new=_mock_llm(raw)):
+        with patch("app.chains._ollama_chat", new=_mock_llm(raw)):
             facts = await extract_facts(project)
         assert len(facts) >= 1
 
@@ -247,7 +247,7 @@ class TestExtractFacts:
     async def test_fence_stripped_before_json_parse(self):
         raw = '```json\n[{"fact_id":"f-1","text":"Test fact","tools":[],"metrics":[],"outcome":""}]\n```'
         project = RawProject("Fenced", ["Test fact"])
-        with patch("app.parser._ollama_chat", new=_mock_llm(raw)):
+        with patch("app.chains._ollama_chat", new=_mock_llm(raw)):
             facts = await extract_facts(project)
         assert len(facts) == 1
         assert facts[0].fact_id == "f-1"
@@ -292,7 +292,7 @@ class TestParseAndStream:
     async def test_single_project_yields_progress_project_done(self):
         with patch("app.parser.parse_docx_bytes",
                    return_value=[RawProject("Test Project", ["Built a model with RMSE=0.5"])]), \
-             patch("app.parser._ollama_chat", new=_mock_llm_for_extract(1)):
+             patch("app.chains._ollama_chat", new=_mock_llm_for_extract(1)):
             events = [(et, d) async for et, d in
                       parse_and_stream(b"x", "test.docx")]
 
@@ -307,7 +307,7 @@ class TestParseAndStream:
         with patch("app.parser.parse_docx_bytes", return_value=[
             RawProject("Project A", ["Bullet with 87% metric"]),
             RawProject("Project B", ["Bullet with RMSE 0.5"]),
-        ]), patch("app.parser._ollama_chat", new=_mock_llm_for_extract(1)):
+        ]), patch("app.chains._ollama_chat", new=_mock_llm_for_extract(1)):
             events = [(et, d) async for et, d in
                       parse_and_stream(b"x", "test.docx")]
 
@@ -321,7 +321,7 @@ class TestParseAndStream:
         with patch("app.parser.parse_docx_bytes", return_value=[
             RawProject("P1", ["b1 with 42%"]),
             RawProject("P2", ["b2 with 87%"]),
-        ]), patch("app.parser._ollama_chat", new=_mock_llm_for_extract(2)):
+        ]), patch("app.chains._ollama_chat", new=_mock_llm_for_extract(2)):
             events = [(et, d) async for et, d in
                       parse_and_stream(b"x", "test.docx")]
 
@@ -333,7 +333,7 @@ class TestParseAndStream:
     async def test_project_event_contains_valid_project_data(self):
         with patch("app.parser.parse_docx_bytes",
                    return_value=[RawProject("Cuckoo.ai", ["Bullet with 87% improvement"])]), \
-             patch("app.parser._ollama_chat", new=_mock_llm_for_extract(1)):
+             patch("app.chains._ollama_chat", new=_mock_llm_for_extract(1)):
             events = [(et, d) async for et, d in
                       parse_and_stream(b"x", "test.docx")]
 
@@ -348,7 +348,7 @@ class TestParseAndStream:
         """Even if LLM fails, project is yielded with fallback facts."""
         with patch("app.parser.parse_docx_bytes",
                    return_value=[RawProject("Resilient Project", ["A bullet with 50% improvement"])]), \
-             patch("app.parser._ollama_chat", new=AsyncMock(side_effect=Exception("LLM down"))):
+             patch("app.chains._ollama_chat", new=AsyncMock(side_effect=Exception("LLM down"))):
             events = [(et, d) async for et, d in
                       parse_and_stream(b"x", "test.docx")]
 
@@ -360,7 +360,7 @@ class TestParseAndStream:
     async def test_progress_events_precede_project_events(self):
         with patch("app.parser.parse_docx_bytes",
                    return_value=[RawProject("P1", ["b1 with metric 40%"])]), \
-             patch("app.parser._ollama_chat", new=_mock_llm_for_extract(1)):
+             patch("app.chains._ollama_chat", new=_mock_llm_for_extract(1)):
             events = [(et, d) async for et, d in
                       parse_and_stream(b"x", "test.docx")]
 
