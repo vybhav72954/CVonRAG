@@ -184,7 +184,7 @@ See [DEVELOPER.md §B](DEVELOPER.md#section-b--kaggle-h100-inference-recommended
 
 **Frontend network error** → check `frontend/.env` has `VITE_API_URL=http://localhost:8000`
 
-Full troubleshooting: [DEVELOPER.md §H](DEVELOPER.md#section-h--troubleshooting)
+Full troubleshooting: [DEVELOPER.md](docs/DEVELOPER.md#section-h--troubleshooting)
 
 ---
 
