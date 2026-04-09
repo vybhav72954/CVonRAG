@@ -1,34 +1,39 @@
 # CVonRAG
 
-**RAG-powered resume bullet optimizer. 100% local, 100% free - maybe, you never know.**
+**RAG-powered resume bullet optimizer. 100% local, 100% free.**
 
-Upload your CV or biodata, paste a job description, get 3–5 polished, character-count-validated bullets ready to paste. Numbers and metrics are preserved exactly. Style comes from a Gold Standard corpus of strong CV bullets retrieved via vector search.
+Upload your biodata, paste a job description, and the AI recommends which of your projects to highlight, then generates 3–5 polished, character-count-validated bullets, grouped by project and ready to paste.
 
 No OpenAI. No Anthropic. No paid APIs. Runs entirely on your machine.
 
 ---
 
-## How it works
+## What it does
 
 ```
-Your CV (.docx/.pdf)
-    ↓  parser extracts projects + facts
-    ↓  you select projects, optionally edit facts
-Job Description (pasted in browser)
-    ↓  LLM analyses JD tone + keywords
-    ↓  RAG retrieves style exemplars from Qdrant
-    ↓  5-phase pipeline: score → retrieve → generate → validate → stream
-3–5 bullets, char-count validated (±2), streamed live
+You upload:   your biodata (.docx or .pdf)
+              a job description (pasted in browser)
+
+System does:  extracts ALL your projects and facts automatically
+              scores every project against the JD (0–100% match)
+              recommends the best 2–3 with one-line reasoning
+              lets you override the selection
+              generates bullets grouped by project
+              validates each bullet to ±2 characters of your target
 ```
 
-**Stack:**
+Numbers are preserved exactly. RMSE=0.250 stays 0.250. The style comes from a curated Gold Standard corpus — never the content.
+
+---
+
+## Stack
+
 | Layer | Tool |
 |---|---|
-| LLM + Embeddings | Ollama + Qwen2.5:14b + nomic-embed-text |
+| LLM + Embeddings | Ollama + Qwen2.5 + nomic-embed-text |
 | Vector Store | Qdrant |
 | Backend | FastAPI + SSE streaming |
 | Frontend | SvelteKit + Tailwind |
-| Package manager | uv |
 
 ---
 
@@ -36,256 +41,150 @@ Job Description (pasted in browser)
 
 | Tool | Version | Install |
 |---|---|---|
-| Python | ≥ 3.12 | [python.org](https://python.org) |
-| uv | latest | `curl -LsSf https://astral.sh/uv/install.sh \| sh` |
-| Docker | latest | [docker.com](https://docker.com) |
-| Ollama | latest | [ollama.com](https://ollama.com/download) |
-| Node.js | ≥ 20 | [nodejs.org](https://nodejs.org) |
+| Python | 3.12+ | [python.org](https://python.org) |
+| uv | latest | `curl -LsSf https://astral.sh/uv/install.sh | sh` |
+| Docker | 24+ | [docker.com](https://docker.com) |
+| Ollama | latest | [ollama.com/download](https://ollama.com/download) |
+| Node.js | 20+ | [nodejs.org](https://nodejs.org) |
 
 ---
 
-## Getting started
+## Getting started (admin setup — run once)
 
-### Step 1 — Clone and install
+These steps are done by whoever runs the server. Users just open the browser.
+
+### 1. Install and configure
 
 ```bash
 git clone https://github.com/YOUR_USERNAME/cvonrag.git
 cd cvonrag
-
-uv venv
-source .venv/bin/activate      # Windows: .venv\Scripts\activate
+uv venv && source .venv/bin/activate
 uv pip install -e ".[dev]"
-
-cp .env.example .env           # defaults work for local dev — no changes needed
+cp .env.example .env    # defaults work for local dev
 ```
 
-### Step 2 — Start Ollama and pull models (one-time, ~8 GB)
+### 2. Start Qdrant
 
 ```bash
-ollama serve                   # in a separate terminal, or run as a daemon
-
-ollama pull qwen2.5:14b        # the generation model (~8 GB)
-ollama pull nomic-embed-text   # the embedding model (~300 MB)
-```
-
-If your machine has < 12 GB RAM, use `qwen2.5:7b` instead.
-Edit `OLLAMA_LLM_MODEL=qwen2.5:7b` in `.env`.
-
-### Step 3 — Start Qdrant
-
-```bash
-docker run -d -p 6333:6333 \
+docker run -d --name qdrant -p 6333:6333 \
   -v qdrant_storage:/qdrant/storage \
   qdrant/qdrant:v1.12.4
 ```
 
-### Step 4 — Start the backend
+### 3. Pull Ollama models
 
 ```bash
-# with venv activated:
-uvicorn app.main:app --reload --port 8000
+ollama serve
+
+# Pick based on your RAM:
+ollama pull qwen2.5:14b       # >= 12 GB free RAM
+# ollama pull qwen2.5:7b      # 8-12 GB free RAM
+
+ollama pull nomic-embed-text   # always — for embeddings
 ```
 
-Check it's alive: `curl http://localhost:8000/health`
+**Low VRAM?** See [DEVELOPER.md §B](DEVELOPER.md#section-b--kaggle-h100-inference-recommended-for-low-vram) — run inference on a free Kaggle H100 instead.
 
-### Step 5 — Seed the vector store
+### 4. Seed the style corpus (once)
 
-You need a folder of good CV PDFs — these are your style references.
-Any CVs with strong, quantified bullets work (IIT/IIM placement CVs, your peers' CVs, etc.).
+The system needs a collection of Gold Standard CVs to learn bullet style from. These are your curated CVs — users never upload or access them. They teach the system sentence structure and style patterns only; user content is never drawn from them.
 
 ```bash
 mkdir ~/good_cvs
-# copy some PDF CVs there
+# place 5–20 good CV PDFs here (IIT/IIM placement CVs, strong peers' CVs, etc.)
 
-# preview what will be extracted (dry run, no API calls)
-python scripts/ingest_pdfs.py --pdf_dir ~/good_cvs --dry_run
-
-# seed Qdrant
-python scripts/ingest_pdfs.py --pdf_dir ~/good_cvs
+python scripts/ingest_pdfs.py --pdf_dir ~/good_cvs --dry_run   # preview
+python scripts/ingest_pdfs.py --pdf_dir ~/good_cvs             # seed
 ```
 
-Verify: `curl http://localhost:8000/health` → `"vector_count"` should be > 0.
+Verify: `curl http://localhost:8000/health` → `"vector_count"` should be > 0. Do this once.
 
-You only need to do this once. Qdrant persists data in the Docker volume.
-
-### Step 6 — Start the frontend
+### 5. Start the backend and frontend
 
 ```bash
-cd frontend
-npm install
-npm run dev
-# → http://localhost:5173
+# Backend:
+uvicorn app.main:app --reload --port 8000
+
+# Frontend (in another terminal):
+cd frontend && npm install && npm run dev
+# -> http://localhost:5173
 ```
 
 ---
 
-## Using the app
+## User flow (what batchmates see)
 
-1. **Upload your CV** — drag and drop your `.docx` biodata or a `.pdf`.
-   Projects are extracted automatically. Numbers are preserved exactly (RMSE=0.250 stays 0.250).
+Users visit `http://localhost:5173` and:
 
-2. **Review and edit facts** — each project shows extracted facts with metrics highlighted in amber.
-   Editing is optional — generation doesn't wait for it.
+**Screen 1 — Upload CV**
+Drag and drop a `.docx` biodata or `.pdf`. All projects are extracted automatically. Metrics are highlighted in amber — they're preserved exactly. Editing facts is optional and non-blocking.
 
-3. **Paste the job description** — set role type, target character count (default 130 ±2), and max bullets per project.
+**Screen 2 — Paste JD → AI Recommendation**
+Paste the full job description, click "Analyse JD". The system scores every project against the JD and shows:
+- A ranked list with match percentage and one-line reasoning per project
+- The top 2–3 pre-selected, rest shown as "also available"
+- A toggle to override the selection
 
-4. **Get your bullets** — streamed live. Each bullet shows char count, tolerance badge, and a Copy button.
+Then click "Generate Bullets".
 
----
-
-## Running via Docker Compose (optional, for convenience)
-
-Once everything works locally, you can start the entire stack with one command:
-
-```bash
-docker compose up --build    # first time (~10–20 min to pull Ollama models)
-docker compose up            # subsequent runs
-```
-
-Services: FastAPI on :8000, Ollama on :11434, Qdrant on :6333.
+**Screen 3 — Results**
+Bullets stream live, grouped by project. Each bullet shows:
+- Character count and ±2 tolerance badge
+- Number of iterations taken to hit the target
+- Individual Copy button
+- Copy All at the top
 
 ---
 
 ## Running the tests
 
-No live services needed everything is mocked.
-
 ```bash
-pytest                        # 220 tests, all should pass
-pytest tests/test_parser.py   # just the parser tests
-pytest tests/test_api.py      # just the API endpoint tests
-pytest -x                     # stop on first failure
+pytest        # 243 tests, no live services needed, ~9 seconds
 ```
 
 ---
 
-## Project structure
+## Architecture: the 5-phase pipeline
 
 ```
-cvonrag/
-├── app/
-│   ├── config.py             ← all settings via env vars
-│   ├── models.py             ← Pydantic v2 schemas
-│   ├── chains.py             ← 5-phase RAG pipeline
-│   ├── vector_store.py       ← Qdrant + embeddings
-│   ├── parser.py             ← .docx/.pdf → structured facts
-│   └── main.py               ← FastAPI + /parse + /optimize endpoints
-│
-├── tests/                    ← 220 tests, all mocked
-│
-├── frontend/
-│   └── src/
-│       ├── routes/+page.svelte  ← 3-screen wizard UI
-│       ├── lib/api.js           ← SSE client for /parse and /optimize
-│       └── lib/stores.js        ← wizard state machine
-│
-├── scripts/
-│   ├── ingest_pdfs.py        ← seed Qdrant from a folder of PDFs (run once)
-│   └── parse_biodata.py      ← parse your .docx → OptimizationRequest JSON
-│
-├── kaggle_pipeline_test.py   ← standalone smoke test on Kaggle H100
-├── pyproject.toml
-├── Dockerfile
-├── docker-compose.yml
-└── DEVELOPER.md              ← full developer reference
+POST /parse
+  -> parser.py extracts projects + facts via LLM (SSE stream)
+
+POST /recommend
+  -> recommender.py scores projects vs JD
+  -> returns ranked list with match % and reasons
+
+POST /optimize
+  Phase 1: OptimizationRequest validated
+  Phase 2: SemanticMatcher — JD analysis + fact scoring
+  Phase 3: Qdrant — retrieve style exemplars (top-K by embedding similarity)
+  Phase 4: BulletAlchemist — generate + ±2 char-limit loop (up to 4 iterations)
+  Phase 5: SSE stream — tokens + bullets + metadata -> browser
 ```
+
+**Content/style firewall:** CoreFacts (your numbers, tools, outcomes) are immutable. StyleExemplars (from Qdrant) provide sentence patterns only. The two never mix.
 
 ---
 
-## The two local scripts
+## Low VRAM / best quality: Kaggle H100
 
-### `scripts/ingest_pdfs.py` — seed Qdrant (run once)
+If Ollama is slow or in low-VRAM mode, run the heavy inference on Kaggle's free H100 instead. Qwen2.5-72B in 4-bit quantisation gives noticeably better bullet quality than local 14b.
 
-Reads a folder of PDF CVs, extracts bullet points, uses Ollama to tag their style, and posts them to Qdrant. These become your style exemplars.
-
-```bash
-# Preview extraction without posting anything
-python scripts/ingest_pdfs.py --pdf_dir ~/good_cvs --dry_run
-
-# Seed Qdrant
-python scripts/ingest_pdfs.py --pdf_dir ~/good_cvs
-
-# Use a faster model for tagging (7b is fine here)
-python scripts/ingest_pdfs.py --pdf_dir ~/good_cvs --model qwen2.5:7b
-```
-
-### `scripts/parse_biodata.py` — parse your docx (terminal alternative to the UI)
-
-For power users who prefer the terminal. Parses your biodata docx, extracts facts via LLM, and either writes `request.json` or streams bullets directly.
-
-```bash
-# See what projects were detected
-python scripts/parse_biodata.py --docx Vybhav_Chaturvedi_Biodata.docx --list_projects
-
-# Select projects and stream bullets directly
-python scripts/parse_biodata.py \
-    --docx     Vybhav_Chaturvedi_Biodata.docx \
-    --jd_file  amazon_mle_jd.txt \
-    --projects 2,4 \
-    --stream
-```
-
----
-
-## About the Kaggle notebook
-
-`kaggle_pipeline_test.py` is a standalone smoke test you can run on Kaggle's free H100.
-
-**When to use it:** if your laptop doesn't have enough RAM to run `qwen2.5:14b` (~12 GB RAM needed), you can run the full pipeline on Kaggle instead. It loads Qwen2.5 via HuggingFace Transformers, runs the 5-phase pipeline end-to-end, and exports generated bullets to a CSV.
-
-**No training involved.** CVonRAG is pure RAG — it does not fine-tune or modify any model weights. Qwen2.5 is used as-is, via prompting. The H100 helps only for inference speed when the local machine is underpowered.
-
-**Setup:** kaggle.com → New Notebook → upload `kaggle_pipeline_test.py` → Accelerator: GPU T4 x2 or H100 → Internet: ON → Run All.
-
----
-
-## Environment variables
-
-Copy `.env.example` to `.env`. For local dev, the defaults work without changes.
-
-```env
-OLLAMA_BASE_URL=http://localhost:11434
-OLLAMA_LLM_MODEL=qwen2.5:14b          # change to qwen2.5:7b if low on RAM
-OLLAMA_EMBED_MODEL=nomic-embed-text
-QDRANT_URL=http://localhost:6333
-QDRANT_COLLECTION=gold_standard_cvs
-```
+See [DEVELOPER.md §B](DEVELOPER.md#section-b--kaggle-h100-inference-recommended-for-low-vram) for step-by-step.
 
 ---
 
 ## Troubleshooting
 
-**`ollama_ok: false` in /health**
-```bash
-curl http://localhost:11434/api/tags   # is Ollama running?
-ollama pull qwen2.5:14b               # are models pulled?
-```
+**`ollama_ok: false` in `/health`** → run `ollama serve` and `ollama pull qwen2.5:14b`
 
-**`qdrant_connected: false` in /health**
-```bash
-# Is the Qdrant container running?
-docker ps | grep qdrant
-# If not:
-docker run -d -p 6333:6333 -v qdrant_storage:/qdrant/storage qdrant/qdrant:v1.12.4
-```
+**`vector_count: 0`** → seed Qdrant: `python scripts/ingest_pdfs.py --pdf_dir ~/good_cvs`
 
-**Bullets outside ±2 character tolerance**
-Add `CHAR_LOOP_MAX_ITERATIONS=6` to `.env`. Or switch to `qwen2.5:14b` if on 7b.
+**Bullets outside ±2** → add `CHAR_LOOP_MAX_ITERATIONS=6` to `.env`
 
-**Frontend can't reach backend (CORS or network error)**
-Make sure `VITE_API_URL=http://localhost:8000` is set in `frontend/.env`.
+**Frontend network error** → check `frontend/.env` has `VITE_API_URL=http://localhost:8000`
 
-**`python-multipart` error on /parse**
-```bash
-uv pip install python-multipart
-```
-
-**Tests failing with ImportError**
-```bash
-source .venv/bin/activate
-uv pip install -e ".[dev]"
-pytest
-```
+Full troubleshooting: [DEVELOPER.md §H](DEVELOPER.md#section-h--troubleshooting)
 
 ---
 
