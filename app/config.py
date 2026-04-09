@@ -18,19 +18,24 @@ class Settings(BaseSettings):
         extra="ignore",   # silently ignore unknown env vars
     )
 
-    # ── Ollama ────────────────────────────────────────────────────────────────
-    # Local dev  → http://localhost:11434
-    # Docker     → http://ollama:11434  (overridden in docker-compose)
+    # ── Groq (preferred — fast, free tier available) ────────────────────────
+    # Set GROQ_API_KEY to enable Groq; leave blank to fall back to Ollama.
+    groq_api_key: str = ""
+    groq_model: str = "llama-3.3-70b-versatile"
+    groq_base_url: str = "https://api.groq.com/openai/v1"
+
+    # ── Ollama (local fallback) ──────────────────────────────────────────────
+    # Used when GROQ_API_KEY is not set, and always used for embeddings.
     ollama_base_url: str = "http://localhost:11434"
 
-    # LLM — pick based on your hardware:
+    # LLM — only used when Groq is not configured:
     #   qwen2.5:3b   ~2 GB RAM  (fast, okay quality — CI/testing)
     #   qwen2.5:7b   ~5 GB RAM  (good quality — development)
     #   qwen2.5:14b  ~10 GB RAM (great quality — recommended production)
     #   qwen2.5:32b  ~20 GB RAM (best quality — strong GPU only)
     ollama_llm_model: str = "qwen2.5:14b"
 
-    # Embedding model — nomic-embed-text produces 768-dim vectors
+    # Embedding model — always via Ollama (nomic-embed-text, 768-dim)
     ollama_embed_model: str = "nomic-embed-text"
 
     # ── Qdrant ────────────────────────────────────────────────────────────────

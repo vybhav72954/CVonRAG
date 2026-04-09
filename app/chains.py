@@ -1,6 +1,6 @@
 """
 CVonRAG — chains.py
-The full 5-phase pipeline, powered by Ollama + Qwen2.5.
+The full 5-phase pipeline, powered by Groq (preferred) or Ollama (fallback).
 
 Phase 1 → FastAPI (main.py)
 Phase 2 → SemanticMatcher   — JD analysis + fact scoring
@@ -49,16 +49,90 @@ def get_http() -> httpx.AsyncClient:
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# Ollama API helpers
+# LLM helpers — route to Groq (if GROQ_API_KEY set) or Ollama (fallback)
 # ═════════════════════════════════════════════════════════════════════════════
 
-async def _ollama_chat(
+def _using_groq() -> bool:
+    """True when a Groq API key is configured."""
+    return bool(settings.groq_api_key)
+
+
+def _build_messages(messages: list[dict], system: str | None) -> list[dict]:
+    """Prepend system message for OpenAI-compatible APIs (Groq)."""
+    if system:
+        return [{"role": "system", "content": system}] + messages
+    return messages
+
+
+async def _groq_chat(
     messages: list[dict],
     system: str | None = None,
     temperature: float | None = None,
     max_tokens: int | None = None,
 ) -> str:
-    """Non-streaming Ollama /api/chat call. Returns assistant text."""
+    """Non-streaming Groq call (OpenAI-compatible)."""
+    payload = {
+        "model": settings.groq_model,
+        "messages": _build_messages(messages, system),
+        "temperature": temperature if temperature is not None else settings.llm_temperature,
+        "max_tokens": max_tokens or settings.llm_max_tokens,
+        "stream": False,
+    }
+    r = await get_http().post(
+        f"{settings.groq_base_url}/chat/completions",
+        json=payload,
+        headers={"Authorization": f"Bearer {settings.groq_api_key}"},
+        timeout=60.0,
+    )
+    r.raise_for_status()
+    content = r.json()["choices"][0]["message"]["content"].strip()
+    # Strip Qwen/Llama extended-reasoning blocks if present
+    content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
+    return content
+
+
+async def _groq_stream(
+    messages: list[dict],
+    system: str | None = None,
+) -> AsyncGenerator[str, None]:
+    """Streaming Groq call (OpenAI-compatible SSE)."""
+    payload = {
+        "model": settings.groq_model,
+        "messages": _build_messages(messages, system),
+        "temperature": settings.llm_temperature,
+        "max_tokens": settings.llm_max_tokens,
+        "stream": True,
+    }
+    async with get_http().stream(
+        "POST",
+        f"{settings.groq_base_url}/chat/completions",
+        json=payload,
+        headers={"Authorization": f"Bearer {settings.groq_api_key}"},
+        timeout=60.0,
+    ) as resp:
+        resp.raise_for_status()
+        async for line in resp.aiter_lines():
+            if not line or not line.startswith("data: "):
+                continue
+            data = line[len("data: "):]
+            if data.strip() == "[DONE]":
+                break
+            try:
+                chunk = json.loads(data)
+                token = chunk["choices"][0].get("delta", {}).get("content", "")
+                if token:
+                    yield token
+            except (json.JSONDecodeError, KeyError, IndexError):
+                continue
+
+
+async def _ollama_chat_inner(
+    messages: list[dict],
+    system: str | None = None,
+    temperature: float | None = None,
+    max_tokens: int | None = None,
+) -> str:
+    """Non-streaming Ollama /api/chat call."""
     payload: dict = {
         "model":  settings.ollama_llm_model,
         "messages": messages,
@@ -77,11 +151,11 @@ async def _ollama_chat(
     return r.json()["message"]["content"].strip()
 
 
-async def _ollama_stream(
+async def _ollama_stream_inner(
     messages: list[dict],
     system: str | None = None,
 ) -> AsyncGenerator[str, None]:
-    """Streaming Ollama /api/chat — yields text tokens as they arrive."""
+    """Streaming Ollama /api/chat — yields text tokens."""
     payload: dict = {
         "model":  settings.ollama_llm_model,
         "messages": messages,
@@ -109,6 +183,33 @@ async def _ollama_stream(
                     break
             except json.JSONDecodeError:
                 continue
+
+
+# ── Public interface (rest of the code calls these only) ─────────────────────
+
+async def _ollama_chat(
+    messages: list[dict],
+    system: str | None = None,
+    temperature: float | None = None,
+    max_tokens: int | None = None,
+) -> str:
+    """LLM call — routes to Groq if GROQ_API_KEY is set, else Ollama."""
+    if _using_groq():
+        return await _groq_chat(messages, system, temperature, max_tokens)
+    return await _ollama_chat_inner(messages, system, temperature, max_tokens)
+
+
+async def _ollama_stream(
+    messages: list[dict],
+    system: str | None = None,
+) -> AsyncGenerator[str, None]:
+    """Streaming LLM call — routes to Groq if GROQ_API_KEY is set, else Ollama."""
+    if _using_groq():
+        async for token in _groq_stream(messages, system):
+            yield token
+    else:
+        async for token in _ollama_stream_inner(messages, system):
+            yield token
 
 
 # ═════════════════════════════════════════════════════════════════════════════

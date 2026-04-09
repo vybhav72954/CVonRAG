@@ -183,30 +183,27 @@ def _make_slug(title: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")[:20]
 
 
-async def extract_facts(project: RawProject, http_client) -> list[CoreFact]:
+async def extract_facts(project: RawProject, http_client=None) -> list[CoreFact]:
     """
-    Call Ollama to extract structured CoreFacts from a project's raw bullets.
+    Extract structured CoreFacts from a project's raw bullets via LLM.
+    Uses the shared _ollama_chat() from chains.py (routes to Groq or Ollama).
     On any failure, falls back to one fact per bullet (up to 4).
+
+    Note: http_client param is kept for backward compatibility but no longer used.
     """
+    from app.chains import _ollama_chat  # deferred import to avoid circular dep
+
     slug         = _make_slug(project.title)
     bullets_text = "\n".join(f"- {b}" for b in project.bullets[:20])
 
-    payload = {
-        "model":    settings.ollama_llm_model,
-        "messages": [{"role": "user", "content": f'Project: "{project.title}"\n\nBullets:\n{bullets_text}'}],
-        "stream":   False,
-        "system":   _EXTRACT_SYSTEM,
-        "options":  {"temperature": 0.1, "num_predict": 1500, "num_ctx": 4096},
-    }
-
     try:
-        r = await http_client.post(
-            f"{settings.ollama_base_url}/api/chat",
-            json=payload,
-            timeout=120,
+        raw = await _ollama_chat(
+            system=_EXTRACT_SYSTEM,
+            messages=[{"role": "user", "content": f'Project: "{project.title}"\n\nBullets:\n{bullets_text}'}],
+            temperature=0.1,
+            max_tokens=1500,
         )
-        r.raise_for_status()
-        raw       = _strip_fences(r.json()["message"]["content"])
+        raw       = _strip_fences(raw)
         raw_facts = json.loads(raw)
         if not isinstance(raw_facts, list):
             raise ValueError("LLM returned non-list")
@@ -242,7 +239,7 @@ async def extract_facts(project: RawProject, http_client) -> list[CoreFact]:
 async def parse_and_stream(
     file_bytes: bytes,
     filename:   str,
-    http_client,
+    http_client=None,        # DEPRECATED — kept for backward compat, unused
 ) -> AsyncGenerator[tuple[str, dict], None]:
     """
     Full parse pipeline as an async generator.
