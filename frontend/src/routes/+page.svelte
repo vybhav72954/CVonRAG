@@ -185,7 +185,7 @@
   $: selectedCount = [...$selectedIds].filter(id => $parsedProjects.some(p => p.project_id === id)).length;
 </script>
 
-<!-- ── Backend-down banner (visible on every step) ──────────────────────── -->
+<!-- ── Backend-down banner ──────────────────────────────────────────────── -->
 {#if backendDown}
 <div class="error-banner" style="margin-bottom:1.5rem">
   <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -203,18 +203,43 @@
 <div class="fade-in step-container">
 
   <!-- Hero -->
-  <div class="hero-section">
+  <div class="hero-section hero-upload">
     <div class="hero-badge">
-      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-        <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
-        <polyline points="14 2 14 8 20 8"/>
-      </svg>
+      <div class="badge-dot"></div>
       <span>Step 1 of 3</span>
     </div>
-    <h1 class="hero-title">Upload your <span class="gradient-text">CV</span></h1>
+
+    <h1 class="hero-title">
+      Transform your <span class="gradient-text">resume</span><br/>
+      with AI precision
+    </h1>
+
     <p class="hero-subtitle">
-      Drop a <span class="mono">.docx</span> or <span class="mono">.pdf</span> — our AI extracts every project, metric, and tool automatically.
+      Drop your CV and watch our 5-phase RAG pipeline extract every project,
+      metric, and tool — then craft bullets that match any JD's tone.
     </p>
+
+    <!-- Feature pills -->
+    <div class="hero-features">
+      <div class="feature-pill">
+        <span class="pill-icon">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="var(--accent-light)" stroke-width="2"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
+        </span>
+        <span class="pill-value">5-Phase RAG</span>
+      </div>
+      <div class="feature-pill">
+        <span class="pill-icon">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="var(--cyan)" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+        </span>
+        <span class="pill-value">288 Exemplars</span>
+      </div>
+      <div class="feature-pill">
+        <span class="pill-icon">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="var(--green)" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+        </span>
+        <span class="pill-value">Style Firewall</span>
+      </div>
+    </div>
   </div>
 
   <!-- Drop zone -->
@@ -234,7 +259,7 @@
       role="button" tabindex="0"
     >
       <div class="drop-icon float-icon">
-        <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="url(#dropGrad)" stroke-width="1.5">
+        <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="url(#dropGrad)" stroke-width="1.5">
           <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
           <polyline points="17 8 12 3 7 8"/>
           <line x1="12" y1="3" x2="12" y2="15"/>
@@ -292,7 +317,7 @@
     <div class="section-header">
       <div>
         <h2 class="section-title">
-          {$parsedProjects.length} project{$parsedProjects.length !== 1 ? 's' : ''} extracted
+          <span class="gradient-text">{$parsedProjects.length}</span> project{$parsedProjects.length !== 1 ? 's' : ''} extracted
         </h2>
         <p class="section-subtitle">Review and optionally edit extracted facts before proceeding.</p>
       </div>
@@ -377,9 +402,7 @@
 
   <div class="hero-section">
     <div class="hero-badge">
-      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-        <rect x="3" y="3" width="18" height="18" rx="2"/><line x1="3" y1="9" x2="21" y2="9"/><line x1="9" y1="21" x2="9" y2="9"/>
-      </svg>
+      <div class="badge-dot badge-dot--cyan"></div>
       <span>Step 2 of 3</span>
     </div>
     <h1 class="hero-title">Paste the <span class="gradient-text">Job Description</span></h1>
@@ -502,7 +525,7 @@
 
           {#if isRecommended && rec.reason}
             <p style="font-size:0.75rem;color:var(--text-secondary);margin-top:0.5rem;line-height:1.5">
-              💡 {rec.reason}
+              {rec.reason}
             </p>
           {/if}
 
@@ -649,55 +672,91 @@
   .step-container {
     display: flex;
     flex-direction: column;
-    gap: 1.5rem;
+    gap: 1.75rem;
   }
 
   /* ── Hero ────────────────────────────────────────────────────────────── */
   .hero-section {
     display: flex;
     flex-direction: column;
-    gap: 0.625rem;
+    gap: 0.75rem;
     padding-bottom: 0.25rem;
+  }
+
+  .hero-upload {
+    text-align: center;
+    align-items: center;
+    padding-top: 1.5rem;
+    padding-bottom: 1rem;
   }
 
   .hero-badge {
     display: inline-flex;
     align-items: center;
-    gap: 0.375rem;
+    gap: 0.5rem;
     font-size: 0.7rem;
     font-weight: 500;
     color: var(--accent-light);
     background: var(--accent-dim);
     border: 1px solid rgba(124,58,237,0.15);
-    padding: 0.3rem 0.75rem;
+    padding: 0.35rem 0.85rem;
     border-radius: 999px;
     width: fit-content;
     font-family: 'JetBrains Mono', monospace;
   }
 
+  .badge-dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--accent-light);
+    box-shadow: 0 0 8px var(--accent-glow);
+    animation: badgePulse 2s ease-in-out infinite;
+  }
+  .badge-dot--cyan {
+    background: var(--cyan);
+    box-shadow: 0 0 8px rgba(6, 182, 212, 0.4);
+  }
+  @keyframes badgePulse {
+    0%, 100% { opacity: 1; transform: scale(1); }
+    50%      { opacity: 0.5; transform: scale(0.8); }
+  }
+
   .hero-title {
-    font-size: 1.75rem;
-    font-weight: 700;
-    letter-spacing: -0.03em;
-    line-height: 1.2;
+    font-size: 2.25rem;
+    font-weight: 800;
+    letter-spacing: -0.04em;
+    line-height: 1.15;
     color: var(--text);
   }
 
+  @media (min-width: 640px) {
+    .hero-title { font-size: 2.75rem; }
+  }
+
   .hero-subtitle {
-    font-size: 0.875rem;
+    font-size: 0.9375rem;
     color: var(--text-secondary);
-    line-height: 1.6;
-    max-width: 36rem;
+    line-height: 1.7;
+    max-width: 38rem;
+  }
+
+  .hero-features {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.625rem;
+    justify-content: center;
+    margin-top: 0.75rem;
   }
 
   /* ── Drop zone ──────────────────────────────────────────────────────── */
   .drop-icon {
-    margin-bottom: 1.25rem;
+    margin-bottom: 1.5rem;
     display: flex;
     justify-content: center;
   }
   .drop-text {
-    font-size: 0.9375rem;
+    font-size: 1rem;
     font-weight: 600;
     color: var(--text);
     margin-bottom: 0.5rem;
@@ -741,8 +800,8 @@
     margin-bottom: 0.25rem;
   }
   .section-title {
-    font-size: 0.9375rem;
-    font-weight: 600;
+    font-size: 1rem;
+    font-weight: 700;
     color: var(--text);
   }
   .section-subtitle {
@@ -758,8 +817,11 @@
   }
 
   /* ── Project cards ──────────────────────────────────────────────────── */
-  .project-card { transition: border-color 0.2s; }
-  .project-card:hover { border-color: var(--border-hi); }
+  .project-card { transition: border-color 0.3s, box-shadow 0.3s; }
+  .project-card:hover {
+    border-color: var(--border-hi);
+    box-shadow: 0 4px 30px rgba(0,0,0,0.2);
+  }
   .project-card-main {
     display: flex;
     align-items: flex-start;
@@ -855,7 +917,7 @@
     flex-direction: column;
     gap: 0.75rem;
   }
-  .reco-card { transition: all 0.2s; }
+  .reco-card { transition: all 0.3s; }
   .reco-card--selected { border-color: rgba(124,58,237,0.25); }
   .reco-card--recommended { border-color: var(--green-border); }
   .reco-card-inner {
@@ -926,7 +988,7 @@
     background: var(--border);
   }
 
-  .bullet-card { transition: border-color 0.2s; }
+  .bullet-card { transition: border-color 0.3s; }
   .bullet-card--warn::before {
     background: linear-gradient(135deg, var(--amber) 0%, rgba(245,158,11,0.3) 100%);
   }
