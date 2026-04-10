@@ -204,13 +204,14 @@ async def parse_cv(file: UploadFile = File(...)):
 
     Upload a `.docx` biodata or `.pdf` CV.
     Returns a `text/event-stream` SSE response showing extraction progress.
+    All events are wrapped in a `StreamChunk` envelope (same as `/optimize`).
 
-    | Event type | Payload | Description |
+    | Event type | `data` field | Description |
     |---|---|---|
     | `progress` | `{message, current, total}` | Extraction progress update |
     | `project`  | `{project: ProjectData, index, total}` | One project completed |
     | `done`     | `{total_projects, total_facts}` | All done |
-    | `error`    | `{error_message}` | Parse error |
+    | `error`    | `null` (see `error_message`) | Parse error |
     """
     if not file.filename:
         raise HTTPException(status_code=400, detail="No filename provided.")
@@ -240,7 +241,13 @@ async def parse_cv(file: UploadFile = File(...)):
         }
         async for event_type, data in parse_and_stream(file_bytes, file.filename, http_client):
             sse_event = _PARSE_EVENT_MAP.get(event_type, event_type)
-            yield f"event: {sse_event}\ndata: {json.dumps(data)}\n\n"
+            if event_type == "error":
+                yield _sse(StreamChunk(
+                    event_type=sse_event,
+                    error_message=data.get("error_message", "Unknown parse error"),
+                ))
+            else:
+                yield _sse(StreamChunk(event_type=sse_event, data=data))
 
     return StreamingResponse(_stream(), media_type="text/event-stream", headers=_SSE_HEADERS)
 

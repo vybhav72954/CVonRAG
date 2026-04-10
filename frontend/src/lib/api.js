@@ -79,9 +79,9 @@ export async function parseCV(file, callbacks = {}) {
   }
 
   await readSSEStream(resp, ({ type, data }) => {
-    if (type === 'progress') onProgress?.(data);
-    if (type === 'project')  onProject?.(data);
-    if (type === 'done')     onDone?.(data);
+    if (type === 'progress') onProgress?.(data.data);
+    if (type === 'project')  onProject?.(data.data);
+    if (type === 'done')     onDone?.(data.data);
     if (type === 'error')    onError?.(data.error_message ?? 'Unknown error');
   }, onError);
 }
