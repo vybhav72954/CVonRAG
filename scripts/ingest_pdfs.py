@@ -23,6 +23,7 @@ Usage:
       --api_url  http://localhost:8000 \\
       --ollama   http://localhost:11434 \\
       --model    qwen2.5:7b \\
+      --secret   your_secret_here  # or set INGEST_SECRET env var
       --dry_run          # optional: print bullets without posting
 
 
@@ -36,6 +37,7 @@ Dependencies (add to your venv):
 
 import argparse
 import json
+import os
 import re
 import sys
 from pathlib import Path
@@ -294,11 +296,15 @@ def tag_bullet(bullet_text: str, ollama_url: str, model: str, timeout: int = 120
 # ── Ingest call ───────────────────────────────────────────────────────────────
 
 
-def post_to_ingest(bullets: list[dict], api_url: str) -> dict:
+def post_to_ingest(bullets: list[dict], api_url: str, secret: str | None = None) -> dict:
     """POST the fully-tagged bullets to POST /ingest."""
+    headers = {}
+    if secret:
+        headers["X-Ingest-Secret"] = secret
     r = httpx.post(
         f"{api_url}/ingest",
         json={"bullets": bullets},
+        headers=headers,
         timeout=300,
     )
     r.raise_for_status()
@@ -321,7 +327,11 @@ def main():
     parser.add_argument("--dry_run",  action="store_true", help="Print bullets, do not POST to API")
     parser.add_argument("--debug_pdf", help="Print ALL extracted lines from a single PDF (use with filename)")
     parser.add_argument("--skip_tag", action="store_true", help="Skip LLM tagging (faster, less rich metadata)")
+    parser.add_argument("--secret",   default=None, help="X-Ingest-Secret value (or set INGEST_SECRET env var)")
     args = parser.parse_args()
+
+    # Resolve ingest secret: CLI flag > env var > None
+    ingest_secret = args.secret or os.environ.get("INGEST_SECRET") or None
 
 
     # Debug mode: print what extraction logic sees from a single PDF
@@ -364,6 +374,7 @@ def main():
     log(f"  PDFs found     : {len(pdfs)}")
     log(f"  API target     : {args.api_url}")
     log(f"  Ollama model   : {args.model}")
+    log(f"  Ingest secret  : {'✓ set' if ingest_secret else '✗ not set (will fail if server requires it)'}")
     log(f"  Dry run        : {args.dry_run}\n")
 
 
@@ -440,7 +451,7 @@ def main():
 
     for i, batch in enumerate(track(batches, description="Posting batches…")):  # ← was tqdm(..., desc=)
         try:
-            result = post_to_ingest(batch, args.api_url)
+            result = post_to_ingest(batch, args.api_url, secret=ingest_secret)
             upserted = result.get("upserted", len(batch))
             total_upserted += upserted
             log(f"  Batch {i}/{len(batches)}: [green]✓ {upserted} bullets upserted[/green]")
