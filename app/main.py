@@ -198,8 +198,15 @@ async def parse_cv(file: UploadFile = File(...)):
     http_client = get_http()
 
     async def _stream():
+        _PARSE_EVENT_MAP = {
+            "progress": StreamEventType.PROGRESS,
+            "project":  StreamEventType.PROJECT,
+            "done":     StreamEventType.DONE,
+            "error":    StreamEventType.ERROR,
+        }
         async for event_type, data in parse_and_stream(file_bytes, file.filename, http_client):
-            yield f"event: {event_type}\ndata: {json.dumps(data)}\n\n"
+            sse_event = _PARSE_EVENT_MAP.get(event_type, event_type)
+            yield f"event: {sse_event}\ndata: {json.dumps(data)}\n\n"
 
     return StreamingResponse(_stream(), media_type="text/event-stream", headers=_SSE_HEADERS)
 

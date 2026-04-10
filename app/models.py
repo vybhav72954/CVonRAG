@@ -34,9 +34,14 @@ class JDTone(StrEnum):
 
 
 class StreamEventType(StrEnum):
+    # /optimize events
     TOKEN    = "token"
     BULLET   = "bullet"
     METADATA = "metadata"
+    # /parse events
+    PROGRESS = "progress"
+    PROJECT  = "project"
+    # shared
     ERROR    = "error"
     DONE     = "done"
 
