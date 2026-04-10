@@ -240,6 +240,7 @@ Schema:
   "role_type": "ml_engineering|data_science|software_engineering|quant_finance|product_management|general",
   "uses_separator": "|" or ";" or null,
   "uses_arrow": true or false,
+  "uses_abbreviations": ["w/", "vs", "~"],
   "sentence_structure": "short phrase like: verb → tool → metric → impact"
 }
 
@@ -248,6 +249,7 @@ Rules:
 - role_type must be exactly one of the six enum values
 - uses_separator: the visual separator char actually present in the bullet, or null
 - uses_arrow: true if the bullet contains any of ↑ ↓ → ↗ ↘
+- uses_abbreviations: list of shorthand tokens found (e.g. "w/", "vs", "~", "approx", "&"); empty list if none
 - sentence_structure: 3-6 words describing the grammatical architecture
 """
 
@@ -411,7 +413,7 @@ def main():
                 "role_type":          tag.get("role_type", "general"),
                 "uses_separator":     tag.get("uses_separator"),
                 "uses_arrow":         tag.get("uses_arrow", False),
-                "uses_abbreviations": [],
+                "uses_abbreviations": tag.get("uses_abbreviations", []),
                 "sentence_structure": tag.get("sentence_structure"),
             })
 

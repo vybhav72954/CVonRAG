@@ -19,27 +19,13 @@ from __future__ import annotations
 
 import json
 import logging
-from dataclasses import dataclass, field
 
 from app.chains import SemanticMatcher, _ollama_chat, _strip_json_fences
-from app.models import ProjectData
+from app.config import get_settings
+from app.models import ProjectData, ProjectRecommendation
 
-logger = logging.getLogger(__name__)
-
-
-# ── Output type ───────────────────────────────────────────────────────────────
-
-@dataclass
-class ProjectRecommendation:
-    project_id:      str
-    title:           str
-    score:           float           # 0.0 – 1.0
-    rank:            int             # 1 = best match
-    reason:          str             # one sentence, human-readable
-    matched_skills:  list[str]       # JD skills this project demonstrates
-    top_metrics:     list[str]       # key numbers from this project
-    recommended:     bool            # True for top K, False for the rest
-    core_facts:      list[dict]      # pass-through for the optimizer
+logger   = logging.getLogger(__name__)
+settings = get_settings()
 
 
 # ── Prompt ────────────────────────────────────────────────────────────────────
@@ -73,11 +59,11 @@ def _project_score(project_id: str, scored_facts: list) -> tuple[float, list[str
         return 0.0, []
 
     facts_sorted = sorted(facts, key=lambda x: x.relevance_score, reverse=True)
-    top_n        = facts_sorted[:3]
+    top_n        = facts_sorted[:settings.top_n_facts_for_score]
     score        = sum(f.relevance_score for f in top_n) / len(top_n)
     kws          = list(dict.fromkeys(
         kw for f in top_n for kw in f.matched_jd_keywords
-    ))[:6]
+    ))[:settings.max_skills_per_project]
     return round(score, 3), kws
 
 
@@ -86,7 +72,7 @@ def _top_metrics(project: ProjectData) -> list[str]:
     metrics: list[str] = []
     for fact in project.core_facts:
         metrics.extend(fact.metrics)
-    return list(dict.fromkeys(metrics))[:4]   # deduplicated, max 4
+    return list(dict.fromkeys(metrics))[:settings.max_metrics_per_project]
 
 
 # ── Main recommendation function ──────────────────────────────────────────────
@@ -135,7 +121,7 @@ async def recommend_projects(
             }
             for pid, score, skills in project_scores[:top_k]
         ]
-        jd_snippet = job_description[:800]
+        jd_snippet = job_description[:settings.jd_snippet_max_chars]
         prompt = (
             f"Job Description (excerpt):\n{jd_snippet}\n\n"
             f"Top projects:\n{json.dumps(top_summary, indent=2)}"

@@ -47,6 +47,14 @@ class Settings(BaseSettings):
     # ── RAG ───────────────────────────────────────────────────────────────────
     retrieval_top_k: int = 5
 
+    # ── Recommender / Scorer ──────────────────────────────────────────────────
+    jd_snippet_max_chars: int = 800        # JD truncation for reason prompt
+    style_query_jd_chars: int = 500        # JD chars in style-retrieval query
+    jd_top_keywords: int = 10             # max required_skills shown to LLM
+    top_n_facts_for_score: int = 3        # top-N fact scores averaged per project
+    max_skills_per_project: int = 6       # matched JD keywords cap per project
+    max_metrics_per_project: int = 4      # metric chips cap per project
+
     # ── Char-limit loop ───────────────────────────────────────────────────────
     char_loop_max_iterations: int = 4
     char_tolerance: int = 2

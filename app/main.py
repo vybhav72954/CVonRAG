@@ -29,7 +29,6 @@ from app.models import (
     GeneratedBullet,
     HealthResponse,
     OptimizationRequest,
-    ProjectRecommendation,
     RecommendRequest,
     RecommendResponse,
     StreamChunk,
@@ -229,22 +228,7 @@ async def recommend(body: RecommendRequest):
         job_description=body.job_description,
         top_k=body.top_k,
     )
-    return RecommendResponse(
-        recommendations=[
-            ProjectRecommendation(
-                project_id    =r.project_id,
-                title         =r.title,
-                score         =r.score,
-                rank          =r.rank,
-                reason        =r.reason,
-                matched_skills=r.matched_skills,
-                top_metrics   =r.top_metrics,
-                recommended   =r.recommended,
-                core_facts    =r.core_facts,
-            )
-            for r in recs
-        ]
-    )
+    return RecommendResponse(recommendations=recs)
 
 
 # ── Bullet generation ─────────────────────────────────────────────────────────
