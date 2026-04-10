@@ -66,11 +66,18 @@ class Settings(BaseSettings):
 
     # ── App ───────────────────────────────────────────────────────────────────
     app_env: str = "development"
-    cors_origins: list[str] = ["*"]
-    log_level: str = "INFO"
     port: int = 8000
+    log_level: str = "INFO"
+
+    # CORS: restrict to your frontend origin in production.
+    cors_origins: list[str] = ["http://localhost:5173"]
+
+    # ── Admin auth ────────────────────────────────────────────────────────────
+    # Set INGEST_SECRET in .env to protect the /ingest endpoint.
+    # Leave blank to allow unauthenticated access (dev only).
+    ingest_secret: str = ""
 
 
-@lru_cache(maxsize=1)
+@lru_cache()
 def get_settings() -> Settings:
     return Settings()

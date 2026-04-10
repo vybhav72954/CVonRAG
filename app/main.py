@@ -18,7 +18,7 @@ from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 
 import httpx
-from fastapi import FastAPI, File, HTTPException, UploadFile, status
+from fastapi import FastAPI, File, Header, HTTPException, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
@@ -282,11 +282,22 @@ class IngestResponse(BaseModel):
 
 
 @app.post("/ingest", response_model=IngestResponse, tags=["admin"])
-async def ingest(body: IngestRequest):
+async def ingest(
+    body: IngestRequest,
+    x_ingest_secret: str | None = Header(default=None),
+):
     """
     **Admin endpoint** — seed Qdrant with Gold Standard CV bullets.
-    Protect behind auth before public exposure.
+
+    When `INGEST_SECRET` is set in `.env`, callers must send
+    `X-Ingest-Secret: <secret>` in the request header.
     """
+    if settings.ingest_secret:
+        if x_ingest_secret != settings.ingest_secret:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Invalid or missing X-Ingest-Secret header.",
+            )
     try:
         count = await ingest_gold_standard_bullets(
             [item.model_dump() for item in body.bullets]
