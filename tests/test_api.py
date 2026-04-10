@@ -69,11 +69,17 @@ class TestRoot:
 
 # ── GET /health ───────────────────────────────────────────────────────────────
 
+class MockAsyncClient:
+    def __init__(self, *args, **kwargs): pass
+    async def __aenter__(self): return self
+    async def __aexit__(self, *args): pass
+    async def get(self, *args, **kwargs): raise Exception("Mocked connection error")
+
 class TestHealth:
     def test_returns_200_and_required_fields(self, client):
         with patch("app.main.collection_info", new=AsyncMock(return_value={
             "qdrant_connected": False, "collection_exists": False, "vector_count": 0,
-        })), patch("httpx.AsyncClient"):
+        })), patch("httpx.AsyncClient", new=MockAsyncClient):
             resp = client.get("/health")
         assert resp.status_code == 200
         body = resp.json()
