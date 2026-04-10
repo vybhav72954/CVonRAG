@@ -58,10 +58,9 @@ async function readSSEStream(resp, onEvent, onError) {
 /**
  * Upload a .docx or .pdf and stream back parsed projects.
  * @param {File} file
- * @param {{ onProgress, onProject, onDone, onError }} callbacks
+ * @param {{ onProgress?: (data: any) => void, onProject?: (data: any) => void, onDone?: (data: any) => void, onError?: (msg: string) => void }} [callbacks]
  */
-export async function parseCV(file, callbacks = {}) {
-  const { onProgress, onProject, onDone, onError } = callbacks;
+export async function parseCV(file, { onProgress, onProject, onDone, onError } = {}) {
   const form = new FormData();
   form.append('file', file);
 
@@ -126,10 +125,9 @@ export async function recommendProjects(payload) {
 /**
  * Stream optimised resume bullets.
  * @param {Object} payload - OptimizationRequest
- * @param {{ onToken, onBullet, onDone, onError }} callbacks
+ * @param {{ onToken?: (data: any) => void, onBullet?: (data: any) => void, onDone?: (data: any) => void, onError?: (msg: string) => void }} [callbacks]
  */
-export async function optimizeResume(payload, callbacks = {}) {
-  const { onToken, onBullet, onDone, onError } = callbacks;
+export async function optimizeResume(payload, { onToken, onBullet, onDone, onError } = {}) {
 
   let resp;
   try {
