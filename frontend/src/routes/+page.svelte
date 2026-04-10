@@ -1,5 +1,6 @@
 <script>
-  import { parseCV, recommendProjects, optimizeResume } from '$lib/api';
+  import { onMount } from 'svelte';
+  import { parseCV, recommendProjects, optimizeResume, checkHealth } from '$lib/api';
   import {
     step,
     parsedProjects, parseStatus, parseProgress, parseError, resetParse,
@@ -8,6 +9,15 @@
     genStatus, tokenBuffer, bullets, genError, elapsed, resetGeneration,
     isUploading, isRecommending, isGenerating,
   } from '$lib/stores';
+
+  // ── Backend health check on mount ──────────────────────────────────────────
+  let backendDown = false;
+  let backendMsg  = '';
+
+  onMount(async () => {
+    const { ok, reason } = await checkHealth();
+    if (!ok) { backendDown = true; backendMsg = reason; }
+  });
 
   // ── Step 1: Upload & Parse ────────────────────────────────────────────────
   let dragOver  = false;
@@ -175,6 +185,17 @@
   $: selectedCount = [...$selectedIds].filter(id => $parsedProjects.some(p => p.project_id === id)).length;
 </script>
 
+<!-- ── Backend-down banner (visible on every step) ──────────────────────── -->
+{#if backendDown}
+<div class="error-banner" style="margin-bottom:1.5rem">
+  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+    <path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/>
+    <line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/>
+  </svg>
+  <span>Backend unreachable — {backendMsg}. Make sure the API server is running.</span>
+</div>
+{/if}
+
 <!-- ═══════════════════════════════════════════════════════════════════════════
      STEP 1 — Upload CV
      ═══════════════════════════════════════════════════════════════════════ -->
@@ -308,7 +329,8 @@
         {#each project.core_facts as fact, fi}
         <div class="fact-card">
           <span class="chip mono" style="font-size:0.6rem">{fact.fact_id}</span>
-          <textarea rows="2" value={fact.text}
+          <label for="fact-{project.project_id}-{fi}" class="sr-only">Fact text</label>
+          <textarea id="fact-{project.project_id}-{fi}" rows="2" value={fact.text}
             on:change={e => updateFact(project.project_id, fi, 'text', e.target.value)}
             class="field mono" style="font-size:0.75rem;resize:none;min-height:3rem"></textarea>
           <div class="fact-fields">
