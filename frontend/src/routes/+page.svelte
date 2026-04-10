@@ -221,6 +221,8 @@
   {#if $parseStatus === 'idle' || $parseStatus === 'error'}
   <div
     class="dropzone-wrapper" class:active={dragOver}
+    role="region"
+    aria-label="File upload dropzone"
     on:dragover|preventDefault={() => dragOver = true}
     on:dragleave={() => dragOver = false}
     on:drop={onDrop}
@@ -331,20 +333,20 @@
           <span class="chip mono" style="font-size:0.6rem">{fact.fact_id}</span>
           <label for="fact-{project.project_id}-{fi}" class="sr-only">Fact text</label>
           <textarea id="fact-{project.project_id}-{fi}" rows="2" value={fact.text}
-            on:change={e => updateFact(project.project_id, fi, 'text', e.target.value)}
+            on:change={e => updateFact(project.project_id, fi, 'text', e.currentTarget.value)}
             class="field mono" style="font-size:0.75rem;resize:none;min-height:3rem"></textarea>
           <div class="fact-fields">
             <div>
               <label for="tools-{project.project_id}-{fi}" class="field-label">Tools</label>
               <input id="tools-{project.project_id}-{fi}" class="field" style="font-size:0.75rem"
                 value={fact.tools.join(', ')}
-                on:change={e => updateFactArray(project.project_id, fi, 'tools', e.target.value)} />
+                on:change={e => updateFactArray(project.project_id, fi, 'tools', e.currentTarget.value)} />
             </div>
             <div>
               <label for="metrics-{project.project_id}-{fi}" class="field-label">Metrics</label>
               <input id="metrics-{project.project_id}-{fi}" class="field" style="font-size:0.75rem;background:var(--amber-dim);border-color:var(--amber-border);color:var(--amber)"
                 value={fact.metrics.join(', ')}
-                on:change={e => updateFactArray(project.project_id, fi, 'metrics', e.target.value)} />
+                on:change={e => updateFactArray(project.project_id, fi, 'metrics', e.currentTarget.value)} />
             </div>
           </div>
         </div>

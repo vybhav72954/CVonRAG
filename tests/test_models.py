@@ -12,6 +12,8 @@ Tests:
 
 import pytest
 from pydantic import ValidationError
+from typing import Any
+from typing import Any
 
 from app.models import (
     CoreFact,
@@ -123,8 +125,8 @@ class TestProjectData:
 
 # ── OptimizationRequest ───────────────────────────────────────────────────────
 
-def _make_request(**kwargs) -> OptimizationRequest:
-    defaults = dict(
+def _make_request(**kwargs: Any) -> OptimizationRequest:
+    defaults: dict[str, Any] = dict(
         job_description="We are looking for a Senior ML Engineer with experience in Python and time-series forecasting.",
         projects=[
             ProjectData(
@@ -135,7 +137,7 @@ def _make_request(**kwargs) -> OptimizationRequest:
         ],
     )
     defaults.update(kwargs)
-    return OptimizationRequest(**defaults)
+    return OptimizationRequest(**defaults)  # type: ignore
 
 
 class TestOptimizationRequest:

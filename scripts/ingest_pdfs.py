@@ -210,7 +210,7 @@ def extract_bullets_from_pdf(pdf_path: Path) -> list[str]:
                 
                 bullet_text = re.sub(
                     r'\s+[A-Z][a-zA-Z\s]{2,20}$',
-                    lambda m: '' if _is_bleed_word(m.group(0).strip()) else m.group(0),
+                    lambda m: '' if _is_bleed_word(str(m.group(0)).strip()) else str(m.group(0)),
                     bullet_text
                 ).strip()
                 

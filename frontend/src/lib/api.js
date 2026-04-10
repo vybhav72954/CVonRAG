@@ -11,15 +11,15 @@ const REQUEST_TIMEOUT_MS = 90_000;
 // ── SSE frame parser ──────────────────────────────────────────────────────────
 
 function parseSSEFrames(buffer) {
-  const frames    = buffer.split('\n\n');
+  const frames = buffer.split('\n\n');
   const remaining = frames.pop() ?? '';
-  const events    = [];
+  const events = [];
   for (const frame of frames) {
     if (!frame.trim()) continue;
     let eventType = 'message', dataLine = '';
     for (const line of frame.split('\n')) {
       if (line.startsWith('event:')) eventType = line.slice(6).trim();
-      if (line.startsWith('data:'))  dataLine  = line.slice(5).trim();
+      if (line.startsWith('data:')) dataLine = line.slice(5).trim();
     }
     if (!dataLine) continue;
     try { events.push({ type: eventType, data: JSON.parse(dataLine) }); }
@@ -35,9 +35,9 @@ function parseSSEFrames(buffer) {
  * @param {(msg: string) => void} [onError]
  */
 async function readSSEStream(resp, onEvent, onError) {
-  const reader  = resp.body.getReader();
+  const reader = resp.body.getReader();
   const decoder = new TextDecoder();
-  let   buffer  = '';
+  let buffer = '';
 
   try {
     while (true) {
@@ -95,14 +95,14 @@ export async function parseCV(file, { onProgress, onProject, onDone, onError } =
  */
 export async function recommendProjects(payload) {
   const controller = new AbortController();
-  const timer      = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+  const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
 
   try {
     const resp = await fetch(`${BASE}/recommend`, {
-      method:  'POST',
+      method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body:    JSON.stringify(payload),
-      signal:  controller.signal,
+      body: JSON.stringify(payload),
+      signal: controller.signal,
     });
     clearTimeout(timer);
 
@@ -132,9 +132,9 @@ export async function optimizeResume(payload, { onToken, onBullet, onDone, onErr
   let resp;
   try {
     resp = await fetch(`${BASE}/optimize`, {
-      method:  'POST',
+      method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body:    JSON.stringify(payload),
+      body: JSON.stringify(payload),
     });
   } catch (err) {
     onError?.(`Network error: ${err.message}`);
@@ -147,10 +147,10 @@ export async function optimizeResume(payload, { onToken, onBullet, onDone, onErr
   }
 
   await readSSEStream(resp, ({ type, data }) => {
-    if (type === 'token')  onToken?.(data.data);
+    if (type === 'token') onToken?.(data.data);
     if (type === 'bullet') onBullet?.(data.data);
-    if (type === 'done')   onDone?.(data.data);
-    if (type === 'error')  onError?.(data.error_message ?? 'Unknown error');
+    if (type === 'done') onDone?.(data.data);
+    if (type === 'error') onError?.(data.error_message ?? 'Unknown error');
   }, onError);
 }
 
@@ -162,8 +162,10 @@ export async function checkHealth() {
     if (!r.ok) return { ok: false, reason: `HTTP ${r.status}` };
     return { ok: true, data: await r.json() };
   } catch (err) {
-    return { ok: false, reason: err.name === 'TimeoutError'
-      ? 'Backend did not respond within 5 s'
-      : `Cannot reach backend at ${BASE}` };
+    return {
+      ok: false, reason: err.name === 'TimeoutError'
+        ? 'Backend did not respond within 5 s'
+        : `Cannot reach backend at ${BASE}`
+    };
   }
 }
