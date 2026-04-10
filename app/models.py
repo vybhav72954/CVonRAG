@@ -186,8 +186,11 @@ class RecommendResponse(BaseModel):
 
 class HealthResponse(BaseModel):
     status: str = "ok"
-    model: str
+    llm_backend: str                  # "groq" or "ollama"
+    model: str                        # active LLM model name
     qdrant_connected: bool
     collection_exists: bool
     vector_count: int = 0
-    ollama_ok: bool = False
+    groq_ok: bool = False             # Groq API reachable (only relevant when using Groq)
+    ollama_ok: bool = False           # Ollama LLM model loaded (only relevant when using Ollama)
+    embed_ok: bool = False            # Ollama embed model loaded (always required)

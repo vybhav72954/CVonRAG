@@ -77,7 +77,7 @@ class TestHealth:
             resp = client.get("/health")
         assert resp.status_code == 200
         body = resp.json()
-        for field in ("status", "model", "qdrant_connected", "ollama_ok"):
+        for field in ("status", "model", "llm_backend", "qdrant_connected", "ollama_ok", "groq_ok", "embed_ok"):
             assert field in body
 
 

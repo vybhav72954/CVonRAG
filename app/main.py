@@ -136,22 +136,51 @@ async def root():
 
 @app.get("/health", response_model=HealthResponse, tags=["infra"])
 async def health_check():
-    """Liveness probe — checks both Ollama and Qdrant connectivity."""
-    qdrant    = await collection_info()
+    """Liveness probe — checks LLM backend (Groq or Ollama) + embed model + Qdrant."""
+    qdrant = await collection_info()
+    using_groq = bool(settings.groq_api_key)
+
+    groq_ok   = False
     ollama_ok = False
-    try:
-        async with httpx.AsyncClient(timeout=5.0) as c:
-            r      = await c.get(f"{settings.ollama_base_url}/api/tags")
+    embed_ok  = False
+
+    async with httpx.AsyncClient(timeout=5.0) as c:
+        # ── Always check Ollama for the embed model ──────────────────────
+        try:
+            r = await c.get(f"{settings.ollama_base_url}/api/tags")
             models = [m["name"] for m in r.json().get("models", [])]
-            base   = settings.ollama_llm_model.split(":")[0]
-            ollama_ok = any(base in m for m in models)
-    except Exception:
-        pass
+            embed_base = settings.ollama_embed_model.split(":")[0]
+            embed_ok = any(embed_base in m for m in models)
+
+            # ── Ollama LLM model (only needed when Groq is NOT configured) ──
+            if not using_groq:
+                llm_base = settings.ollama_llm_model.split(":")[0]
+                ollama_ok = any(llm_base in m for m in models)
+        except Exception:
+            pass
+
+        # ── Groq API reachability (only when Groq IS configured) ─────────
+        if using_groq:
+            try:
+                r = await c.get(
+                    f"{settings.groq_base_url}/models",
+                    headers={"Authorization": f"Bearer {settings.groq_api_key}"},
+                )
+                groq_ok = r.status_code == 200
+            except Exception:
+                pass
+
+    # Determine overall status
+    llm_healthy = groq_ok if using_groq else ollama_ok
+    all_ok = llm_healthy and embed_ok and qdrant["qdrant_connected"]
 
     return HealthResponse(
-        status="ok" if (ollama_ok and qdrant["qdrant_connected"]) else "degraded",
-        model=settings.ollama_llm_model,
+        status="ok" if all_ok else "degraded",
+        llm_backend="groq" if using_groq else "ollama",
+        model=settings.groq_model if using_groq else settings.ollama_llm_model,
+        groq_ok=groq_ok,
         ollama_ok=ollama_ok,
+        embed_ok=embed_ok,
         **qdrant,
     )
 
