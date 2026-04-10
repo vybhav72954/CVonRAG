@@ -53,7 +53,15 @@ def get_http() -> httpx.AsyncClient:
 # ── Embeddings via Ollama ─────────────────────────────────────────────────────
 
 # Limit concurrent embedding requests to avoid overwhelming Ollama.
-_EMBED_SEM = asyncio.Semaphore(3)
+_EMBED_SEM: asyncio.Semaphore | None = None
+
+
+def _get_embed_sem() -> asyncio.Semaphore:
+    """Lazy-init the semaphore inside a running event loop (defensive)."""
+    global _EMBED_SEM
+    if _EMBED_SEM is None:
+        _EMBED_SEM = asyncio.Semaphore(3)
+    return _EMBED_SEM
 
 
 async def embed_text(text: str) -> list[float]:
@@ -75,7 +83,7 @@ async def embed_text(text: str) -> list[float]:
 
 async def _embed_text_throttled(text: str) -> list[float]:
     """Wraps embed_text with a concurrency semaphore."""
-    async with _EMBED_SEM:
+    async with _get_embed_sem():
         return await embed_text(text)
 
 
