@@ -23,7 +23,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-from app.chains import CVonRAGOrchestrator, get_http
+from app.chains import CVonRAGOrchestrator, close_http, get_http
 from app.config import get_settings
 from app.models import (
     GeneratedBullet,
@@ -37,6 +37,7 @@ from app.models import (
 from app.parser import parse_and_stream
 from app.recommender import recommend_projects as _do_recommend
 from app.vector_store import (
+    close_clients,
     collection_info,
     ensure_collection_exists,
     ingest_gold_standard_bullets,
@@ -61,7 +62,11 @@ async def lifespan(_: FastAPI):
     except Exception as exc:
         logger.warning("Qdrant startup check failed (will retry on first request): %s", exc)
     yield
-    logger.info("CVonRAG shutting down.")
+    # ── Shutdown: close singleton clients ──────────────────────────────
+    logger.info("CVonRAG shutting down — closing connections …")
+    await close_http()          # chains.py HTTP client
+    await close_clients()       # vector_store.py HTTP + Qdrant clients
+    logger.info("All connections closed.")
 
 
 # ── App ───────────────────────────────────────────────────────────────────────
@@ -136,22 +141,51 @@ async def root():
 
 @app.get("/health", response_model=HealthResponse, tags=["infra"])
 async def health_check():
-    """Liveness probe — checks both Ollama and Qdrant connectivity."""
-    qdrant    = await collection_info()
+    """Liveness probe — checks LLM backend (Groq or Ollama) + embed model + Qdrant."""
+    qdrant = await collection_info()
+    using_groq = bool(settings.groq_api_key)
+
+    groq_ok   = False
     ollama_ok = False
-    try:
-        async with httpx.AsyncClient(timeout=5.0) as c:
-            r      = await c.get(f"{settings.ollama_base_url}/api/tags")
+    embed_ok  = False
+
+    async with httpx.AsyncClient(timeout=5.0) as c:
+        # ── Always check Ollama for the embed model ──────────────────────
+        try:
+            r = await c.get(f"{settings.ollama_base_url}/api/tags")
             models = [m["name"] for m in r.json().get("models", [])]
-            base   = settings.ollama_llm_model.split(":")[0]
-            ollama_ok = any(base in m for m in models)
-    except Exception:
-        pass
+            embed_base = settings.ollama_embed_model.split(":")[0]
+            embed_ok = any(embed_base in m for m in models)
+
+            # ── Ollama LLM model (only needed when Groq is NOT configured) ──
+            if not using_groq:
+                llm_base = settings.ollama_llm_model.split(":")[0]
+                ollama_ok = any(llm_base in m for m in models)
+        except Exception:
+            pass
+
+        # ── Groq API reachability (only when Groq IS configured) ─────────
+        if using_groq:
+            try:
+                r = await c.get(
+                    f"{settings.groq_base_url}/models",
+                    headers={"Authorization": f"Bearer {settings.groq_api_key}"},
+                )
+                groq_ok = r.status_code == 200
+            except Exception:
+                pass
+
+    # Determine overall status
+    llm_healthy = groq_ok if using_groq else ollama_ok
+    all_ok = llm_healthy and embed_ok and qdrant["qdrant_connected"]
 
     return HealthResponse(
-        status="ok" if (ollama_ok and qdrant["qdrant_connected"]) else "degraded",
-        model=settings.ollama_llm_model,
+        status="ok" if all_ok else "degraded",
+        llm_backend="groq" if using_groq else "ollama",
+        model=settings.groq_model if using_groq else settings.ollama_llm_model,
+        groq_ok=groq_ok,
         ollama_ok=ollama_ok,
+        embed_ok=embed_ok,
         **qdrant,
     )
 
@@ -170,13 +204,14 @@ async def parse_cv(file: UploadFile = File(...)):
 
     Upload a `.docx` biodata or `.pdf` CV.
     Returns a `text/event-stream` SSE response showing extraction progress.
+    All events are wrapped in a `StreamChunk` envelope (same as `/optimize`).
 
-    | Event type | Payload | Description |
+    | Event type | `data` field | Description |
     |---|---|---|
     | `progress` | `{message, current, total}` | Extraction progress update |
     | `project`  | `{project: ProjectData, index, total}` | One project completed |
     | `done`     | `{total_projects, total_facts}` | All done |
-    | `error`    | `{error_message}` | Parse error |
+    | `error`    | `null` (see `error_message`) | Parse error |
     """
     if not file.filename:
         raise HTTPException(status_code=400, detail="No filename provided.")
@@ -206,7 +241,13 @@ async def parse_cv(file: UploadFile = File(...)):
         }
         async for event_type, data in parse_and_stream(file_bytes, file.filename, http_client):
             sse_event = _PARSE_EVENT_MAP.get(event_type, event_type)
-            yield f"event: {sse_event}\ndata: {json.dumps(data)}\n\n"
+            if event_type == "error":
+                yield _sse(StreamChunk(
+                    event_type=sse_event,
+                    error_message=data.get("error_message", "Unknown parse error"),
+                ))
+            else:
+                yield _sse(StreamChunk(event_type=sse_event, data=data))
 
     return StreamingResponse(_stream(), media_type="text/event-stream", headers=_SSE_HEADERS)
 

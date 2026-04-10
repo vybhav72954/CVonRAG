@@ -48,6 +48,14 @@ def get_http() -> httpx.AsyncClient:
     return _http
 
 
+async def close_http() -> None:
+    """Gracefully close the shared HTTP client (call on shutdown)."""
+    global _http
+    if _http is not None:
+        await _http.aclose()
+        _http = None
+
+
 # ═════════════════════════════════════════════════════════════════════════════
 # LLM helpers — route to Groq (if GROQ_API_KEY set) or Ollama (fallback)
 # ═════════════════════════════════════════════════════════════════════════════
@@ -389,7 +397,7 @@ Output only the revised bullet (single line, no explanation):"""
 class BulletAlchemist:
     """Phase 4: generate one bullet point with the ±tolerance char-limit loop."""
 
-    async def generate_bullet(
+    def _build_initial_prompt(
         self,
         scored_facts: list[ScoredFact],
         exemplars: list[StyleExemplar],
@@ -397,9 +405,9 @@ class BulletAlchemist:
         jd_tone: JDTone,
         constraints: FormattingConstraints,
         role_type: RoleType,
-    ) -> BulletDraft:
-        """Run the full correction loop. Returns best draft within tolerance, or closest."""
-        initial_prompt = _GENERATION_TEMPLATE.format(
+    ) -> str:
+        """Build the initial generation prompt (shared by stream + correction)."""
+        return _GENERATION_TEMPLATE.format(
             role_type=role_type.value,
             jd_tone=jd_tone.value,
             jd_keywords=", ".join(jd_analysis.get("required_skills", [])[:settings.jd_top_keywords]),
@@ -411,6 +419,20 @@ class BulletAlchemist:
             upper=constraints.upper_bound,
         )
 
+    async def generate_bullet(
+        self,
+        scored_facts: list[ScoredFact],
+        exemplars: list[StyleExemplar],
+        jd_analysis: dict,
+        jd_tone: JDTone,
+        constraints: FormattingConstraints,
+        role_type: RoleType,
+    ) -> BulletDraft:
+        """Run the full correction loop (cold start — no streamed draft)."""
+        initial_prompt = self._build_initial_prompt(
+            scored_facts, exemplars, jd_analysis, jd_tone, constraints, role_type,
+        )
+
         history: list[dict] = [{"role": "user", "content": initial_prompt}]
         bullet  = _clean_bullet(
             await _ollama_chat(system=_ALCHEMIST_SYSTEM, messages=history),
@@ -418,6 +440,44 @@ class BulletAlchemist:
         )
         history.append({"role": "assistant", "content": bullet})
 
+        return await self._correction_loop(bullet, history, scored_facts, constraints)
+
+    async def generate_bullet_from_draft(
+        self,
+        initial_draft: str,
+        scored_facts: list[ScoredFact],
+        exemplars: list[StyleExemplar],
+        jd_analysis: dict,
+        jd_tone: JDTone,
+        constraints: FormattingConstraints,
+        role_type: RoleType,
+    ) -> BulletDraft:
+        """Run the correction loop starting from an already-generated draft.
+
+        This avoids a redundant LLM call when the initial draft was already
+        produced by stream_initial_tokens().
+        """
+        initial_prompt = self._build_initial_prompt(
+            scored_facts, exemplars, jd_analysis, jd_tone, constraints, role_type,
+        )
+        bullet = _clean_bullet(initial_draft, constraints.bullet_prefix)
+
+        # Reconstruct conversation history as if the LLM had produced this draft
+        history: list[dict] = [
+            {"role": "user", "content": initial_prompt},
+            {"role": "assistant", "content": bullet},
+        ]
+
+        return await self._correction_loop(bullet, history, scored_facts, constraints)
+
+    async def _correction_loop(
+        self,
+        bullet: str,
+        history: list[dict],
+        scored_facts: list[ScoredFact],
+        constraints: FormattingConstraints,
+    ) -> BulletDraft:
+        """Shared ±tolerance char-limit correction loop."""
         best: BulletDraft | None = None
 
         for iteration in range(1, settings.char_loop_max_iterations + 1):
@@ -474,23 +534,25 @@ class BulletAlchemist:
         constraints: FormattingConstraints,
         role_type: RoleType,
     ) -> AsyncGenerator[str, None]:
-        """Phase 5: stream raw tokens from the initial draft pass only."""
-        initial_prompt = _GENERATION_TEMPLATE.format(
-            role_type=role_type.value,
-            jd_tone=jd_tone.value,
-            jd_keywords=", ".join(jd_analysis.get("required_skills", [])[:10]),
-            facts=_format_facts(scored_facts),
-            exemplars=_format_exemplars(exemplars),
-            prefix=constraints.bullet_prefix,
-            target=constraints.target_char_limit,
-            lower=constraints.lower_bound,
-            upper=constraints.upper_bound,
+        """Stream raw tokens from the initial draft pass.
+
+        Yields each token AND sets self.last_streamed_draft to the full
+        concatenated text so the caller can reuse it in the correction loop.
+        """
+        initial_prompt = self._build_initial_prompt(
+            scored_facts, exemplars, jd_analysis, jd_tone, constraints, role_type,
         )
+        accumulated: list[str] = []
         async for token in _ollama_stream(
             system=_ALCHEMIST_SYSTEM,
             messages=[{"role": "user", "content": initial_prompt}],
         ):
+            accumulated.append(token)
             yield token
+
+        # Store the full draft so the orchestrator can pass it to the
+        # correction loop without making a second LLM call.
+        self.last_streamed_draft = "".join(accumulated)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -564,8 +626,10 @@ class CVonRAGOrchestrator:
                 ):
                     yield ("token", token)
 
-                # Phase 4: correction loop (silent, runs after stream)
-                draft = await self.alchemist.generate_bullet(
+                # Phase 4: correction loop — reuse the streamed draft
+                # instead of making a second LLM call from scratch
+                draft = await self.alchemist.generate_bullet_from_draft(
+                    initial_draft=self.alchemist.last_streamed_draft,
                     scored_facts=facts,
                     exemplars=exemplars,
                     jd_analysis=jd_analysis,
