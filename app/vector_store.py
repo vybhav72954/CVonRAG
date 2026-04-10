@@ -50,6 +50,17 @@ def get_http() -> httpx.AsyncClient:
     return _http
 
 
+async def close_clients() -> None:
+    """Gracefully close singleton HTTP + Qdrant clients (call on shutdown)."""
+    global _http, _qdrant
+    if _http is not None:
+        await _http.aclose()
+        _http = None
+    if _qdrant is not None:
+        await _qdrant.close()
+        _qdrant = None
+
+
 # ── Embeddings via Ollama ─────────────────────────────────────────────────────
 
 # Limit concurrent embedding requests to avoid overwhelming Ollama.

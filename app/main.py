@@ -23,7 +23,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-from app.chains import CVonRAGOrchestrator, get_http
+from app.chains import CVonRAGOrchestrator, close_http, get_http
 from app.config import get_settings
 from app.models import (
     GeneratedBullet,
@@ -37,6 +37,7 @@ from app.models import (
 from app.parser import parse_and_stream
 from app.recommender import recommend_projects as _do_recommend
 from app.vector_store import (
+    close_clients,
     collection_info,
     ensure_collection_exists,
     ingest_gold_standard_bullets,
@@ -61,7 +62,11 @@ async def lifespan(_: FastAPI):
     except Exception as exc:
         logger.warning("Qdrant startup check failed (will retry on first request): %s", exc)
     yield
-    logger.info("CVonRAG shutting down.")
+    # ── Shutdown: close singleton clients ──────────────────────────────
+    logger.info("CVonRAG shutting down — closing connections …")
+    await close_http()          # chains.py HTTP client
+    await close_clients()       # vector_store.py HTTP + Qdrant clients
+    logger.info("All connections closed.")
 
 
 # ── App ───────────────────────────────────────────────────────────────────────

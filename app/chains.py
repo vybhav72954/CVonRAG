@@ -48,6 +48,14 @@ def get_http() -> httpx.AsyncClient:
     return _http
 
 
+async def close_http() -> None:
+    """Gracefully close the shared HTTP client (call on shutdown)."""
+    global _http
+    if _http is not None:
+        await _http.aclose()
+        _http = None
+
+
 # ═════════════════════════════════════════════════════════════════════════════
 # LLM helpers — route to Groq (if GROQ_API_KEY set) or Ollama (fallback)
 # ═════════════════════════════════════════════════════════════════════════════
