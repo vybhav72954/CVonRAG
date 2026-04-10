@@ -156,9 +156,16 @@ export async function optimizeResume(payload, callbacks = {}) {
   }, onError);
 }
 
-/** GET /health */
+/** GET /health — quick backend liveness check.
+ *  Returns { ok, data?, reason? } so callers can show a banner instead of crashing. */
 export async function checkHealth() {
-  const r = await fetch(`${BASE}/health`);
-  if (!r.ok) throw new Error('Health check failed');
-  return r.json();
+  try {
+    const r = await fetch(`${BASE}/health`, { signal: AbortSignal.timeout(5000) });
+    if (!r.ok) return { ok: false, reason: `HTTP ${r.status}` };
+    return { ok: true, data: await r.json() };
+  } catch (err) {
+    return { ok: false, reason: err.name === 'TimeoutError'
+      ? 'Backend did not respond within 5 s'
+      : `Cannot reach backend at ${BASE}` };
+  }
 }

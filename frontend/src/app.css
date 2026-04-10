@@ -370,6 +370,29 @@ html {
     opacity: 0.6;
   }
 
+  /* ── Screen-reader only ─────────────────────────────────────────────── */
+  .sr-only {
+    position: absolute;
+    width: 1px; height: 1px;
+    padding: 0; margin: -1px;
+    overflow: hidden;
+    clip: rect(0,0,0,0);
+    border: 0;
+  }
+
+  /* ── Error banner ─────────────────────────────────────────────────── */
+  .error-banner {
+    display: flex;
+    align-items: center;
+    gap: 0.625rem;
+    padding: 0.75rem 1rem;
+    border-radius: var(--radius);
+    background: var(--red-dim);
+    border: 1px solid var(--red-border);
+    color: #fca5a5;
+    font-size: 0.8125rem;
+  }
+
   /* ── Background dots ───────────────────────────────────────────────── */
   .bg-dots {
     background-image: radial-gradient(rgba(255,255,255,0.03) 1px, transparent 1px);

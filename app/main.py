@@ -18,7 +18,7 @@ from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 
 import httpx
-from fastapi import FastAPI, File, HTTPException, UploadFile, status
+from fastapi import FastAPI, File, Header, HTTPException, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
@@ -29,7 +29,6 @@ from app.models import (
     GeneratedBullet,
     HealthResponse,
     OptimizationRequest,
-    ProjectRecommendation,
     RecommendRequest,
     RecommendResponse,
     StreamChunk,
@@ -199,8 +198,15 @@ async def parse_cv(file: UploadFile = File(...)):
     http_client = get_http()
 
     async def _stream():
+        _PARSE_EVENT_MAP = {
+            "progress": StreamEventType.PROGRESS,
+            "project":  StreamEventType.PROJECT,
+            "done":     StreamEventType.DONE,
+            "error":    StreamEventType.ERROR,
+        }
         async for event_type, data in parse_and_stream(file_bytes, file.filename, http_client):
-            yield f"event: {event_type}\ndata: {json.dumps(data)}\n\n"
+            sse_event = _PARSE_EVENT_MAP.get(event_type, event_type)
+            yield f"event: {sse_event}\ndata: {json.dumps(data)}\n\n"
 
     return StreamingResponse(_stream(), media_type="text/event-stream", headers=_SSE_HEADERS)
 
@@ -229,22 +235,7 @@ async def recommend(body: RecommendRequest):
         job_description=body.job_description,
         top_k=body.top_k,
     )
-    return RecommendResponse(
-        recommendations=[
-            ProjectRecommendation(
-                project_id    =r.project_id,
-                title         =r.title,
-                score         =r.score,
-                rank          =r.rank,
-                reason        =r.reason,
-                matched_skills=r.matched_skills,
-                top_metrics   =r.top_metrics,
-                recommended   =r.recommended,
-                core_facts    =r.core_facts,
-            )
-            for r in recs
-        ]
-    )
+    return RecommendResponse(recommendations=recs)
 
 
 # ── Bullet generation ─────────────────────────────────────────────────────────
@@ -298,11 +289,22 @@ class IngestResponse(BaseModel):
 
 
 @app.post("/ingest", response_model=IngestResponse, tags=["admin"])
-async def ingest(body: IngestRequest):
+async def ingest(
+    body: IngestRequest,
+    x_ingest_secret: str | None = Header(default=None),
+):
     """
     **Admin endpoint** — seed Qdrant with Gold Standard CV bullets.
-    Protect behind auth before public exposure.
+
+    When `INGEST_SECRET` is set in `.env`, callers must send
+    `X-Ingest-Secret: <secret>` in the request header.
     """
+    if settings.ingest_secret:
+        if x_ingest_secret != settings.ingest_secret:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Invalid or missing X-Ingest-Secret header.",
+            )
     try:
         count = await ingest_gold_standard_bullets(
             [item.model_dump() for item in body.bullets]

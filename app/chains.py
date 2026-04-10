@@ -402,7 +402,7 @@ class BulletAlchemist:
         initial_prompt = _GENERATION_TEMPLATE.format(
             role_type=role_type.value,
             jd_tone=jd_tone.value,
-            jd_keywords=", ".join(jd_analysis.get("required_skills", [])[:10]),
+            jd_keywords=", ".join(jd_analysis.get("required_skills", [])[:settings.jd_top_keywords]),
             facts=_format_facts(scored_facts),
             exemplars=_format_exemplars(exemplars),
             prefix=constraints.bullet_prefix,
@@ -521,7 +521,7 @@ class CVonRAGOrchestrator:
 
         # Phase 3
         style_query = (
-            request.job_description[:500]
+            request.job_description[:settings.style_query_jd_chars]
             + " "
             + " ".join(sf.fact.text for sf in all_scored[:8])
         )

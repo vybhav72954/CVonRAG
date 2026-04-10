@@ -52,19 +52,36 @@ def get_http() -> httpx.AsyncClient:
 
 # ── Embeddings via Ollama ─────────────────────────────────────────────────────
 
+# Limit concurrent embedding requests to avoid overwhelming Ollama.
+_EMBED_SEM = asyncio.Semaphore(3)
+
+
 async def embed_text(text: str) -> list[float]:
     """Single embedding via Ollama /api/embeddings."""
-    r = await get_http().post(
-        f"{settings.ollama_base_url}/api/embeddings",
-        json={"model": settings.ollama_embed_model, "prompt": text},
-    )
-    r.raise_for_status()
-    return r.json()["embedding"]
+    try:
+        r = await get_http().post(
+            f"{settings.ollama_base_url}/api/embeddings",
+            json={"model": settings.ollama_embed_model, "prompt": text},
+        )
+        r.raise_for_status()
+        return r.json()["embedding"]
+    except httpx.HTTPStatusError as exc:
+        logger.error("Ollama embedding HTTP %s for text %.40s…: %s", exc.response.status_code, text, exc)
+        raise RuntimeError(f"Embedding failed (HTTP {exc.response.status_code})") from exc
+    except httpx.RequestError as exc:
+        logger.error("Ollama embedding connection error: %s", exc)
+        raise RuntimeError("Embedding service unavailable — is Ollama running?") from exc
+
+
+async def _embed_text_throttled(text: str) -> list[float]:
+    """Wraps embed_text with a concurrency semaphore."""
+    async with _EMBED_SEM:
+        return await embed_text(text)
 
 
 async def embed_texts(texts: list[str]) -> list[list[float]]:
-    """Concurrent batch embeddings (Ollama has no native batch endpoint)."""
-    return list(await asyncio.gather(*[embed_text(t) for t in texts]))
+    """Concurrent batch embeddings, throttled to 3 at a time."""
+    return list(await asyncio.gather(*[_embed_text_throttled(t) for t in texts]))
 
 
 # ── Collection management ─────────────────────────────────────────────────────

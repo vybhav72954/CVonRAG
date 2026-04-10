@@ -218,9 +218,13 @@ async def extract_facts(project: RawProject, http_client=None) -> list[CoreFact]
     facts: list[CoreFact] = []
     for i, item in enumerate(raw_facts):
         try:
+            text = item.get("text", "")
+            if not text:
+                logger.debug("Skipping fact %d: missing 'text' field.", i)
+                continue
             facts.append(CoreFact(
                 fact_id=item.get("fact_id", f"{slug}-{i + 1}"),
-                text=item["text"],
+                text=text,
                 tools=item.get("tools", []),
                 metrics=item.get("metrics", []),
                 outcome=item.get("outcome", ""),

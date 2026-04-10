@@ -7,9 +7,8 @@ import json
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from app.models import CoreFact, ProjectData
+from app.models import CoreFact, ProjectData, ProjectRecommendation
 from app.recommender import (
-    ProjectRecommendation,
     _project_score,
     _top_metrics,
     recommend_projects,
@@ -285,7 +284,7 @@ class TestRecommendEndpoint:
     def test_recommend_returns_200(self):
         from fastapi.testclient import TestClient
         from app.main import app
-        from app.recommender import ProjectRecommendation as PR
+        from app.models import ProjectRecommendation as PR
 
         async def _mock_recommend(projects, job_description, top_k):
             return [
