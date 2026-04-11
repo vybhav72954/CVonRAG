@@ -210,13 +210,14 @@
     </div>
 
     <h1 class="hero-title">
-      Transform your <span class="gradient-text">BioData</span><br/>
-      with AI precision
+      Create your <span class="gradient-text">Resume</span><br/>
+      leavarging our state-of-the-art Corpus
     </h1>
 
     <p class="hero-subtitle">
-      Not your CV. Your <span class="biodata-term" tabindex="0">BioData<span class="biodata-tooltip">A BioData is your complete project inventory: every project you've done, with all related facts, metrics, tools, and outcomes. As detailed as possible.</span></span>
-      is your full project inventory. Upload it and our 5-phase RAG pipeline
+      Upload your <span class="biodata-term" tabindex="0">BioData.<span class="biodata-tooltip">A BioData is your complete project inventory: every project you've done, with all related facts, metrics, tools, and outcomes. As detailed as possible.</span></span>
+      It should contain all our projects, along with all your bullets, metrics and impacts.
+      Sit back and relax as  our 5-phase RAG pipeline
       extracts every project, metric, and tool, then crafts bullets that match any JD's tone.
     </p>
 
@@ -238,7 +239,7 @@
         <span class="pill-icon">
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="var(--green)" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
         </span>
-        <span class="pill-value">Style Firewall</span>
+        <span class="pill-value">Curated CVs</span>
       </div>
     </div>
   </div>
