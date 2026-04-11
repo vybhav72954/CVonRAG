@@ -192,12 +192,12 @@
     <path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/>
     <line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/>
   </svg>
-  <span>Backend unreachable — {backendMsg}. Make sure the API server is running.</span>
+  <span>Backend unreachable: {backendMsg}. Make sure the API server is running.</span>
 </div>
 {/if}
 
 <!-- ═══════════════════════════════════════════════════════════════════════════
-     STEP 1 — Upload CV
+     STEP 1: Upload BioData
      ═══════════════════════════════════════════════════════════════════════ -->
 {#if $step === 1}
 <div class="fade-in step-container">
@@ -210,13 +210,14 @@
     </div>
 
     <h1 class="hero-title">
-      Transform your <span class="gradient-text">resume</span><br/>
+      Transform your <span class="gradient-text">BioData</span><br/>
       with AI precision
     </h1>
 
     <p class="hero-subtitle">
-      Drop your CV and watch our 5-phase RAG pipeline extract every project,
-      metric, and tool — then craft bullets that match any JD's tone.
+      Not your CV. Your <span class="biodata-term" tabindex="0">BioData<span class="biodata-tooltip">A BioData is your complete project inventory: every project you've done, with all related facts, metrics, tools, and outcomes. As detailed as possible.</span></span>
+      is your full project inventory. Upload it and our 5-phase RAG pipeline
+      extracts every project, metric, and tool, then crafts bullets that match any JD's tone.
     </p>
 
     <!-- Feature pills -->
@@ -271,7 +272,7 @@
           </defs>
         </svg>
       </div>
-      <p class="drop-text">Drop your resume here or <span class="gradient-text">browse files</span></p>
+      <p class="drop-text">Drop your BioData here or <span class="gradient-text">browse files</span></p>
       <p class="drop-hint mono">.docx (recommended) or .pdf · max 10 MB</p>
       <input bind:this={fileInput} type="file" accept=".docx,.pdf" class="hidden" on:change={onFileChange} id="cv-upload" />
     </div>
@@ -352,7 +353,7 @@
 
       {#if expanded}
       <div class="project-facts">
-        <p class="facts-hint">Optional — edit if the parser missed something.</p>
+        <p class="facts-hint">Optional: edit if the parser missed something.</p>
         {#each project.core_facts as fact, fi}
         <div class="fact-card">
           <span class="chip mono" style="font-size:0.6rem">{fact.fact_id}</span>
@@ -395,7 +396,7 @@
 </div>
 
 <!-- ═══════════════════════════════════════════════════════════════════════════
-     STEP 2 — JD + AI Recommendation + Generate
+     STEP 2: JD + AI Recommendation + Generate
      ═══════════════════════════════════════════════════════════════════════ -->
 {:else if $step === 2}
 <div class="fade-in step-container">
@@ -457,7 +458,7 @@
     <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="margin-right:8px">
       <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/>
     </svg>
-    Analyse JD — Find Best Projects
+    Analyse JD: Find Best Projects
   </button>
   {#if $recommendStatus === 'error'}
     <div class="error-banner">
@@ -484,7 +485,7 @@
     <div class="section-header">
       <div>
         <h2 class="section-title">AI Recommendation</h2>
-        <p class="section-subtitle">Toggle projects to include in your optimized resume.</p>
+        <p class="section-subtitle">Toggle projects to include in your optimised bullets.</p>
       </div>
       <button class="btn-ghost" on:click={() => recommendStatus.set('idle')}>Re-analyse</button>
     </div>
@@ -578,7 +579,7 @@
 </div>
 
 <!-- ═══════════════════════════════════════════════════════════════════════════
-     STEP 3 — Results
+     STEP 3: Results
      ═══════════════════════════════════════════════════════════════════════ -->
 {:else if $step === 3}
 <div class="fade-in step-container">
@@ -739,6 +740,54 @@
     color: var(--text-secondary);
     line-height: 1.7;
     max-width: 38rem;
+  }
+
+  /* ── BioData tooltip ───────────────────────────────────────────────── */
+  .biodata-term {
+    position: relative;
+    color: var(--accent-light);
+    font-weight: 600;
+    cursor: help;
+    border-bottom: 1px dashed rgba(167, 139, 250, 0.4);
+  }
+
+  .biodata-tooltip {
+    position: absolute;
+    bottom: calc(100% + 10px);
+    left: 50%;
+    transform: translateX(-50%);
+    width: 300px;
+    padding: 0.75rem 1rem;
+    background: var(--surface-solid);
+    border: 1px solid var(--border-hi);
+    border-radius: var(--radius-sm);
+    font-size: 0.75rem;
+    font-weight: 400;
+    color: var(--text-secondary);
+    line-height: 1.6;
+    pointer-events: none;
+    opacity: 0;
+    transition: opacity 0.2s, transform 0.2s;
+    transform: translateX(-50%) translateY(4px);
+    z-index: 20;
+    box-shadow: 0 8px 30px rgba(0,0,0,0.4);
+  }
+
+  .biodata-tooltip::after {
+    content: '';
+    position: absolute;
+    top: 100%;
+    left: 50%;
+    transform: translateX(-50%);
+    border: 6px solid transparent;
+    border-top-color: var(--border-hi);
+  }
+
+  .biodata-term:hover .biodata-tooltip,
+  .biodata-term:focus .biodata-tooltip {
+    opacity: 1;
+    transform: translateX(-50%) translateY(0);
+    pointer-events: auto;
   }
 
   .hero-features {

@@ -3,7 +3,7 @@
   import { step } from '$lib/stores';
 
   const STEPS = [
-    { n: 1, label: 'Upload CV',       icon: '↑' },
+    { n: 1, label: 'Upload BioData',  icon: '↑' },
     { n: 2, label: 'Job Description', icon: '≡' },
     { n: 3, label: 'Results',         icon: '◆' },
   ];
