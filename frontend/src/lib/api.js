@@ -114,7 +114,7 @@ export async function recommendProjects(payload) {
   } catch (err) {
     clearTimeout(timer);
     if (err.name === 'AbortError') {
-      throw new Error('JD analysis timed out — the AI took too long. Try again or shorten the JD.');
+      throw new Error('JD analysis timed out: the AI took too long. Try again or shorten the JD.');
     }
     throw err;
   }
