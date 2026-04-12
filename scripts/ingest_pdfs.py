@@ -18,13 +18,14 @@ What it does:
 
 
 Usage:
-  python scripts/ingest_pdfs.py \\
-      --pdf_dir  /path/to/your/good_cvs/ \\
-      --api_url  http://localhost:8000 \\
-      --ollama   http://localhost:11434 \\
-      --model    qwen2.5:7b \\
-      --secret   your_secret_here  # or set INGEST_SECRET env var
-      --dry_run          # optional: print bullets without posting
+  # All secrets are read from .env automatically (GROQ_API_KEY, INGEST_SECRET).
+  # If GROQ_API_KEY is set, tagging uses Groq (~10 min for 288 bullets).
+  # If not, falls back to local Ollama (~60 min on CPU).
+
+  python scripts/ingest_pdfs.py --pdf_dir ./docs/good_cvs
+
+  # Skip tagging entirely (all bullets get role_type=general):
+  python scripts/ingest_pdfs.py --pdf_dir ./docs/good_cvs --skip_tag
 
 
 Dependencies (add to your venv):
@@ -40,7 +41,11 @@ import json
 import os
 import re
 import sys
+import time
 from pathlib import Path
+
+from dotenv import load_dotenv
+load_dotenv()  # reads .env from project root so GROQ_API_KEY / INGEST_SECRET are available
 
 
 import httpx
@@ -257,39 +262,106 @@ Rules:
 
 
 
-def tag_bullet(bullet_text: str, ollama_url: str, model: str, timeout: int = 120) -> dict:
+_TAG_DEFAULTS = {
+    "role_type": "general",
+    "uses_separator": None,
+    "uses_arrow": False,
+    "sentence_structure": None,
+}
+
+
+def _parse_tag_response(raw: str) -> dict:
+    """Extract JSON from an LLM response, stripping fences and preamble."""
+    raw = re.sub(r"^```(?:json)?\s*", "", raw.strip())
+    raw = re.sub(r"\s*```$", "", raw)
+    if not raw:
+        raise ValueError("Model returned empty content")
+    match = re.search(r'\{.*\}', raw, re.DOTALL)
+    if not match:
+        raise ValueError(f"No JSON object found in response: {raw[:80]}")
+    return json.loads(match.group(0))
+
+
+def tag_bullet_ollama(bullet_text: str, ollama_url: str, model: str, timeout: int = 120) -> dict:
     """Call Ollama to tag a single bullet with style metadata."""
     payload = {
         "model": model,
         "messages": [{"role": "user", "content": f'Bullet: "{bullet_text}"'}],
         "stream": False,
-        "options": {"temperature": 0.0, "num_predict": 512, "num_ctx": 2048},  # ← 200→512
+        "options": {"temperature": 0.0, "num_predict": 512, "num_ctx": 2048},
         "system": _TAGGING_SYSTEM,
     }
-    _DEFAULTS = {
-        "role_type": "general",
-        "uses_separator": None,
-        "uses_arrow": False,
-        "sentence_structure": None,
-    }
-    for attempt in range(3):                                                    # ← retry up to 3×
+    for attempt in range(3):
         try:
             r = httpx.post(f"{ollama_url}/api/chat", json=payload, timeout=timeout)
             r.raise_for_status()
-            raw = r.json()["message"]["content"].strip()
-            raw = re.sub(r"^```(?:json)?\s*", "", raw)
-            raw = re.sub(r"\s*```$", "", raw)
-            if not raw:                                                         # ← guard empty string
-                raise ValueError("Model returned empty content")
-            # Extract first {...} block in case model adds preamble text
-            match = re.search(r'\{.*\}', raw, re.DOTALL)                       # ← extract JSON blob
-            if not match:
-                raise ValueError(f"No JSON object found in response: {raw[:80]}")
-            return json.loads(match.group(0))
+            return _parse_tag_response(r.json()["message"]["content"])
         except Exception as exc:
-            if attempt == 2:                                                    # ← only warn on final failure
+            if attempt == 2:
                 log(f"  [yellow]Tag failed for bullet (will use defaults): {exc}[/yellow]")
-    return _DEFAULTS
+    return _TAG_DEFAULTS
+
+
+_groq_last_call = 0.0          # monotonic timestamp of last Groq request
+_GROQ_MIN_INTERVAL = 2.2       # seconds between requests (27 req/min, safely under 30)
+
+
+def tag_bullet_groq(bullet_text: str, groq_api_key: str, groq_model: str,
+                    groq_base_url: str = "https://api.groq.com/openai/v1",
+                    timeout: int = 30) -> dict:
+    """Call Groq (OpenAI-compatible) to tag a single bullet. ~500 tok/sec."""
+    global _groq_last_call
+
+    payload = {
+        "model": groq_model,
+        "messages": [
+            {"role": "system", "content": _TAGGING_SYSTEM},
+            {"role": "user",   "content": f'Bullet: "{bullet_text}"'},
+        ],
+        "temperature": 0.0,
+        "max_tokens": 256,
+    }
+    headers = {
+        "Authorization": f"Bearer {groq_api_key}",
+        "Content-Type":  "application/json",
+    }
+
+    for attempt in range(5):
+        # Throttle: wait until min interval has passed since last request
+        elapsed = time.monotonic() - _groq_last_call
+        if elapsed < _GROQ_MIN_INTERVAL:
+            time.sleep(_GROQ_MIN_INTERVAL - elapsed)
+
+        try:
+            _groq_last_call = time.monotonic()
+            r = httpx.post(
+                f"{groq_base_url}/chat/completions",
+                json=payload, headers=headers, timeout=timeout,
+            )
+            # Groq free tier: 30 req/min. If we still hit 429, back off harder.
+            if r.status_code == 429:
+                wait = max(int(r.headers.get("retry-after", 10)), 5)
+                log(f"  [yellow]Groq rate limit, backing off {wait}s...[/yellow]")
+                time.sleep(wait)
+                continue
+            r.raise_for_status()
+            raw = r.json()["choices"][0]["message"]["content"]
+            return _parse_tag_response(raw)
+        except Exception as exc:
+            if attempt == 4:
+                log(f"  [yellow]Tag failed for bullet (will use defaults): {exc}[/yellow]")
+            else:
+                time.sleep(3)  # brief pause before network retry
+    return _TAG_DEFAULTS
+
+
+def tag_bullet(bullet_text: str, *, ollama_url: str, model: str,
+               groq_api_key: str | None = None, groq_model: str = "llama-3.3-70b-versatile",
+               groq_base_url: str = "https://api.groq.com/openai/v1") -> dict:
+    """Route tagging to Groq (if key set) or Ollama (fallback)."""
+    if groq_api_key:
+        return tag_bullet_groq(bullet_text, groq_api_key, groq_model, groq_base_url)
+    return tag_bullet_ollama(bullet_text, ollama_url, model)
 
 
 
@@ -322,16 +394,19 @@ def main():
     parser.add_argument("--pdf_dir",  required=True,  help="Folder containing your good CV PDFs")
     parser.add_argument("--api_url",  default="http://localhost:8000", help="CVonRAG API base URL")
     parser.add_argument("--ollama",   default="http://localhost:11434", help="Ollama base URL")
-    parser.add_argument("--model",    default="qwen2.5:7b",  help="Ollama model for tagging (7b is fine)")
+    parser.add_argument("--model",    default="qwen2.5:7b",  help="Ollama model for tagging (fallback if no Groq key)")
     parser.add_argument("--batch_size", type=int, default=50, help="Bullets per /ingest call")
     parser.add_argument("--dry_run",  action="store_true", help="Print bullets, do not POST to API")
     parser.add_argument("--debug_pdf", help="Print ALL extracted lines from a single PDF (use with filename)")
     parser.add_argument("--skip_tag", action="store_true", help="Skip LLM tagging (faster, less rich metadata)")
-    parser.add_argument("--secret",   default=None, help="X-Ingest-Secret value (or set INGEST_SECRET env var)")
     args = parser.parse_args()
 
-    # Resolve ingest secret: CLI flag > env var > None
-    ingest_secret = args.secret or os.environ.get("INGEST_SECRET") or None
+    # All secrets come from .env (loaded by dotenv at the top).
+    # No need to pass them on the command line.
+    ingest_secret = os.environ.get("INGEST_SECRET") or None
+    groq_api_key  = os.environ.get("GROQ_API_KEY") or None
+    groq_model    = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
+    groq_base_url = os.environ.get("GROQ_BASE_URL", "https://api.groq.com/openai/v1")
 
 
     # Debug mode: print what extraction logic sees from a single PDF
@@ -370,10 +445,12 @@ def main():
         sys.exit(1)
 
 
+    tag_backend = f"Groq ({groq_model})" if groq_api_key else f"Ollama ({args.model})"
+
     log(f"\n[bold]CVonRAG — Gold Standard Ingestion[/bold]")
     log(f"  PDFs found     : {len(pdfs)}")
     log(f"  API target     : {args.api_url}")
-    log(f"  Ollama model   : {args.model}")
+    log(f"  Tag backend    : {tag_backend}")
     log(f"  Ingest secret  : {'✓ set' if ingest_secret else '✗ not set (will fail if server requires it)'}")
     log(f"  Dry run        : {args.dry_run}\n")
 
@@ -413,12 +490,18 @@ def main():
                 "sentence_structure": None,
             })
     else:
-        log(f"Tagging {len(all_bullets_raw)} bullets via Ollama ({args.model})…")
-        log("(This is the slow step — ~2-3 seconds per bullet. Get a coffee.)\n")
+        if groq_api_key:
+            log(f"Tagging {len(all_bullets_raw)} bullets via [bold cyan]Groq[/bold cyan] ({groq_model})…")
+            log("(Fast: ~0.2s per bullet via Groq API. Rate limit: 30 req/min on free tier.)\n")
+        else:
+            log(f"Tagging {len(all_bullets_raw)} bullets via Ollama ({args.model})…")
+            log("(This is the slow step — ~2-3 seconds per bullet. Get a coffee.)\n")
+            log("[dim]Tip: pass --groq_key or set GROQ_API_KEY to use Groq instead (50x faster)[/dim]\n")
 
 
-        for filename, text in track(all_bullets_raw, description="Tagging bullets…"):  # ← was tqdm(..., description=)
-            tag = tag_bullet(text, args.ollama, args.model)
+        for filename, text in track(all_bullets_raw, description="Tagging bullets…"):
+            tag = tag_bullet(text, ollama_url=args.ollama, model=args.model,
+                             groq_api_key=groq_api_key, groq_model=groq_model)
             tagged_bullets.append({
                 "text":               text,
                 "role_type":          tag.get("role_type", "general"),
