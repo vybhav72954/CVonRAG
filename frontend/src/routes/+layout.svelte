@@ -3,7 +3,7 @@
   import { step } from '$lib/stores';
 
   const STEPS = [
-    { n: 1, label: 'Upload CV',       icon: '↑' },
+    { n: 1, label: 'Upload BioData',  icon: '↑' },
     { n: 2, label: 'Job Description', icon: '≡' },
     { n: 3, label: 'Results',         icon: '◆' },
   ];
@@ -11,11 +11,13 @@
 
 <div class="app-shell">
 
-  <!-- ── Ambient background effects ───────────────────────────────────── -->
+  <!-- ── Ambient background ──────────────────────────────────────────── -->
   <div class="ambient-bg" aria-hidden="true">
     <div class="ambient-orb orb-1"></div>
     <div class="ambient-orb orb-2"></div>
-    <div class="bg-dots-layer"></div>
+    <div class="ambient-orb orb-3"></div>
+    <div class="grid-layer"></div>
+    <div class="noise-layer"></div>
   </div>
 
   <!-- ── Header ───────────────────────────────────────────────────────── -->
@@ -24,7 +26,7 @@
       <!-- Logo -->
       <div class="logo-group">
         <div class="logo-mark">
-          <svg width="22" height="22" viewBox="0 0 24 24" fill="none">
+          <svg width="24" height="24" viewBox="0 0 24 24" fill="none">
             <path d="M12 2L2 7l10 5 10-5-10-5z" fill="url(#lg1)" opacity="0.9"/>
             <path d="M2 17l10 5 10-5M2 12l10 5 10-5" stroke="url(#lg2)" stroke-width="1.5" fill="none" stroke-linecap="round"/>
             <defs>
@@ -39,9 +41,7 @@
             </defs>
           </svg>
         </div>
-        <span class="logo-text">
-          CVon<span class="gradient-text">RAG</span>
-        </span>
+        <span class="logo-text">CVon<span class="gradient-text">RAG</span></span>
         <span class="version-chip">v1.1</span>
       </div>
 
@@ -75,9 +75,11 @@
 
   <!-- ── Footer ───────────────────────────────────────────────────────── -->
   <footer class="app-footer">
-    <span>Powered by Hopes, Dreams and Prayers</span>
-    <span class="footer-dot">·</span>
-    <span>Built with Coffee, Regret and No Sleep</span>
+    <div class="footer-inner">
+      <span>Powered by Hopes, Dreams and Prayers</span>
+      <span class="footer-dot">·</span>
+      <span>Built with Coffee, Regret and No Sleep</span>
+    </div>
   </footer>
 </div>
 
@@ -101,38 +103,66 @@
   .ambient-orb {
     position: absolute;
     border-radius: 50%;
-    filter: blur(100px);
-    opacity: 0.35;
+    filter: blur(120px);
   }
 
   .orb-1 {
-    width: 600px; height: 600px;
-    top: -200px; left: -100px;
-    background: radial-gradient(circle, rgba(124, 58, 237, 0.15) 0%, transparent 70%);
-    animation: orbDrift1 20s ease-in-out infinite;
+    width: 700px; height: 700px;
+    top: -250px; left: -150px;
+    background: radial-gradient(circle, rgba(124, 58, 237, 0.18) 0%, transparent 70%);
+    animation: orbDrift1 22s ease-in-out infinite;
   }
 
   .orb-2 {
-    width: 500px; height: 500px;
-    bottom: -150px; right: -100px;
-    background: radial-gradient(circle, rgba(6, 182, 212, 0.1) 0%, transparent 70%);
-    animation: orbDrift2 25s ease-in-out infinite;
+    width: 600px; height: 600px;
+    bottom: -200px; right: -150px;
+    background: radial-gradient(circle, rgba(6, 182, 212, 0.14) 0%, transparent 70%);
+    animation: orbDrift2 28s ease-in-out infinite;
+  }
+
+  .orb-3 {
+    width: 400px; height: 400px;
+    top: 40%; left: 50%;
+    transform: translate(-50%, -50%);
+    background: radial-gradient(circle, rgba(124, 58, 237, 0.08) 0%, transparent 70%);
+    animation: orbDrift3 18s ease-in-out infinite;
   }
 
   @keyframes orbDrift1 {
-    0%, 100% { transform: translate(0, 0); }
-    50%      { transform: translate(60px, 40px); }
+    0%, 100% { transform: translate(0, 0) scale(1); }
+    33%      { transform: translate(80px, 50px) scale(1.05); }
+    66%      { transform: translate(30px, -20px) scale(0.97); }
   }
   @keyframes orbDrift2 {
-    0%, 100% { transform: translate(0, 0); }
-    50%      { transform: translate(-40px, -30px); }
+    0%, 100% { transform: translate(0, 0) scale(1); }
+    33%      { transform: translate(-50px, -40px) scale(1.03); }
+    66%      { transform: translate(-80px, 20px) scale(0.98); }
+  }
+  @keyframes orbDrift3 {
+    0%, 100% { transform: translate(-50%, -50%) scale(1); opacity: 0.6; }
+    50%      { transform: translate(-40%, -55%) scale(1.15); opacity: 1; }
   }
 
-  .bg-dots-layer {
+  /* Grid overlay — subtle tech feel */
+  .grid-layer {
     position: absolute;
     inset: 0;
-    background-image: radial-gradient(rgba(255,255,255,0.025) 1px, transparent 1px);
-    background-size: 28px 28px;
+    background-image:
+      linear-gradient(rgba(255,255,255,0.02) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(255,255,255,0.02) 1px, transparent 1px);
+    background-size: 60px 60px;
+    mask-image: radial-gradient(ellipse 70% 60% at 50% 40%, black 30%, transparent 100%);
+    -webkit-mask-image: radial-gradient(ellipse 70% 60% at 50% 40%, black 30%, transparent 100%);
+  }
+
+  /* Noise texture */
+  .noise-layer {
+    position: absolute;
+    inset: 0;
+    opacity: 0.03;
+    background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+    background-repeat: repeat;
+    background-size: 256px 256px;
   }
 
   /* ── Header ─────────────────────────────────────────────────────────── */
@@ -140,9 +170,9 @@
     position: sticky;
     top: 0;
     z-index: 50;
-    background: rgba(6, 6, 10, 0.7);
-    backdrop-filter: blur(20px) saturate(1.2);
-    -webkit-backdrop-filter: blur(20px) saturate(1.2);
+    background: rgba(5, 5, 7, 0.75);
+    backdrop-filter: blur(24px) saturate(1.3);
+    -webkit-backdrop-filter: blur(24px) saturate(1.3);
     border-bottom: 1px solid rgba(255,255,255,0.04);
   }
 
@@ -167,12 +197,13 @@
     display: flex;
     align-items: center;
     justify-content: center;
+    filter: drop-shadow(0 0 8px rgba(124, 58, 237, 0.3));
   }
 
   .logo-text {
-    font-size: 1.05rem;
-    font-weight: 700;
-    letter-spacing: -0.02em;
+    font-size: 1.1rem;
+    font-weight: 800;
+    letter-spacing: -0.03em;
     color: var(--text);
   }
 
@@ -217,16 +248,16 @@
   .step-item--done .step-label   { color: var(--text-secondary); }
 
   .step-connector {
-    width: 2rem;
+    width: 2.5rem;
     height: 1px;
     background: rgba(255,255,255,0.06);
     margin: 0 0.25rem;
-    transition: background 0.5s;
+    transition: all 0.5s;
   }
 
   .step-connector--done {
-    background: var(--green);
-    box-shadow: 0 0 6px rgba(16, 185, 129, 0.3);
+    background: linear-gradient(90deg, var(--green), rgba(16, 185, 129, 0.3));
+    box-shadow: 0 0 8px rgba(16, 185, 129, 0.3);
   }
 
   /* ── Main ────────────────────────────────────────────────────────────── */
@@ -246,12 +277,15 @@
     z-index: 1;
     text-align: center;
     padding: 1.5rem;
-    font-size: 0.7rem;
-    color: var(--muted);
     border-top: 1px solid rgba(255,255,255,0.03);
+  }
+
+  .footer-inner {
     display: flex;
     justify-content: center;
     gap: 0.5rem;
+    font-size: 0.7rem;
+    color: var(--muted);
     font-family: 'JetBrains Mono', monospace;
   }
 
