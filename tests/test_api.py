@@ -115,6 +115,39 @@ class TestIngest:
         assert "Qdrant down" in resp.json()["detail"]
 
 
+class TestIngestAuth:
+    """Cover the INGEST_SECRET enforcement path. The auth gate fires only when
+    settings.ingest_secret is truthy — patch.object overrides the autouse
+    fixture's empty default for the duration of each test."""
+
+    def test_returns_403_when_secret_required_and_header_missing(self, client):
+        from app.main import settings
+        with patch.object(settings, "ingest_secret", "real-secret"):
+            resp = client.post("/ingest", json=INGEST_BODY)
+        assert resp.status_code == 403
+        assert "X-Ingest-Secret" in resp.json()["detail"]
+
+    def test_returns_403_when_secret_required_and_header_wrong(self, client):
+        from app.main import settings
+        with patch.object(settings, "ingest_secret", "real-secret"):
+            resp = client.post(
+                "/ingest", json=INGEST_BODY,
+                headers={"X-Ingest-Secret": "wrong-secret"},
+            )
+        assert resp.status_code == 403
+
+    def test_returns_200_when_secret_required_and_header_correct(self, client):
+        from app.main import settings
+        with patch.object(settings, "ingest_secret", "real-secret"), \
+             patch("app.main.ingest_gold_standard_bullets", new=AsyncMock(return_value=1)):
+            resp = client.post(
+                "/ingest", json=INGEST_BODY,
+                headers={"X-Ingest-Secret": "real-secret"},
+            )
+        assert resp.status_code == 200
+        assert resp.json()["upserted"] == 1
+
+
 # ── POST /optimize ────────────────────────────────────────────────────────────
 
 class TestOptimize:
