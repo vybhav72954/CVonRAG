@@ -23,6 +23,10 @@ class Settings(BaseSettings):
     groq_api_key: str = ""
     groq_model: str = "llama-3.3-70b-versatile"
     groq_base_url: str = "https://api.groq.com/openai/v1"
+    # Hard cap on bullets per /optimize request when using Groq.
+    # Groq free tier is 30 req/min; 15 bullets × 4 correction iterations = 62 calls (~2 min max).
+    # Set higher only if you have a paid Groq plan.
+    groq_max_bullets_per_request: int = 15
 
     # ── Ollama (local fallback) ──────────────────────────────────────────────
     # Used when GROQ_API_KEY is not set, and always used for embeddings.
@@ -64,6 +68,12 @@ class Settings(BaseSettings):
     llm_max_tokens: int = 512
     llm_context_window: int = 8192
 
+    # ── Bullet typewriter stream ──────────────────────────────────────────────
+    # Delay (seconds) between word chunks when streaming the finalized bullet
+    # to the browser. Higher = slower, more deliberate typewriter feel.
+    # Set to 0 to emit all chunks at once (e.g., in tests/CI).
+    bullet_stream_chunk_delay: float = 0.025
+
     # ── App ───────────────────────────────────────────────────────────────────
     app_env: str = "development"
     port: int = 8000
@@ -71,6 +81,15 @@ class Settings(BaseSettings):
 
     # CORS: restrict to your frontend origin in production.
     cors_origins: list[str] = ["http://localhost:5173"]
+
+    # ── Rate limiting ─────────────────────────────────────────────────────────
+    # Per-IP sliding-window limits for the three expensive endpoints.
+    # Set RATE_LIMIT_ENABLED=false to disable (useful in local dev / testing).
+    rate_limit_enabled: bool = True
+    rate_limit_window: int = 60       # window in seconds
+    rate_limit_parse: int = 10        # max /parse calls per IP per window
+    rate_limit_recommend: int = 20    # max /recommend calls per IP per window
+    rate_limit_optimize: int = 5      # max /optimize calls per IP per window
 
     # ── Admin auth ────────────────────────────────────────────────────────────
     # Set INGEST_SECRET in .env to protect the /ingest endpoint.

@@ -211,7 +211,7 @@
 
     <h1 class="hero-title">
       Create your <span class="gradient-text">Resume</span><br/>
-      leavarging our state-of-the-art Corpus
+      leveraging our state-of-the-art Corpus
     </h1>
 
     <p class="hero-subtitle">

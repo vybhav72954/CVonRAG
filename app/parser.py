@@ -105,27 +105,168 @@ def parse_docx_bytes(file_bytes: bytes) -> list[RawProject]:
 
 _BULLET_RE = re.compile(r"^\s*[▪•\-–→*]\s+(.+)$")
 
+# PGDBA CV bullet markers — private-use Unicode that pdfplumber's text layer drops.
+#     Wingdings glyph rendered as ▪ (most PGDBA CVs)
+#   §       Section sign repurposed as a bullet (some templates)
+_BULLET_MARKER_CHARS = {"", "§"}
+
+# Section headers used by the PGDBA CV template. Bullets only count when we are
+# inside a project section; everything else (work ex, awards, etc.) is skipped.
+_PROJECT_SECTION_HEADERS = ("ACADEMIC PROJECT", "ADDITIONAL PROJECT")
+_STOP_SECTION_HEADERS    = (
+    "WORK EXPERIENCE", "AWARDS", "RESPONSIBILITY",
+    "EXTRA CURRICULAR", "EXTRACURRICULAR", "ELECTIVES", "INTERESTS",
+    "KEY SKILLS",
+)
+
+
+def _is_pgdba_template(page_chars: list[dict]) -> bool:
+    """True when the page uses the private-use bullet markers (PGDBA template)."""
+    return any(c.get("text") in _BULLET_MARKER_CHARS for c in page_chars)
+
+
+def _right_column_threshold(page_chars: list[dict], page_width: float) -> float:
+    """x-coordinate threshold (absolute pt) separating left-column titles from
+    right-column bullet content. Anchored 3pt left of the leftmost bullet marker.
+    """
+    markers = [c for c in page_chars if c.get("text") in _BULLET_MARKER_CHARS]
+    if not markers:
+        return 0.18 * page_width  # not used unless _is_pgdba_template, defensive
+    return max(0.05 * page_width, min(c["x0"] for c in markers) - 3)
+
+
+def _group_words_into_lines(words: list[dict], y_tol: float = 4.0) -> list[list[dict]]:
+    """Group word boxes into physical lines using their 'top' coordinate."""
+    if not words:
+        return []
+    words = sorted(words, key=lambda w: (w["top"], w["x0"]))
+    lines: list[list[dict]] = []
+    current: list[dict] = [words[0]]
+    current_top = words[0]["top"]
+    for w in words[1:]:
+        if abs(w["top"] - current_top) <= y_tol:
+            current.append(w)
+        else:
+            lines.append(current)
+            current = [w]
+            current_top = w["top"]
+    if current:
+        lines.append(current)
+    return lines
+
+
+def _clean_bullet_text(text: str) -> str:
+    """Strip mid-line bullet markers and leading punctuation."""
+    # Split on mid-line markers (▪ • ■) and keep the longest segment.
+    if any(m in text for m in ("▪", "•", "■")):
+        text = max(re.split(r"\s*[▪•■]\s*", text), key=len).strip()
+    # Drop leading non-alphanumeric noise.
+    return re.sub(r"^[^a-zA-Z0-9]+", "", text).strip()
+
+
+def _parse_pdf_pgdba(pdf) -> list[RawProject]:
+    """
+    Two-column PGDBA template: left column = project titles, right column = bullets.
+
+    Walk physical lines top-to-bottom; track the most recent left-column title and
+    attach right-column bullets to it. Section headers gate which lines count.
+    """
+    projects: list[RawProject] = []
+    current: RawProject | None = None
+    in_target = False
+
+    for page in pdf.pages:
+        words      = page.extract_words(x_tolerance=3, y_tolerance=3, keep_blank_chars=False)
+        page_chars = page.chars
+        page_width = float(page.width)
+        threshold  = _right_column_threshold(page_chars, page_width)
+
+        for line in _group_words_into_lines(words):
+            full_line = " ".join(w["text"] for w in line).upper()
+
+            if any(h in full_line for h in _PROJECT_SECTION_HEADERS):
+                in_target = True
+                continue
+            if any(h in full_line for h in _STOP_SECTION_HEADERS):
+                in_target = False
+                continue
+            if not in_target:
+                continue
+
+            left_words  = [w["text"] for w in line if w["x0"] <= threshold]
+            right_words = [w["text"] for w in line if w["x0"] >  threshold]
+
+            # New project title in the left column → open a new RawProject.
+            if left_words and not right_words:
+                title = " ".join(left_words).strip()
+                if 3 < len(title) < 80 and not title.upper().startswith(_STOP_SECTION_HEADERS):
+                    if current and current.bullets:
+                        projects.append(current)
+                    current = RawProject(title=title)
+                continue
+
+            if not right_words:
+                continue
+
+            bullet = _clean_bullet_text(" ".join(right_words))
+            if len(bullet) < 30:
+                continue
+            if bullet.upper().startswith(_STOP_SECTION_HEADERS):
+                continue
+
+            # Bullet found before any title — open a fallback container.
+            if current is None:
+                current = RawProject(title="CV Bullets")
+            current.bullets.append(bullet)
+
+    if current and current.bullets:
+        projects.append(current)
+    return projects
+
+
+def _parse_pdf_generic(pdf) -> list[RawProject]:
+    """Fallback for non-PGDBA PDFs: one project, regex-driven bullet detection."""
+    bullets: list[str] = []
+    for page in pdf.pages:
+        text = page.extract_text(layout=True) or ""
+        for line in text.splitlines():
+            m = _BULLET_RE.match(line)
+            if m:
+                b = m.group(1).strip()
+                if len(b) > 30:
+                    bullets.append(b)
+    return [RawProject("CV Bullets", bullets)] if bullets else []
+
 
 def parse_pdf_bytes(file_bytes: bytes) -> list[RawProject]:
     """
-    Extract bullets from a PDF.
-    PDFs lose heading-level style info, so all bullets go into one project.
-    The LLM groups them into facts during extraction.
+    Extract projects + bullets from a PDF.
+
+    Strategy:
+      1. PGDBA template (private-use bullet glyphs detected) → coordinate-based
+         two-column extraction with multi-project segmentation.
+      2. Anything else → regex-driven fallback, single "CV Bullets" project.
+
+    PGDBA path falls back to generic if it produces nothing useful.
     """
     import pdfplumber  # lazy import
 
-    bullets: list[str] = []
     with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
-        for page in pdf.pages:
-            text = page.extract_text(layout=True) or ""
-            for line in text.splitlines():
-                m = _BULLET_RE.match(line)
-                if m:
-                    b = m.group(1).strip()
-                    if len(b) > 30:
-                        bullets.append(b)
+        # Sniff the first page's chars to decide which extraction path to use.
+        try:
+            first_chars = pdf.pages[0].chars if pdf.pages else []
+        except Exception:
+            first_chars = []
 
-    return [RawProject("CV Bullets", bullets)] if bullets else []
+        if _is_pgdba_template(first_chars):
+            try:
+                projects = _parse_pdf_pgdba(pdf)
+                if projects and any(p.bullets for p in projects):
+                    return projects
+            except Exception as exc:
+                logger.warning("PGDBA-template extraction failed (%s) — falling back.", exc)
+
+        return _parse_pdf_generic(pdf)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

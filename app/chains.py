@@ -10,6 +10,7 @@ Phase 5 → CVonRAGOrchestrator.run() — async generator of SSE events
 """
 
 from __future__ import annotations
+import asyncio
 import json
 import logging
 import re
@@ -72,13 +73,28 @@ def _build_messages(messages: list[dict], system: str | None) -> list[dict]:
     return messages
 
 
+# ── Groq rate-limit retry constants ──────────────────────────────────────────
+
+_GROQ_MAX_RETRIES = 3
+_GROQ_RETRY_AFTER_DEFAULT = 10.0  # seconds when Retry-After header is absent
+
+
+def _groq_retry_wait(response: httpx.Response) -> float:
+    """Return Retry-After seconds from a 429 response, or the default."""
+    try:
+        return float(response.headers.get("retry-after", _GROQ_RETRY_AFTER_DEFAULT))
+    except (TypeError, ValueError):
+        return _GROQ_RETRY_AFTER_DEFAULT
+
+
 async def _groq_chat(
     messages: list[dict],
     system: str | None = None,
     temperature: float | None = None,
     max_tokens: int | None = None,
+    json_mode: bool = False,
 ) -> str:
-    """Non-streaming Groq call (OpenAI-compatible)."""
+    """Non-streaming Groq call (OpenAI-compatible) — retries up to 3× on 429."""
     payload = {
         "model": settings.groq_model,
         "messages": _build_messages(messages, system),
@@ -86,24 +102,39 @@ async def _groq_chat(
         "max_tokens": max_tokens or settings.llm_max_tokens,
         "stream": False,
     }
-    r = await get_http().post(
-        f"{settings.groq_base_url}/chat/completions",
-        json=payload,
-        headers={"Authorization": f"Bearer {settings.groq_api_key}"},
-        timeout=60.0,
-    )
-    r.raise_for_status()
-    content = r.json()["choices"][0]["message"]["content"].strip()
-    # Strip Qwen/Llama extended-reasoning blocks if present
-    content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
-    return content
+    if json_mode:
+        payload["response_format"] = {"type": "json_object"}
+    for attempt in range(_GROQ_MAX_RETRIES):
+        try:
+            r = await get_http().post(
+                f"{settings.groq_base_url}/chat/completions",
+                json=payload,
+                headers={"Authorization": f"Bearer {settings.groq_api_key}"},
+                timeout=60.0,
+            )
+            r.raise_for_status()
+            content = r.json()["choices"][0]["message"]["content"].strip()
+            # Strip Qwen/Llama extended-reasoning blocks if present
+            content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
+            return content
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code == 429 and attempt < _GROQ_MAX_RETRIES - 1:
+                wait = _groq_retry_wait(exc.response)
+                logger.warning(
+                    "Groq 429 (chat) — retry %d/%d after %.1fs",
+                    attempt + 1, _GROQ_MAX_RETRIES, wait,
+                )
+                await asyncio.sleep(wait)
+            else:
+                raise
+    raise RuntimeError("unreachable")  # loop always returns or re-raises
 
 
 async def _groq_stream(
     messages: list[dict],
     system: str | None = None,
 ) -> AsyncGenerator[str, None]:
-    """Streaming Groq call (OpenAI-compatible SSE)."""
+    """Streaming Groq call (OpenAI-compatible SSE) — retries up to 3× on 429."""
     payload = {
         "model": settings.groq_model,
         "messages": _build_messages(messages, system),
@@ -111,27 +142,40 @@ async def _groq_stream(
         "max_tokens": settings.llm_max_tokens,
         "stream": True,
     }
-    async with get_http().stream(
-        "POST",
-        f"{settings.groq_base_url}/chat/completions",
-        json=payload,
-        headers={"Authorization": f"Bearer {settings.groq_api_key}"},
-        timeout=60.0,
-    ) as resp:
-        resp.raise_for_status()
-        async for line in resp.aiter_lines():
-            if not line or not line.startswith("data: "):
-                continue
-            data = line[len("data: "):]
-            if data.strip() == "[DONE]":
-                break
-            try:
-                chunk = json.loads(data)
-                token = chunk["choices"][0].get("delta", {}).get("content", "")
-                if token:
-                    yield token
-            except (json.JSONDecodeError, KeyError, IndexError):
-                continue
+    for attempt in range(_GROQ_MAX_RETRIES):
+        try:
+            async with get_http().stream(
+                "POST",
+                f"{settings.groq_base_url}/chat/completions",
+                json=payload,
+                headers={"Authorization": f"Bearer {settings.groq_api_key}"},
+                timeout=60.0,
+            ) as resp:
+                resp.raise_for_status()
+                async for line in resp.aiter_lines():
+                    if not line or not line.startswith("data: "):
+                        continue
+                    data = line[len("data: "):]
+                    if data.strip() == "[DONE]":
+                        return
+                    try:
+                        chunk = json.loads(data)
+                        token = chunk["choices"][0].get("delta", {}).get("content", "")
+                        if token:
+                            yield token
+                    except (json.JSONDecodeError, KeyError, IndexError):
+                        continue
+                return  # stream ended normally
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code == 429 and attempt < _GROQ_MAX_RETRIES - 1:
+                wait = _groq_retry_wait(exc.response)
+                logger.warning(
+                    "Groq 429 (stream) — retry %d/%d after %.1fs",
+                    attempt + 1, _GROQ_MAX_RETRIES, wait,
+                )
+                await asyncio.sleep(wait)
+            else:
+                raise
 
 
 async def _ollama_chat_inner(
@@ -139,6 +183,7 @@ async def _ollama_chat_inner(
     system: str | None = None,
     temperature: float | None = None,
     max_tokens: int | None = None,
+    json_mode: bool = False,
 ) -> str:
     """Non-streaming Ollama /api/chat call."""
     payload: dict = {
@@ -153,6 +198,8 @@ async def _ollama_chat_inner(
     }
     if system:
         payload["system"] = system
+    if json_mode:
+        payload["format"] = "json"
 
     r = await get_http().post(f"{settings.ollama_base_url}/api/chat", json=payload, timeout=120.0)
     r.raise_for_status()
@@ -200,11 +247,12 @@ async def _ollama_chat(
     system: str | None = None,
     temperature: float | None = None,
     max_tokens: int | None = None,
+    json_mode: bool = False,
 ) -> str:
     """LLM call — routes to Groq if GROQ_API_KEY is set, else Ollama."""
     if _using_groq():
-        return await _groq_chat(messages, system, temperature, max_tokens)
-    return await _ollama_chat_inner(messages, system, temperature, max_tokens)
+        return await _groq_chat(messages, system, temperature, max_tokens, json_mode)
+    return await _ollama_chat_inner(messages, system, temperature, max_tokens, json_mode)
 
 
 async def _ollama_stream(
@@ -250,16 +298,20 @@ class SemanticMatcher:
     """Phase 2: analyse the JD and score every CoreFact for relevance."""
 
     async def analyze_jd(self, jd: str) -> dict:
-        raw = await _ollama_chat(
-            system=_JD_ANALYSIS_SYSTEM,
-            messages=[{"role": "user", "content": f"Job Description:\n\n{jd}"}],
-            temperature=0.05,
-        )
+        msgs = [{"role": "user", "content": f"Job Description:\n\n{jd}"}]
+        raw  = await _ollama_chat(system=_JD_ANALYSIS_SYSTEM, messages=msgs, temperature=0.05)
         try:
             return json.loads(_strip_json_fences(raw))
         except json.JSONDecodeError:
-            logger.warning("JD analysis JSON parse failed. Raw: %.200s", raw)
-            return {}
+            logger.warning("JD analysis JSON parse failed — retrying with json_mode. Raw: %.200s", raw)
+            raw = await _ollama_chat(
+                system=_JD_ANALYSIS_SYSTEM, messages=msgs, temperature=0.05, json_mode=True,
+            )
+            try:
+                return json.loads(_strip_json_fences(raw))
+            except json.JSONDecodeError:
+                logger.warning("JD analysis retry failed — returning empty analysis. Raw: %.200s", raw)
+                return {}
 
     async def score_facts(
         self,
@@ -276,19 +328,25 @@ class SemanticMatcher:
             f"JD Analysis:\n{json.dumps(jd_analysis, indent=2)}\n\n"
             f"Facts:\n{json.dumps(payload, indent=2)}"
         )
-        raw = await _ollama_chat(
-            system=_FACT_SCORING_SYSTEM,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.05,
-        )
+        msgs = [{"role": "user", "content": prompt}]
+        raw  = await _ollama_chat(system=_FACT_SCORING_SYSTEM, messages=msgs, temperature=0.05)
         try:
             scores: list[dict] = json.loads(_strip_json_fences(raw))
         except json.JSONDecodeError:
-            logger.warning("Fact scoring JSON parse failed — assigning 0.5 to all.")
-            scores = [
-                {"fact_id": f.fact_id, "relevance_score": 0.5, "matched_jd_keywords": []}
-                for _, f in flat
-            ]
+            logger.warning("Fact scoring JSON parse failed — retrying with json_mode. Raw: %.200s", raw)
+            raw = await _ollama_chat(
+                system=_FACT_SCORING_SYSTEM, messages=msgs, temperature=0.05, json_mode=True,
+            )
+            try:
+                scores = json.loads(_strip_json_fences(raw))
+            except json.JSONDecodeError:
+                logger.warning(
+                    "Fact scoring retry failed — assigning 0.5 to all. Raw: %.200s", raw
+                )
+                scores = [
+                    {"fact_id": f.fact_id, "relevance_score": 0.5, "matched_jd_keywords": []}
+                    for _, f in flat
+                ]
 
         score_map = {s["fact_id"]: s for s in scores}
         result = [
@@ -442,34 +500,6 @@ class BulletAlchemist:
 
         return await self._correction_loop(bullet, history, scored_facts, constraints)
 
-    async def generate_bullet_from_draft(
-        self,
-        initial_draft: str,
-        scored_facts: list[ScoredFact],
-        exemplars: list[StyleExemplar],
-        jd_analysis: dict,
-        jd_tone: JDTone,
-        constraints: FormattingConstraints,
-        role_type: RoleType,
-    ) -> BulletDraft:
-        """Run the correction loop starting from an already-generated draft.
-
-        This avoids a redundant LLM call when the initial draft was already
-        produced by stream_initial_tokens().
-        """
-        initial_prompt = self._build_initial_prompt(
-            scored_facts, exemplars, jd_analysis, jd_tone, constraints, role_type,
-        )
-        bullet = _clean_bullet(initial_draft, constraints.bullet_prefix)
-
-        # Reconstruct conversation history as if the LLM had produced this draft
-        history: list[dict] = [
-            {"role": "user", "content": initial_prompt},
-            {"role": "assistant", "content": bullet},
-        ]
-
-        return await self._correction_loop(bullet, history, scored_facts, constraints)
-
     async def _correction_loop(
         self,
         bullet: str,
@@ -525,34 +555,29 @@ class BulletAlchemist:
 
         return best  # type: ignore[return-value]
 
-    async def stream_initial_tokens(
-        self,
-        scored_facts: list[ScoredFact],
-        exemplars: list[StyleExemplar],
-        jd_analysis: dict,
-        jd_tone: JDTone,
-        constraints: FormattingConstraints,
-        role_type: RoleType,
-    ) -> AsyncGenerator[str, None]:
-        """Stream raw tokens from the initial draft pass.
 
-        Yields each token AND sets self.last_streamed_draft to the full
-        concatenated text so the caller can reuse it in the correction loop.
-        """
-        initial_prompt = self._build_initial_prompt(
-            scored_facts, exemplars, jd_analysis, jd_tone, constraints, role_type,
-        )
-        accumulated: list[str] = []
-        async for token in _ollama_stream(
-            system=_ALCHEMIST_SYSTEM,
-            messages=[{"role": "user", "content": initial_prompt}],
-        ):
-            accumulated.append(token)
-            yield token
+# ═════════════════════════════════════════════════════════════════════════════
+# Typewriter stream — chunk the FINAL bullet to the browser
+# ═════════════════════════════════════════════════════════════════════════════
 
-        # Store the full draft so the orchestrator can pass it to the
-        # correction loop without making a second LLM call.
-        self.last_streamed_draft = "".join(accumulated)
+async def _chunk_stream(text: str) -> AsyncGenerator[str, None]:
+    """Yield the finalized bullet word-by-word so the browser typewriter shows
+    exactly the text that will be kept (no replace-on-correction blink).
+
+    Why: the previous design streamed tokens of an *initial* LLM draft, then
+    silently rewrote it through the char-limit correction loop — the user saw
+    one sentence type out and a different one snap into place. Now we run the
+    correction loop silently, then chunk-stream the final draft.
+    """
+    if not text:
+        yield ""
+        return
+    parts = re.findall(r"\S+\s*", text) or [text]
+    delay = settings.bullet_stream_chunk_delay
+    for part in parts:
+        yield part
+        if delay:
+            await asyncio.sleep(delay)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -615,21 +640,9 @@ class CVonRAGOrchestrator:
                 supporting = _pick_supporting_facts(primary, scored, exclude_idx=i)
                 facts      = [primary] + supporting
 
-                # Phase 5: stream initial draft tokens
-                async for token in self.alchemist.stream_initial_tokens(
-                    scored_facts=facts,
-                    exemplars=exemplars,
-                    jd_analysis=jd_analysis,
-                    jd_tone=jd_tone,
-                    constraints=request.constraints,
-                    role_type=request.target_role_type,
-                ):
-                    yield ("token", token)
-
-                # Phase 4: correction loop — reuse the streamed draft
-                # instead of making a second LLM call from scratch
-                draft = await self.alchemist.generate_bullet_from_draft(
-                    initial_draft=self.alchemist.last_streamed_draft,
+                # Phase 4: run the full correction loop silently — we want the
+                # *final* bullet, not an initial draft that may get rewritten.
+                draft = await self.alchemist.generate_bullet(
                     scored_facts=facts,
                     exemplars=exemplars,
                     jd_analysis=jd_analysis,
@@ -637,6 +650,11 @@ class CVonRAGOrchestrator:
                     constraints=request.constraints,
                     role_type=request.target_role_type,
                 )
+
+                # Phase 5: chunk-stream the *final* bullet so the typewriter
+                # in the browser shows exactly what the user is going to keep.
+                async for token in _chunk_stream(draft.text):
+                    yield ("token", token)
 
                 metadata = BulletMetadata(
                     bullet_index=bullet_index,
@@ -715,8 +733,10 @@ def _pick_supporting_facts(
 
 
 def _strip_json_fences(text: str) -> str:
-    """Remove ```json ... ``` fences that Qwen sometimes adds."""
+    """Remove ```json ... ``` fences and <think>...</think> reasoning blocks."""
     text = text.strip()
-    text = re.sub(r"^```(?:json)?\s*", "", text)
+    # Strip extended-reasoning blocks that Qwen/DeepSeek reasoning models emit
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
+    text = re.sub(r"^```(?:json)?\s*", "", text.strip())
     text = re.sub(r"\s*```$", "", text)
     return text.strip()

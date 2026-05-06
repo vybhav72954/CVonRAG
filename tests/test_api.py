@@ -40,6 +40,10 @@ MINIMAL_REQUEST = {
     ],
 }
 
+# Magic-byte prefixes used to build realistic test file payloads (H7)
+_DOCX_MAGIC = b"PK\x03\x04"           # ZIP / OOXML container
+_PDF_MAGIC  = b"%PDF-1.4\n"           # PDF header (any version starts with %PDF)
+
 INGEST_BODY = {
     "bullets": [
         {
@@ -115,6 +119,39 @@ class TestIngest:
         assert "Qdrant down" in resp.json()["detail"]
 
 
+class TestIngestAuth:
+    """Cover the INGEST_SECRET enforcement path. The auth gate fires only when
+    settings.ingest_secret is truthy — patch.object overrides the autouse
+    fixture's empty default for the duration of each test."""
+
+    def test_returns_403_when_secret_required_and_header_missing(self, client):
+        from app.main import settings
+        with patch.object(settings, "ingest_secret", "real-secret"):
+            resp = client.post("/ingest", json=INGEST_BODY)
+        assert resp.status_code == 403
+        assert "X-Ingest-Secret" in resp.json()["detail"]
+
+    def test_returns_403_when_secret_required_and_header_wrong(self, client):
+        from app.main import settings
+        with patch.object(settings, "ingest_secret", "real-secret"):
+            resp = client.post(
+                "/ingest", json=INGEST_BODY,
+                headers={"X-Ingest-Secret": "wrong-secret"},
+            )
+        assert resp.status_code == 403
+
+    def test_returns_200_when_secret_required_and_header_correct(self, client):
+        from app.main import settings
+        with patch.object(settings, "ingest_secret", "real-secret"), \
+             patch("app.main.ingest_gold_standard_bullets", new=AsyncMock(return_value=1)):
+            resp = client.post(
+                "/ingest", json=INGEST_BODY,
+                headers={"X-Ingest-Secret": "real-secret"},
+            )
+        assert resp.status_code == 200
+        assert resp.json()["upserted"] == 1
+
+
 # ── POST /optimize ────────────────────────────────────────────────────────────
 
 class TestOptimize:
@@ -174,6 +211,160 @@ class TestOptimize:
             resp = client.post("/optimize", json=MINIMAL_REQUEST)
 
         assert "event: done" in resp.text
+
+    def test_too_many_bullets_for_groq_returns_422(self, client):
+        """H3: /optimize rejects requests that exceed groq_max_bullets_per_request."""
+        from app.main import settings
+        with patch.object(settings, "groq_api_key", "test-key"), \
+             patch.object(settings, "groq_max_bullets_per_request", 2):
+            resp = client.post("/optimize", json={
+                **MINIMAL_REQUEST,
+                "total_bullets_requested": 3,
+            })
+        assert resp.status_code == 422
+        detail = resp.json()["detail"].lower()
+        assert "groq" in detail or "bullets" in detail
+
+    def test_groq_bullet_cap_not_triggered_when_within_limit(self, client):
+        """H3: requests within the Groq cap proceed normally."""
+        async def fake_run(request):
+            yield ("done", None)
+
+        from app.main import settings
+        with patch.object(settings, "groq_api_key", "test-key"), \
+             patch.object(settings, "groq_max_bullets_per_request", 5), \
+             patch("app.main.CVonRAGOrchestrator") as M:
+            M.return_value.run = fake_run
+            resp = client.post("/optimize", json={
+                **MINIMAL_REQUEST,
+                "total_bullets_requested": 1,
+            })
+        assert resp.status_code == 200
+
+    def test_groq_bullet_cap_skipped_when_no_api_key(self, client):
+        """H3: cap does not fire when GROQ_API_KEY is unset (Ollama mode)."""
+        async def fake_run(request):
+            yield ("done", None)
+
+        from app.main import settings
+        with patch.object(settings, "groq_api_key", ""), \
+             patch.object(settings, "groq_max_bullets_per_request", 2), \
+             patch("app.main.CVonRAGOrchestrator") as M:
+            M.return_value.run = fake_run
+            resp = client.post("/optimize", json={
+                **MINIMAL_REQUEST,
+                "total_bullets_requested": 3,
+            })
+        assert resp.status_code == 200
+
+
+
+# ── Rate limiting (H1) ────────────────────────────────────────────────────────
+
+_RECOMMEND_BODY = {
+    "job_description": SAMPLE_JD,
+    "projects": MINIMAL_REQUEST["projects"],
+    "top_k": 3,
+}
+
+
+class TestRateLimit:
+    """H1: per-IP sliding-window rate limiting on /parse, /recommend, /optimize."""
+
+    def test_optimize_429_after_limit_exceeded(self, client):
+        async def fake_run(_r):
+            yield ("done", None)
+
+        from app.main import settings, _limiter
+        with patch.object(settings, "rate_limit_enabled", True), \
+             patch.object(settings, "rate_limit_optimize", 2), \
+             patch("app.main.CVonRAGOrchestrator") as M:
+            M.return_value.run = fake_run
+            _limiter._windows.clear()
+            client.post("/optimize", json=MINIMAL_REQUEST)
+            client.post("/optimize", json=MINIMAL_REQUEST)
+            resp = client.post("/optimize", json=MINIMAL_REQUEST)  # 3rd exceeds cap of 2
+        assert resp.status_code == 429
+
+    def test_optimize_retry_after_header_present(self, client):
+        async def fake_run(_r):
+            yield ("done", None)
+
+        from app.main import settings, _limiter
+        with patch.object(settings, "rate_limit_enabled", True), \
+             patch.object(settings, "rate_limit_optimize", 1), \
+             patch("app.main.CVonRAGOrchestrator") as M:
+            M.return_value.run = fake_run
+            _limiter._windows.clear()
+            client.post("/optimize", json=MINIMAL_REQUEST)
+            resp = client.post("/optimize", json=MINIMAL_REQUEST)
+        assert resp.status_code == 429
+        assert "Retry-After" in resp.headers
+        assert int(resp.headers["Retry-After"]) > 0
+
+    def test_parse_429_after_limit_exceeded(self, client):
+        async def _mock_stream(file_bytes, filename, http_client):
+            yield ("done", {"total_projects": 0, "total_facts": 0})
+
+        from app.main import settings, _limiter
+        _file = ("cv.pdf", _PDF_MAGIC + b"x" * 200, "application/pdf")
+        with patch.object(settings, "rate_limit_enabled", True), \
+             patch.object(settings, "rate_limit_parse", 1), \
+             patch("app.main.parse_and_stream", side_effect=_mock_stream):
+            _limiter._windows.clear()
+            client.post("/parse", files={"file": _file})
+            resp = client.post("/parse", files={"file": _file})
+        assert resp.status_code == 429
+
+    def test_recommend_429_after_limit_exceeded(self, client):
+        from app.main import settings, _limiter
+        with patch.object(settings, "rate_limit_enabled", True), \
+             patch.object(settings, "rate_limit_recommend", 1), \
+             patch("app.main._do_recommend", new=AsyncMock(return_value=[])):
+            _limiter._windows.clear()
+            client.post("/recommend", json=_RECOMMEND_BODY)
+            resp = client.post("/recommend", json=_RECOMMEND_BODY)
+        assert resp.status_code == 429
+
+    def test_rate_limit_disabled_allows_unlimited_calls(self, client):
+        """When RATE_LIMIT_ENABLED=false, no 429 is returned regardless of call count."""
+        async def fake_run(_r):
+            yield ("done", None)
+
+        from app.main import settings, _limiter
+        with patch.object(settings, "rate_limit_enabled", False), \
+             patch.object(settings, "rate_limit_optimize", 1), \
+             patch("app.main.CVonRAGOrchestrator") as M:
+            M.return_value.run = fake_run
+            _limiter._windows.clear()
+            for _ in range(3):
+                resp = client.post("/optimize", json=MINIMAL_REQUEST)
+        assert resp.status_code == 200
+
+    def test_different_keys_tracked_independently(self, client):
+        """Rate limit state for /parse and /optimize are independent buckets."""
+        async def _mock_stream(file_bytes, filename, http_client):
+            yield ("done", {"total_projects": 0, "total_facts": 0})
+
+        async def fake_run(_r):
+            yield ("done", None)
+
+        from app.main import settings, _limiter
+        _file = ("cv.pdf", _PDF_MAGIC + b"x" * 200, "application/pdf")
+        with patch.object(settings, "rate_limit_enabled", True), \
+             patch.object(settings, "rate_limit_parse", 1), \
+             patch.object(settings, "rate_limit_optimize", 1), \
+             patch("app.main.parse_and_stream", side_effect=_mock_stream), \
+             patch("app.main.CVonRAGOrchestrator") as M:
+            M.return_value.run = fake_run
+            _limiter._windows.clear()
+            # Exhaust the /parse bucket
+            client.post("/parse", files={"file": _file})
+            parse_resp = client.post("/parse", files={"file": _file})
+            # /optimize bucket is still fresh — first call should succeed
+            opt_resp = client.post("/optimize", json=MINIMAL_REQUEST)
+        assert parse_resp.status_code == 429
+        assert opt_resp.status_code == 200
 
 
 # ── Docs ──────────────────────────────────────────────────────────────────────
@@ -247,7 +438,7 @@ class TestParse:
         with patch("app.main.parse_and_stream", side_effect=_mock_stream):
             resp = client.post(
                 "/parse",
-                files={"file": ("resume.docx", b"fake-docx-content-" + b"x" * 200, "application/vnd.openxmlformats-officedocument.wordprocessingml.document")},
+                files={"file": ("resume.docx", _DOCX_MAGIC + b"x" * 200, "application/vnd.openxmlformats-officedocument.wordprocessingml.document")},
             )
 
         assert resp.status_code == 200
@@ -266,7 +457,7 @@ class TestParse:
         with patch("app.main.parse_and_stream", side_effect=_mock_stream):
             resp = client.post(
                 "/parse",
-                files={"file": ("cv.pdf", b"fake-pdf-content-" + b"x" * 200, "application/pdf")},
+                files={"file": ("cv.pdf", _PDF_MAGIC + b"x" * 200, "application/pdf")},
             )
 
         assert resp.status_code == 200
@@ -280,8 +471,73 @@ class TestParse:
         with patch("app.main.parse_and_stream", side_effect=_mock_stream):
             resp = client.post(
                 "/parse",
-                files={"file": ("resume.docx", b"bad-bytes-" + b"x" * 200, "application/vnd.openxmlformats-officedocument.wordprocessingml.document")},
+                files={"file": ("resume.docx", _DOCX_MAGIC + b"x" * 200, "application/vnd.openxmlformats-officedocument.wordprocessingml.document")},
             )
 
         assert resp.status_code == 200
         assert "event: error" in resp.text
+
+
+# ── Magic-byte validation (H7) ────────────────────────────────────────────────
+
+class TestFileMagic:
+    """H7: file-type is verified by magic bytes, not just the filename extension."""
+
+    _DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    _PDF_MIME  = "application/pdf"
+
+    def test_docx_with_pdf_magic_returns_415(self, client):
+        """A .docx file that starts with %PDF bytes is rejected."""
+        resp = client.post(
+            "/parse",
+            files={"file": ("resume.docx", _PDF_MAGIC + b"x" * 200, self._DOCX_MIME)},
+        )
+        assert resp.status_code == 415
+
+    def test_pdf_with_docx_magic_returns_415(self, client):
+        """A .pdf file that starts with PK bytes is rejected."""
+        resp = client.post(
+            "/parse",
+            files={"file": ("cv.pdf", _DOCX_MAGIC + b"x" * 200, self._PDF_MIME)},
+        )
+        assert resp.status_code == 415
+
+    def test_renamed_exe_as_docx_returns_415(self, client):
+        """A Windows executable (MZ header) renamed to .docx is rejected."""
+        resp = client.post(
+            "/parse",
+            files={"file": ("cv.docx", b"MZ\x90\x00" + b"x" * 200, self._DOCX_MIME)},
+        )
+        assert resp.status_code == 415
+
+    def test_valid_docx_magic_passes_check(self, client):
+        """A .docx file with correct PK magic proceeds past validation."""
+        async def _mock_stream(fb, fn, hc):
+            yield ("done", {"total_projects": 0, "total_facts": 0})
+
+        with patch("app.main.parse_and_stream", side_effect=_mock_stream):
+            resp = client.post(
+                "/parse",
+                files={"file": ("cv.docx", _DOCX_MAGIC + b"x" * 200, self._DOCX_MIME)},
+            )
+        assert resp.status_code == 200
+
+    def test_valid_pdf_magic_passes_check(self, client):
+        """A .pdf file with correct %PDF magic proceeds past validation."""
+        async def _mock_stream(fb, fn, hc):
+            yield ("done", {"total_projects": 0, "total_facts": 0})
+
+        with patch("app.main.parse_and_stream", side_effect=_mock_stream):
+            resp = client.post(
+                "/parse",
+                files={"file": ("cv.pdf", _PDF_MAGIC + b"x" * 200, self._PDF_MIME)},
+            )
+        assert resp.status_code == 200
+
+    def test_magic_check_runs_after_size_check(self, client):
+        """Files that are too small fail with 400 before reaching the magic check."""
+        resp = client.post(
+            "/parse",
+            files={"file": ("cv.docx", b"PK", self._DOCX_MIME)},  # valid magic, too short
+        )
+        assert resp.status_code == 400  # not 415
