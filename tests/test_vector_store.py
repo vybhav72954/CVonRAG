@@ -174,8 +174,10 @@ class TestRetrieval:
                 "uses_separator": "|",
             }
         )
-        mock_client.search.return_value = [mock_point]
-        
+        mock_response = MagicMock()
+        mock_response.points = [mock_point]
+        mock_client.query_points.return_value = mock_response
+
         with patch("app.vector_store.embed_text", new=AsyncMock(return_value=[0.1])), \
              patch("app.vector_store._qdrant", mock_client):
             

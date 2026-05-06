@@ -190,13 +190,14 @@ async def retrieve_style_exemplars(
             must=[FieldCondition(key="role_type", match=MatchValue(value=role_type.value))]
         )
 
-    hits: list[ScoredPoint] = await get_qdrant().search(
+    result = await get_qdrant().query_points(
         collection_name=settings.qdrant_collection,
-        query_vector=query_vector,
+        query=query_vector,
         query_filter=query_filter,
         limit=k,
         with_payload=True,
     )
+    hits: list[ScoredPoint] = result.points
 
     return [
         StyleExemplar(
