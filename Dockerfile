@@ -12,22 +12,11 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build
-COPY pyproject.toml .
+COPY pyproject.toml README.md ./
+COPY app/ ./app/
 
 RUN pip install --upgrade pip --quiet \
- && pip install --prefix=/install --no-cache-dir \
-      "fastapi==0.115.5" \
-      "uvicorn[standard]==0.32.1" \
-      "httptools==0.6.4" \
-      "uvloop==0.21.0" \
-      "pydantic==2.10.3" \
-      "pydantic-settings==2.6.1" \
-      "httpx==0.28.1" \
-      "qdrant-client==1.12.1" \
-      "anyio==4.7.0" \
-      "python-dotenv==1.0.1" \
-      "pdfplumber>=0.11" \
-      "python-docx>=1.1"
+ && pip install --prefix=/install --no-cache-dir ".[unix]"
 
 # ── Stage 2: minimal runtime ──────────────────────────────────────────────────
 FROM python:3.12-slim AS runtime

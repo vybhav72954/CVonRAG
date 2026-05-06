@@ -52,8 +52,8 @@ services:
       OLLAMA_HOST: http://ollama:11434
     entrypoint: >
       sh -c "
-        echo 'Pulling qwen2.5:14b ...' &&
-        ollama pull qwen2.5:14b &&
+        echo 'Pulling ${OLLAMA_LLM_MODEL:-qwen2.5:14b} ...' &&
+        ollama pull ${OLLAMA_LLM_MODEL:-qwen2.5:14b} &&
         echo 'Pulling nomic-embed-text ...' &&
         ollama pull nomic-embed-text &&
         echo 'All models ready.'
