@@ -254,6 +254,115 @@ class TestOptimize:
         assert resp.status_code == 200
 
 
+
+# ── Rate limiting (H1) ────────────────────────────────────────────────────────
+
+_RECOMMEND_BODY = {
+    "job_description": SAMPLE_JD,
+    "projects": MINIMAL_REQUEST["projects"],
+    "top_k": 3,
+}
+
+
+class TestRateLimit:
+    """H1: per-IP sliding-window rate limiting on /parse, /recommend, /optimize."""
+
+    def test_optimize_429_after_limit_exceeded(self, client):
+        async def fake_run(_r):
+            yield ("done", None)
+
+        from app.main import settings, _limiter
+        with patch.object(settings, "rate_limit_enabled", True), \
+             patch.object(settings, "rate_limit_optimize", 2), \
+             patch("app.main.CVonRAGOrchestrator") as M:
+            M.return_value.run = fake_run
+            _limiter._windows.clear()
+            client.post("/optimize", json=MINIMAL_REQUEST)
+            client.post("/optimize", json=MINIMAL_REQUEST)
+            resp = client.post("/optimize", json=MINIMAL_REQUEST)  # 3rd exceeds cap of 2
+        assert resp.status_code == 429
+
+    def test_optimize_retry_after_header_present(self, client):
+        async def fake_run(_r):
+            yield ("done", None)
+
+        from app.main import settings, _limiter
+        with patch.object(settings, "rate_limit_enabled", True), \
+             patch.object(settings, "rate_limit_optimize", 1), \
+             patch("app.main.CVonRAGOrchestrator") as M:
+            M.return_value.run = fake_run
+            _limiter._windows.clear()
+            client.post("/optimize", json=MINIMAL_REQUEST)
+            resp = client.post("/optimize", json=MINIMAL_REQUEST)
+        assert resp.status_code == 429
+        assert "Retry-After" in resp.headers
+        assert int(resp.headers["Retry-After"]) > 0
+
+    def test_parse_429_after_limit_exceeded(self, client):
+        async def _mock_stream(file_bytes, filename, http_client):
+            yield ("done", {"total_projects": 0, "total_facts": 0})
+
+        from app.main import settings, _limiter
+        _file = ("cv.pdf", b"fake-pdf-content-" + b"x" * 200, "application/pdf")
+        with patch.object(settings, "rate_limit_enabled", True), \
+             patch.object(settings, "rate_limit_parse", 1), \
+             patch("app.main.parse_and_stream", side_effect=_mock_stream):
+            _limiter._windows.clear()
+            client.post("/parse", files={"file": _file})
+            resp = client.post("/parse", files={"file": _file})
+        assert resp.status_code == 429
+
+    def test_recommend_429_after_limit_exceeded(self, client):
+        from app.main import settings, _limiter
+        with patch.object(settings, "rate_limit_enabled", True), \
+             patch.object(settings, "rate_limit_recommend", 1), \
+             patch("app.main._do_recommend", new=AsyncMock(return_value=[])):
+            _limiter._windows.clear()
+            client.post("/recommend", json=_RECOMMEND_BODY)
+            resp = client.post("/recommend", json=_RECOMMEND_BODY)
+        assert resp.status_code == 429
+
+    def test_rate_limit_disabled_allows_unlimited_calls(self, client):
+        """When RATE_LIMIT_ENABLED=false, no 429 is returned regardless of call count."""
+        async def fake_run(_r):
+            yield ("done", None)
+
+        from app.main import settings, _limiter
+        with patch.object(settings, "rate_limit_enabled", False), \
+             patch.object(settings, "rate_limit_optimize", 1), \
+             patch("app.main.CVonRAGOrchestrator") as M:
+            M.return_value.run = fake_run
+            _limiter._windows.clear()
+            for _ in range(3):
+                resp = client.post("/optimize", json=MINIMAL_REQUEST)
+        assert resp.status_code == 200
+
+    def test_different_keys_tracked_independently(self, client):
+        """Rate limit state for /parse and /optimize are independent buckets."""
+        async def _mock_stream(file_bytes, filename, http_client):
+            yield ("done", {"total_projects": 0, "total_facts": 0})
+
+        async def fake_run(_r):
+            yield ("done", None)
+
+        from app.main import settings, _limiter
+        _file = ("cv.pdf", b"fake-pdf-content-" + b"x" * 200, "application/pdf")
+        with patch.object(settings, "rate_limit_enabled", True), \
+             patch.object(settings, "rate_limit_parse", 1), \
+             patch.object(settings, "rate_limit_optimize", 1), \
+             patch("app.main.parse_and_stream", side_effect=_mock_stream), \
+             patch("app.main.CVonRAGOrchestrator") as M:
+            M.return_value.run = fake_run
+            _limiter._windows.clear()
+            # Exhaust the /parse bucket
+            client.post("/parse", files={"file": _file})
+            parse_resp = client.post("/parse", files={"file": _file})
+            # /optimize bucket is still fresh — first call should succeed
+            opt_resp = client.post("/optimize", json=MINIMAL_REQUEST)
+        assert parse_resp.status_code == 429
+        assert opt_resp.status_code == 200
+
+
 # ── Docs ──────────────────────────────────────────────────────────────────────
 
 class TestDocs:

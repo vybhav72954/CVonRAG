@@ -11,14 +11,17 @@ Endpoints:
 """
 
 from __future__ import annotations
+import asyncio
 import json
 import logging
 import time
+from collections import defaultdict, deque
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
+from math import ceil
 
 import httpx
-from fastapi import FastAPI, File, Header, HTTPException, UploadFile, status
+from fastapi import FastAPI, File, Header, HTTPException, Request, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
@@ -49,6 +52,53 @@ logging.basicConfig(
 )
 logger   = logging.getLogger("cvonrag")
 settings = get_settings()
+
+
+# ── Rate limiter ──────────────────────────────────────────────────────────────
+
+class _RateLimiter:
+    """Per-IP sliding-window in-memory rate limiter.
+
+    Safe for a single-process deployment. For multi-worker or distributed
+    deployments, replace with a Redis-backed solution (e.g. slowapi + Redis).
+    """
+
+    def __init__(self) -> None:
+        self._windows: dict[tuple[str, str], deque] = defaultdict(deque)
+        self._lock = asyncio.Lock()
+
+    async def check(
+        self, ip: str, key: str, max_calls: int, window_seconds: int
+    ) -> float | None:
+        """Return None if the request is allowed; return seconds-to-wait if limited."""
+        if not settings.rate_limit_enabled:
+            return None
+        now    = time.monotonic()
+        cutoff = now - window_seconds
+        async with self._lock:
+            dq = self._windows[(ip, key)]
+            while dq and dq[0] < cutoff:
+                dq.popleft()
+            if len(dq) >= max_calls:
+                oldest = dq[0] if dq else now
+                return max(window_seconds - (now - oldest), 0.1)
+            dq.append(now)
+            return None
+
+
+_limiter = _RateLimiter()
+
+
+async def _rate_check(request: Request, key: str, max_calls: int) -> None:
+    """Raise HTTP 429 if the caller has exceeded their per-minute quota."""
+    ip   = request.client.host if request.client else "unknown"
+    wait = await _limiter.check(ip, key, max_calls, settings.rate_limit_window)
+    if wait is not None:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=f"Rate limit exceeded. Try again in {ceil(wait)}s.",
+            headers={"Retry-After": str(ceil(wait))},
+        )
 
 
 # ── Lifespan ──────────────────────────────────────────────────────────────────
@@ -198,7 +248,7 @@ async def health_check():
     summary="Parse a .docx or .pdf CV file into structured projects + facts",
     status_code=status.HTTP_200_OK,
 )
-async def parse_cv(file: UploadFile = File(...)):
+async def parse_cv(request: Request, file: UploadFile = File(...)):
     """
     **Document parsing endpoint.**
 
@@ -213,6 +263,7 @@ async def parse_cv(file: UploadFile = File(...)):
     | `done`     | `{total_projects, total_facts}` | All done |
     | `error`    | `null` (see `error_message`) | Parse error |
     """
+    await _rate_check(request, "parse", settings.rate_limit_parse)
     if not file.filename:
         raise HTTPException(status_code=400, detail="No filename provided.")
 
@@ -260,7 +311,7 @@ async def parse_cv(file: UploadFile = File(...)):
     tags=["generation"],
     summary="Score and rank all uploaded projects against a job description",
 )
-async def recommend(body: RecommendRequest):
+async def recommend(request: Request, body: RecommendRequest):
     """
     **Project recommendation endpoint.**
 
@@ -271,6 +322,7 @@ async def recommend(body: RecommendRequest):
     Call this after `/parse` and before `/optimize`. The frontend uses the
     response to pre-select the best projects and show reasoning to the user.
     """
+    await _rate_check(request, "recommend", settings.rate_limit_recommend)
     recs = await _do_recommend(
         projects=body.projects,
         job_description=body.job_description,
@@ -287,7 +339,7 @@ async def recommend(body: RecommendRequest):
     summary="Stream optimised resume bullets via SSE",
     status_code=status.HTTP_200_OK,
 )
-async def optimize(request: OptimizationRequest):
+async def optimize(request: Request, body: OptimizationRequest):
     """
     **Main generation endpoint.**
 
@@ -302,12 +354,13 @@ async def optimize(request: OptimizationRequest):
     | `error`    | `{error_message: string}` | Pipeline error |
     | `done`     | `{data: {elapsed_seconds}}` | Stream complete |
     """
+    await _rate_check(request, "optimize", settings.rate_limit_optimize)
     # H3: guard Groq free-tier quota before starting the stream.
     # 429 backoff is handled inside chains.py, but the best defence is not
     # sending 200+ LLM calls in the first place.
     if settings.groq_api_key:
         cap = settings.groq_max_bullets_per_request
-        requested = request.total_bullets_requested or 0
+        requested = body.total_bullets_requested or 0
         if requested > cap:
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -318,7 +371,7 @@ async def optimize(request: OptimizationRequest):
                 ),
             )
     return StreamingResponse(
-        _sse_stream(request),
+        _sse_stream(body),
         media_type="text/event-stream",
         headers=_SSE_HEADERS,
     )

@@ -82,6 +82,15 @@ class Settings(BaseSettings):
     # CORS: restrict to your frontend origin in production.
     cors_origins: list[str] = ["http://localhost:5173"]
 
+    # ── Rate limiting ─────────────────────────────────────────────────────────
+    # Per-IP sliding-window limits for the three expensive endpoints.
+    # Set RATE_LIMIT_ENABLED=false to disable (useful in local dev / testing).
+    rate_limit_enabled: bool = True
+    rate_limit_window: int = 60       # window in seconds
+    rate_limit_parse: int = 10        # max /parse calls per IP per window
+    rate_limit_recommend: int = 20    # max /recommend calls per IP per window
+    rate_limit_optimize: int = 5      # max /optimize calls per IP per window
+
     # ── Admin auth ────────────────────────────────────────────────────────────
     # Set INGEST_SECRET in .env to protect the /ingest endpoint.
     # Leave blank to allow unauthenticated access (dev only).
