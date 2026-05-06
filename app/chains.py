@@ -443,34 +443,6 @@ class BulletAlchemist:
 
         return await self._correction_loop(bullet, history, scored_facts, constraints)
 
-    async def generate_bullet_from_draft(
-        self,
-        initial_draft: str,
-        scored_facts: list[ScoredFact],
-        exemplars: list[StyleExemplar],
-        jd_analysis: dict,
-        jd_tone: JDTone,
-        constraints: FormattingConstraints,
-        role_type: RoleType,
-    ) -> BulletDraft:
-        """Run the correction loop starting from an already-generated draft.
-
-        This avoids a redundant LLM call when the initial draft was already
-        produced by stream_initial_tokens().
-        """
-        initial_prompt = self._build_initial_prompt(
-            scored_facts, exemplars, jd_analysis, jd_tone, constraints, role_type,
-        )
-        bullet = _clean_bullet(initial_draft, constraints.bullet_prefix)
-
-        # Reconstruct conversation history as if the LLM had produced this draft
-        history: list[dict] = [
-            {"role": "user", "content": initial_prompt},
-            {"role": "assistant", "content": bullet},
-        ]
-
-        return await self._correction_loop(bullet, history, scored_facts, constraints)
-
     async def _correction_loop(
         self,
         bullet: str,
@@ -526,34 +498,29 @@ class BulletAlchemist:
 
         return best  # type: ignore[return-value]
 
-    async def stream_initial_tokens(
-        self,
-        scored_facts: list[ScoredFact],
-        exemplars: list[StyleExemplar],
-        jd_analysis: dict,
-        jd_tone: JDTone,
-        constraints: FormattingConstraints,
-        role_type: RoleType,
-    ) -> AsyncGenerator[str, None]:
-        """Stream raw tokens from the initial draft pass.
 
-        Yields each token AND sets self.last_streamed_draft to the full
-        concatenated text so the caller can reuse it in the correction loop.
-        """
-        initial_prompt = self._build_initial_prompt(
-            scored_facts, exemplars, jd_analysis, jd_tone, constraints, role_type,
-        )
-        accumulated: list[str] = []
-        async for token in _ollama_stream(
-            system=_ALCHEMIST_SYSTEM,
-            messages=[{"role": "user", "content": initial_prompt}],
-        ):
-            accumulated.append(token)
-            yield token
+# ═════════════════════════════════════════════════════════════════════════════
+# Typewriter stream — chunk the FINAL bullet to the browser
+# ═════════════════════════════════════════════════════════════════════════════
 
-        # Store the full draft so the orchestrator can pass it to the
-        # correction loop without making a second LLM call.
-        self.last_streamed_draft = "".join(accumulated)
+async def _chunk_stream(text: str) -> AsyncGenerator[str, None]:
+    """Yield the finalized bullet word-by-word so the browser typewriter shows
+    exactly the text that will be kept (no replace-on-correction blink).
+
+    Why: the previous design streamed tokens of an *initial* LLM draft, then
+    silently rewrote it through the char-limit correction loop — the user saw
+    one sentence type out and a different one snap into place. Now we run the
+    correction loop silently, then chunk-stream the final draft.
+    """
+    if not text:
+        yield ""
+        return
+    parts = re.findall(r"\S+\s*", text) or [text]
+    delay = settings.bullet_stream_chunk_delay
+    for part in parts:
+        yield part
+        if delay:
+            await asyncio.sleep(delay)
 
 
 # ═════════════════════════════════════════════════════════════════════════════

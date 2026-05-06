@@ -64,6 +64,12 @@ class Settings(BaseSettings):
     llm_max_tokens: int = 512
     llm_context_window: int = 8192
 
+    # ── Bullet typewriter stream ──────────────────────────────────────────────
+    # Delay (seconds) between word chunks when streaming the finalized bullet
+    # to the browser. Higher = slower, more deliberate typewriter feel.
+    # Set to 0 to emit all chunks at once (e.g., in tests/CI).
+    bullet_stream_chunk_delay: float = 0.025
+
     # ── App ───────────────────────────────────────────────────────────────────
     app_env: str = "development"
     port: int = 8000
