@@ -11,7 +11,10 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 from app.parser import (
     RawProject,
+    _BULLET_MARKER_CHARS,
+    _clean_bullet_text,
     _is_label,
+    _is_pgdba_template,
     _is_project_heading,
     _make_slug,
     _strip_fences,
@@ -114,6 +117,128 @@ class TestPdfParsing:
             projects = parse_pdf_bytes(b"fake-pdf-bytes")
 
         assert projects == []
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PGDBA-template PDF parsing (private-use bullet glyphs, two-column layout)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _word(text: str, x0: float, top: float) -> dict:
+    """Build a pdfplumber-shaped word box with sane bottom/x1 estimates."""
+    return {"text": text, "x0": x0, "top": top, "x1": x0 + len(text) * 5, "bottom": top + 10}
+
+
+def _char(text: str, x0: float, top: float) -> dict:
+    return {"text": text, "x0": x0, "top": top, "x1": x0 + 4, "bottom": top + 10}
+
+
+def _make_pgdba_page(words: list[dict], chars: list[dict], width: float = 600.0):
+    page = MagicMock()
+    page.extract_words.return_value = words
+    page.chars = chars
+    page.width = width
+    # Generic-fallback path uses extract_text — leave it harmless in case PGDBA path bails.
+    page.extract_text.return_value = ""
+    return page
+
+
+def _open_pdf_with_pages(pages: list) -> MagicMock:
+    pdf = MagicMock()
+    pdf.__enter__ = MagicMock(return_value=pdf)
+    pdf.__exit__  = MagicMock(return_value=False)
+    pdf.pages     = pages
+    return pdf
+
+
+class TestPgdbaPath:
+    """Coverage for _parse_pdf_pgdba — the coordinate-based extractor used when
+    the PDF's char layer contains the PGDBA private-use bullet glyphs."""
+
+    def test_is_pgdba_template_detects_wingdings_marker(self):
+        # The Wingdings glyph U+F0A7 is what pdfplumber returns in page.chars
+        # for the bullet markers used across most PGDBA CVs.
+        chars = [_char("", 110, 90), _char("B", 130, 90)]
+        assert _is_pgdba_template(chars) is True
+
+    def test_is_pgdba_template_false_without_markers(self):
+        chars = [_char("B", 130, 90), _char("u", 138, 90)]
+        assert _is_pgdba_template(chars) is False
+        # And the marker set itself contains exactly what we expect.
+        assert _BULLET_MARKER_CHARS == {"", "§"}
+
+    def test_clean_bullet_text_strips_mid_line_marker_split(self):
+        # Real-world artifact: "LMs] ▪ Enhanced..." — keep the longest segment.
+        out = _clean_bullet_text("LMs] ▪ Enhanced retrieval pipeline reducing latency by 40ms")
+        assert out.startswith("Enhanced")
+        assert "▪" not in out
+
+    def test_pgdba_path_segments_into_multiple_projects(self):
+        # Page width 600 → marker at x0=110 → threshold = max(30, 107) = 107 pt.
+        # Words with x0 ≤ 107 land in the left column (project titles); words
+        # with x0 > 107 are right-column bullet content.
+        words = [
+            # Section header — toggles in_target = True
+            _word("ACADEMIC",  20, 50),  _word("PROJECTS",  90, 50),
+            # Project title #1 — left column only
+            _word("Time",      20, 70),  _word("Series",    50, 70),
+            # Bullet for project #1 — right column only
+            _word("Built",    130, 90),  _word("SARIMA",   180, 90),
+            _word("reducing", 240, 90),  _word("RMSE",     320, 90),
+            _word("to",       370, 90),  _word("0.250",    400, 90),
+            _word("with",     440, 90),  _word("careful",  480, 90),
+            _word("tuning",   530, 90),
+            # Project title #2 — left column only
+            _word("ML",        20, 110), _word("Project",   50, 110),
+            # Bullet for project #2 — right column only
+            _word("Trained",  130, 130), _word("XGBoost",  180, 130),
+            _word("achieving",240, 130), _word("87%",      320, 130),
+            _word("accuracy", 360, 130), _word("on",       420, 130),
+            _word("validation",450, 130),
+        ]
+        chars = [_char("", 110, 90), _char("", 110, 130)]
+        pdf   = _open_pdf_with_pages([_make_pgdba_page(words, chars)])
+
+        with patch("pdfplumber.open", return_value=pdf):
+            projects = parse_pdf_bytes(b"fake")
+
+        assert [p.title for p in projects] == ["Time Series", "ML Project"]
+        assert len(projects[0].bullets) == 1
+        assert "SARIMA" in projects[0].bullets[0]
+        assert "0.250"  in projects[0].bullets[0]   # number preserved
+        assert len(projects[1].bullets) == 1
+        assert "XGBoost" in projects[1].bullets[0]
+        assert "87%"     in projects[1].bullets[0]
+
+    def test_pgdba_path_skips_bullets_after_stop_header(self):
+        # WORK EXPERIENCE bullets must NOT be ingested as project content —
+        # the section gate flips off when a stop header is hit.
+        words = [
+            _word("ACADEMIC",  20, 50),  _word("PROJECTS",  90, 50),
+            _word("Real",      20, 70),  _word("Project",   50, 70),
+            _word("Built",    130, 90),  _word("SARIMA",   180, 90),
+            _word("reducing", 240, 90),  _word("RMSE",     320, 90),
+            _word("to",       370, 90),  _word("0.250",    400, 90),
+            _word("over",     440, 90),  _word("baseline", 480, 90),
+            # Stop header — gate closes here
+            _word("WORK",      20, 110), _word("EXPERIENCE",70, 110),
+            # Bullet under WORK EXPERIENCE — must be ignored
+            _word("Worked",   130, 130), _word("at",       190, 130),
+            _word("CompanyX", 220, 130), _word("on",       290, 130),
+            _word("internal", 320, 130), _word("tools",    390, 130),
+            _word("for",      440, 130), _word("logging",  470, 130),
+        ]
+        chars = [_char("", 110, 90), _char("", 110, 130)]
+        pdf   = _open_pdf_with_pages([_make_pgdba_page(words, chars)])
+
+        with patch("pdfplumber.open", return_value=pdf):
+            projects = parse_pdf_bytes(b"fake")
+
+        assert len(projects) == 1
+        assert projects[0].title == "Real Project"
+        assert len(projects[0].bullets) == 1
+        assert "SARIMA" in projects[0].bullets[0]
+        # The post-stop-header bullet must NOT have leaked in.
+        assert all("Worked" not in b for b in projects[0].bullets)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

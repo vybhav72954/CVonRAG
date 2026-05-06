@@ -51,6 +51,18 @@ load_dotenv()  # reads .env from project root so GROQ_API_KEY / INGEST_SECRET ar
 import httpx
 import pdfplumber
 
+# Ensure `app` is importable when this script is run via `python scripts/ingest_pdfs.py`
+# (Python adds the script's dir to sys.path, not the project root). No-op when the
+# package is already pip-installed (`uv pip install -e .`).
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
+
+from app.parser import (
+    _BULLET_MARKER_CHARS,        # canonical PGDBA bullet glyphs (, §)
+    _group_words_into_lines,     # shared word-box → physical-line grouping
+)
+
 
 # Try rich for pretty output; fall back to plain print
 try:
@@ -81,11 +93,9 @@ def _looks_like_header(text: str) -> bool:
     )
 
 
-# PGDBA CV bullet marker characters (private-use / non-standard Unicode).
-# pdfplumber sees these in page.chars but NOT in page.extract_words().
-#   \uf0a7 — Wingdings private-use glyph that renders as ▪ (most PGDBA CVs)
-#   §       — Section sign repurposed as a bullet (e.g. JP50, Sayali's CV)
-_BULLET_MARKER_CHARS = {'\uf0a7', '§'}
+# NOTE: _BULLET_MARKER_CHARS is imported from app.parser (single source of truth).
+# When PGDBA introduces a new bullet glyph, update app/parser.py only — both the
+# runtime parser and this seeding script will pick up the change automatically.
 
 
 
@@ -157,27 +167,10 @@ def extract_bullets_from_pdf(pdf_path: Path) -> list[str]:
         for page in pdf.pages:
             # 1. Extract every individual word with its exact bounding box
             words = page.extract_words(x_tolerance=3, y_tolerance=3, keep_blank_chars=False)
-            
-            # 2. Group words into physical horizontal lines based on their 'top' coordinate
-            lines = []
-            words.sort(key=lambda w: (w['top'], w['x0']))
-            
-            current_line = []
-            current_top = None
-            
-            for w in words:
-                if current_top is None:
-                    current_top = w['top']
-                    current_line.append(w)
-                elif abs(w['top'] - current_top) <= 4:  # 4px vertical tolerance to group a line
-                    current_line.append(w)
-                else:
-                    lines.append(current_line)
-                    current_line = [w]
-                    current_top = w['top']
-            if current_line:
-                lines.append(current_line)
-                
+
+            # 2. Group words into physical horizontal lines (shared helper from app.parser)
+            lines = _group_words_into_lines(words, y_tol=4.0)
+
             page_width = float(page.width)
             
             # 3. Process each physical line
