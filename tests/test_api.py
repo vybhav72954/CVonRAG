@@ -40,6 +40,10 @@ MINIMAL_REQUEST = {
     ],
 }
 
+# Magic-byte prefixes used to build realistic test file payloads (H7)
+_DOCX_MAGIC = b"PK\x03\x04"           # ZIP / OOXML container
+_PDF_MAGIC  = b"%PDF-1.4\n"           # PDF header (any version starts with %PDF)
+
 INGEST_BODY = {
     "bullets": [
         {
@@ -303,7 +307,7 @@ class TestRateLimit:
             yield ("done", {"total_projects": 0, "total_facts": 0})
 
         from app.main import settings, _limiter
-        _file = ("cv.pdf", b"fake-pdf-content-" + b"x" * 200, "application/pdf")
+        _file = ("cv.pdf", _PDF_MAGIC + b"x" * 200, "application/pdf")
         with patch.object(settings, "rate_limit_enabled", True), \
              patch.object(settings, "rate_limit_parse", 1), \
              patch("app.main.parse_and_stream", side_effect=_mock_stream):
@@ -346,7 +350,7 @@ class TestRateLimit:
             yield ("done", None)
 
         from app.main import settings, _limiter
-        _file = ("cv.pdf", b"fake-pdf-content-" + b"x" * 200, "application/pdf")
+        _file = ("cv.pdf", _PDF_MAGIC + b"x" * 200, "application/pdf")
         with patch.object(settings, "rate_limit_enabled", True), \
              patch.object(settings, "rate_limit_parse", 1), \
              patch.object(settings, "rate_limit_optimize", 1), \
@@ -434,7 +438,7 @@ class TestParse:
         with patch("app.main.parse_and_stream", side_effect=_mock_stream):
             resp = client.post(
                 "/parse",
-                files={"file": ("resume.docx", b"fake-docx-content-" + b"x" * 200, "application/vnd.openxmlformats-officedocument.wordprocessingml.document")},
+                files={"file": ("resume.docx", _DOCX_MAGIC + b"x" * 200, "application/vnd.openxmlformats-officedocument.wordprocessingml.document")},
             )
 
         assert resp.status_code == 200
@@ -453,7 +457,7 @@ class TestParse:
         with patch("app.main.parse_and_stream", side_effect=_mock_stream):
             resp = client.post(
                 "/parse",
-                files={"file": ("cv.pdf", b"fake-pdf-content-" + b"x" * 200, "application/pdf")},
+                files={"file": ("cv.pdf", _PDF_MAGIC + b"x" * 200, "application/pdf")},
             )
 
         assert resp.status_code == 200
@@ -467,8 +471,73 @@ class TestParse:
         with patch("app.main.parse_and_stream", side_effect=_mock_stream):
             resp = client.post(
                 "/parse",
-                files={"file": ("resume.docx", b"bad-bytes-" + b"x" * 200, "application/vnd.openxmlformats-officedocument.wordprocessingml.document")},
+                files={"file": ("resume.docx", _DOCX_MAGIC + b"x" * 200, "application/vnd.openxmlformats-officedocument.wordprocessingml.document")},
             )
 
         assert resp.status_code == 200
         assert "event: error" in resp.text
+
+
+# ── Magic-byte validation (H7) ────────────────────────────────────────────────
+
+class TestFileMagic:
+    """H7: file-type is verified by magic bytes, not just the filename extension."""
+
+    _DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    _PDF_MIME  = "application/pdf"
+
+    def test_docx_with_pdf_magic_returns_415(self, client):
+        """A .docx file that starts with %PDF bytes is rejected."""
+        resp = client.post(
+            "/parse",
+            files={"file": ("resume.docx", _PDF_MAGIC + b"x" * 200, self._DOCX_MIME)},
+        )
+        assert resp.status_code == 415
+
+    def test_pdf_with_docx_magic_returns_415(self, client):
+        """A .pdf file that starts with PK bytes is rejected."""
+        resp = client.post(
+            "/parse",
+            files={"file": ("cv.pdf", _DOCX_MAGIC + b"x" * 200, self._PDF_MIME)},
+        )
+        assert resp.status_code == 415
+
+    def test_renamed_exe_as_docx_returns_415(self, client):
+        """A Windows executable (MZ header) renamed to .docx is rejected."""
+        resp = client.post(
+            "/parse",
+            files={"file": ("cv.docx", b"MZ\x90\x00" + b"x" * 200, self._DOCX_MIME)},
+        )
+        assert resp.status_code == 415
+
+    def test_valid_docx_magic_passes_check(self, client):
+        """A .docx file with correct PK magic proceeds past validation."""
+        async def _mock_stream(fb, fn, hc):
+            yield ("done", {"total_projects": 0, "total_facts": 0})
+
+        with patch("app.main.parse_and_stream", side_effect=_mock_stream):
+            resp = client.post(
+                "/parse",
+                files={"file": ("cv.docx", _DOCX_MAGIC + b"x" * 200, self._DOCX_MIME)},
+            )
+        assert resp.status_code == 200
+
+    def test_valid_pdf_magic_passes_check(self, client):
+        """A .pdf file with correct %PDF magic proceeds past validation."""
+        async def _mock_stream(fb, fn, hc):
+            yield ("done", {"total_projects": 0, "total_facts": 0})
+
+        with patch("app.main.parse_and_stream", side_effect=_mock_stream):
+            resp = client.post(
+                "/parse",
+                files={"file": ("cv.pdf", _PDF_MAGIC + b"x" * 200, self._PDF_MIME)},
+            )
+        assert resp.status_code == 200
+
+    def test_magic_check_runs_after_size_check(self, client):
+        """Files that are too small fail with 400 before reaching the magic check."""
+        resp = client.post(
+            "/parse",
+            files={"file": ("cv.docx", b"PK", self._DOCX_MIME)},  # valid magic, too short
+        )
+        assert resp.status_code == 400  # not 415

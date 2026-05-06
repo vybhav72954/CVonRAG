@@ -147,6 +147,24 @@ _SSE_HEADERS = {
     "Connection":        "keep-alive",
 }
 
+# ── File-type validation (magic bytes) ───────────────────────────────────────
+# Trusting the filename extension alone lets a renamed file bypass the parser.
+# Checking the leading bytes costs nothing and catches the common case (H7).
+# DOCX (OOXML) is a ZIP container: PK\x03\x04
+# PDF specification header:         %PDF
+
+_MAGIC_DOCX = b"PK\x03\x04"
+_MAGIC_PDF  = b"%PDF"
+
+
+def _validate_file_magic(file_bytes: bytes, fname: str) -> bool:
+    """Return True when the file's leading bytes match the declared extension."""
+    if fname.endswith(".docx"):
+        return file_bytes[:4] == _MAGIC_DOCX
+    if fname.endswith(".pdf"):
+        return file_bytes[:4] == _MAGIC_PDF
+    return False
+
 
 # ── SSE helpers ───────────────────────────────────────────────────────────────
 
@@ -280,6 +298,15 @@ async def parse_cv(request: Request, file: UploadFile = File(...)):
 
     if len(file_bytes) < 100:
         raise HTTPException(status_code=400, detail="File appears to be empty or corrupt.")
+
+    if not _validate_file_magic(file_bytes, fname):
+        raise HTTPException(
+            status_code=415,
+            detail=(
+                "File content does not match the declared type. "
+                "Upload a genuine .docx or .pdf — not a renamed file."
+            ),
+        )
 
     http_client = get_http()
 
