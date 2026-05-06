@@ -10,6 +10,7 @@ Phase 5 → CVonRAGOrchestrator.run() — async generator of SSE events
 """
 
 from __future__ import annotations
+import asyncio
 import json
 import logging
 import re
@@ -615,21 +616,9 @@ class CVonRAGOrchestrator:
                 supporting = _pick_supporting_facts(primary, scored, exclude_idx=i)
                 facts      = [primary] + supporting
 
-                # Phase 5: stream initial draft tokens
-                async for token in self.alchemist.stream_initial_tokens(
-                    scored_facts=facts,
-                    exemplars=exemplars,
-                    jd_analysis=jd_analysis,
-                    jd_tone=jd_tone,
-                    constraints=request.constraints,
-                    role_type=request.target_role_type,
-                ):
-                    yield ("token", token)
-
-                # Phase 4: correction loop — reuse the streamed draft
-                # instead of making a second LLM call from scratch
-                draft = await self.alchemist.generate_bullet_from_draft(
-                    initial_draft=self.alchemist.last_streamed_draft,
+                # Phase 4: run the full correction loop silently — we want the
+                # *final* bullet, not an initial draft that may get rewritten.
+                draft = await self.alchemist.generate_bullet(
                     scored_facts=facts,
                     exemplars=exemplars,
                     jd_analysis=jd_analysis,
@@ -637,6 +626,11 @@ class CVonRAGOrchestrator:
                     constraints=request.constraints,
                     role_type=request.target_role_type,
                 )
+
+                # Phase 5: chunk-stream the *final* bullet so the typewriter
+                # in the browser shows exactly what the user is going to keep.
+                async for token in _chunk_stream(draft.text):
+                    yield ("token", token)
 
                 metadata = BulletMetadata(
                     bullet_index=bullet_index,

@@ -1,7 +1,7 @@
 [project]
 name            = "cvonrag"
 version         = "1.0.0"
-description     = "RAG-powered resume bullet optimizer — Ollama/Qwen edition, 100% free"
+description     = "RAG-powered resume bullet optimizer — Groq LLM (preferred) or local Ollama, with Qdrant for style exemplar retrieval"
 readme          = "README.md"
 requires-python = ">=3.12"
 
