@@ -92,6 +92,7 @@ async def _groq_chat(
     system: str | None = None,
     temperature: float | None = None,
     max_tokens: int | None = None,
+    json_mode: bool = False,
 ) -> str:
     """Non-streaming Groq call (OpenAI-compatible) — retries up to 3× on 429."""
     payload = {
@@ -101,6 +102,8 @@ async def _groq_chat(
         "max_tokens": max_tokens or settings.llm_max_tokens,
         "stream": False,
     }
+    if json_mode:
+        payload["response_format"] = {"type": "json_object"}
     for attempt in range(_GROQ_MAX_RETRIES):
         try:
             r = await get_http().post(
@@ -180,6 +183,7 @@ async def _ollama_chat_inner(
     system: str | None = None,
     temperature: float | None = None,
     max_tokens: int | None = None,
+    json_mode: bool = False,
 ) -> str:
     """Non-streaming Ollama /api/chat call."""
     payload: dict = {
@@ -194,6 +198,8 @@ async def _ollama_chat_inner(
     }
     if system:
         payload["system"] = system
+    if json_mode:
+        payload["format"] = "json"
 
     r = await get_http().post(f"{settings.ollama_base_url}/api/chat", json=payload, timeout=120.0)
     r.raise_for_status()
@@ -241,11 +247,12 @@ async def _ollama_chat(
     system: str | None = None,
     temperature: float | None = None,
     max_tokens: int | None = None,
+    json_mode: bool = False,
 ) -> str:
     """LLM call — routes to Groq if GROQ_API_KEY is set, else Ollama."""
     if _using_groq():
-        return await _groq_chat(messages, system, temperature, max_tokens)
-    return await _ollama_chat_inner(messages, system, temperature, max_tokens)
+        return await _groq_chat(messages, system, temperature, max_tokens, json_mode)
+    return await _ollama_chat_inner(messages, system, temperature, max_tokens, json_mode)
 
 
 async def _ollama_stream(
@@ -291,16 +298,20 @@ class SemanticMatcher:
     """Phase 2: analyse the JD and score every CoreFact for relevance."""
 
     async def analyze_jd(self, jd: str) -> dict:
-        raw = await _ollama_chat(
-            system=_JD_ANALYSIS_SYSTEM,
-            messages=[{"role": "user", "content": f"Job Description:\n\n{jd}"}],
-            temperature=0.05,
-        )
+        msgs = [{"role": "user", "content": f"Job Description:\n\n{jd}"}]
+        raw  = await _ollama_chat(system=_JD_ANALYSIS_SYSTEM, messages=msgs, temperature=0.05)
         try:
             return json.loads(_strip_json_fences(raw))
         except json.JSONDecodeError:
-            logger.warning("JD analysis JSON parse failed. Raw: %.200s", raw)
-            return {}
+            logger.warning("JD analysis JSON parse failed — retrying with json_mode. Raw: %.200s", raw)
+            raw = await _ollama_chat(
+                system=_JD_ANALYSIS_SYSTEM, messages=msgs, temperature=0.05, json_mode=True,
+            )
+            try:
+                return json.loads(_strip_json_fences(raw))
+            except json.JSONDecodeError:
+                logger.warning("JD analysis retry failed — returning empty analysis. Raw: %.200s", raw)
+                return {}
 
     async def score_facts(
         self,
@@ -317,19 +328,25 @@ class SemanticMatcher:
             f"JD Analysis:\n{json.dumps(jd_analysis, indent=2)}\n\n"
             f"Facts:\n{json.dumps(payload, indent=2)}"
         )
-        raw = await _ollama_chat(
-            system=_FACT_SCORING_SYSTEM,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.05,
-        )
+        msgs = [{"role": "user", "content": prompt}]
+        raw  = await _ollama_chat(system=_FACT_SCORING_SYSTEM, messages=msgs, temperature=0.05)
         try:
             scores: list[dict] = json.loads(_strip_json_fences(raw))
         except json.JSONDecodeError:
-            logger.warning("Fact scoring JSON parse failed — assigning 0.5 to all.")
-            scores = [
-                {"fact_id": f.fact_id, "relevance_score": 0.5, "matched_jd_keywords": []}
-                for _, f in flat
-            ]
+            logger.warning("Fact scoring JSON parse failed — retrying with json_mode. Raw: %.200s", raw)
+            raw = await _ollama_chat(
+                system=_FACT_SCORING_SYSTEM, messages=msgs, temperature=0.05, json_mode=True,
+            )
+            try:
+                scores = json.loads(_strip_json_fences(raw))
+            except json.JSONDecodeError:
+                logger.warning(
+                    "Fact scoring retry failed — assigning 0.5 to all. Raw: %.200s", raw
+                )
+                scores = [
+                    {"fact_id": f.fact_id, "relevance_score": 0.5, "matched_jd_keywords": []}
+                    for _, f in flat
+                ]
 
         score_map = {s["fact_id"]: s for s in scores}
         result = [
@@ -716,8 +733,10 @@ def _pick_supporting_facts(
 
 
 def _strip_json_fences(text: str) -> str:
-    """Remove ```json ... ``` fences that Qwen sometimes adds."""
+    """Remove ```json ... ``` fences and <think>...</think> reasoning blocks."""
     text = text.strip()
-    text = re.sub(r"^```(?:json)?\s*", "", text)
+    # Strip extended-reasoning blocks that Qwen/DeepSeek reasoning models emit
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
+    text = re.sub(r"^```(?:json)?\s*", "", text.strip())
     text = re.sub(r"\s*```$", "", text)
     return text.strip()

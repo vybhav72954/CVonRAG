@@ -4,13 +4,15 @@ Unit tests for chains.py — no live Ollama or Qdrant required.
 
 Coverage:
   • _clean_bullet          — markdown stripping, prefix, Qwen <think> removal
-  • _strip_json_fences
+  • _strip_json_fences     — fence removal + <think> block stripping (M8)
   • _format_facts
   • _format_exemplars
   • _pick_supporting_facts
   • SemanticMatcher.infer_tone
+  • SemanticMatcher.score_facts — json_mode retry on parse fail (H5)
   • Character tolerance boundary checks
   • Metric fidelity (numbers never mutated by helpers)
+  • Groq 429 retry logic (H2)
 """
 
 import asyncio
@@ -130,6 +132,20 @@ class TestStripJsonFences:
 
     def test_strips_surrounding_whitespace(self):
         assert _strip_json_fences("  ```json\n{}\n```  ") == "{}"
+
+    def test_strips_think_block_before_json(self):
+        raw = "<think>I will output valid JSON now.</think>\n{\"k\": \"v\"}"
+        assert _strip_json_fences(raw) == '{"k": "v"}'
+
+    def test_strips_think_block_wrapped_in_fence(self):
+        raw = "```json\n<think>reasoning</think>\n{\"a\": 1}\n```"
+        result = _strip_json_fences(raw)
+        assert "<think>" not in result
+        assert '{"a": 1}' in result
+
+    def test_no_think_block_unchanged(self):
+        raw = '[{"fact_id": "f-1", "relevance_score": 0.9}]'
+        assert _strip_json_fences(raw) == raw
 
 
 # ── _format_facts ─────────────────────────────────────────────────────────────
@@ -269,6 +285,71 @@ class TestMetricFidelity:
             relevance_score=0.9,
         )
         assert metric in _format_facts([fact])
+
+
+# ── H5: score_facts json_mode retry + M8: _strip_json_fences <think> strip ───
+
+class TestScoreFactsRetry:
+    """SemanticMatcher.score_facts retries with json_mode=True on first parse failure."""
+
+    def _make_project(self) -> "ProjectData":
+        from app.models import ProjectData
+        return ProjectData(
+            project_id="p-001",
+            title="Forecasting",
+            core_facts=[
+                CoreFact(fact_id="f-001", text="Built SARIMA model", tools=["SARIMA"], metrics=[]),
+            ],
+        )
+
+    @pytest.mark.anyio
+    async def test_succeeds_on_first_try_no_retry(self):
+        """When the LLM returns valid JSON immediately, _ollama_chat is called once."""
+        good_json = '[{"fact_id": "f-001", "relevance_score": 0.9, "matched_jd_keywords": ["SARIMA"]}]'
+        with patch("app.chains._ollama_chat", new=AsyncMock(return_value=good_json)) as mock_chat:
+            matcher = SemanticMatcher()
+            result = await matcher.score_facts({}, [self._make_project()])
+
+        assert mock_chat.call_count == 1
+        assert result[0].relevance_score == 0.9
+        assert result[0].matched_jd_keywords == ["SARIMA"]
+
+    @pytest.mark.anyio
+    async def test_retries_with_json_mode_on_first_parse_failure(self):
+        """On first parse failure, score_facts retries once with json_mode=True."""
+        bad_raw  = "Here are the scores: blah blah (malformed)"
+        good_json = '[{"fact_id": "f-001", "relevance_score": 0.7, "matched_jd_keywords": []}]'
+        with patch("app.chains._ollama_chat", new=AsyncMock(side_effect=[bad_raw, good_json])) as mock_chat:
+            matcher = SemanticMatcher()
+            result = await matcher.score_facts({}, [self._make_project()])
+
+        assert mock_chat.call_count == 2
+        # Second call must have json_mode=True
+        _, second_kwargs = mock_chat.call_args_list[1]
+        assert second_kwargs.get("json_mode") is True
+        assert result[0].relevance_score == 0.7
+
+    @pytest.mark.anyio
+    async def test_falls_back_to_0_5_after_double_failure(self):
+        """If both attempts return malformed JSON, every fact gets relevance_score=0.5."""
+        bad = "not json at all"
+        with patch("app.chains._ollama_chat", new=AsyncMock(return_value=bad)):
+            matcher = SemanticMatcher()
+            result = await matcher.score_facts({}, [self._make_project()])
+
+        assert all(sf.relevance_score == 0.5 for sf in result)
+        assert all(sf.matched_jd_keywords == [] for sf in result)
+
+    @pytest.mark.anyio
+    async def test_first_call_does_not_use_json_mode(self):
+        """The initial call is made without json_mode so we don't waste quota on overhead."""
+        good_json = '[{"fact_id": "f-001", "relevance_score": 0.8, "matched_jd_keywords": []}]'
+        with patch("app.chains._ollama_chat", new=AsyncMock(return_value=good_json)) as mock_chat:
+            matcher = SemanticMatcher()
+            await matcher.score_facts({}, [self._make_project()])
+
+        first_kwargs = mock_chat.call_args_list[0][1]
+        assert not first_kwargs.get("json_mode", False)
 
 
 # ── H2: Groq 429 retry logic ─────────────────────────────────────────────────
