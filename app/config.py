@@ -23,6 +23,10 @@ class Settings(BaseSettings):
     groq_api_key: str = ""
     groq_model: str = "llama-3.3-70b-versatile"
     groq_base_url: str = "https://api.groq.com/openai/v1"
+    # Hard cap on bullets per /optimize request when using Groq.
+    # Groq free tier is 30 req/min; 15 bullets × 4 correction iterations = 62 calls (~2 min max).
+    # Set higher only if you have a paid Groq plan.
+    groq_max_bullets_per_request: int = 15
 
     # ── Ollama (local fallback) ──────────────────────────────────────────────
     # Used when GROQ_API_KEY is not set, and always used for embeddings.

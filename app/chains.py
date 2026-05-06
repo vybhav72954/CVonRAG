@@ -73,13 +73,27 @@ def _build_messages(messages: list[dict], system: str | None) -> list[dict]:
     return messages
 
 
+# ── Groq rate-limit retry constants ──────────────────────────────────────────
+
+_GROQ_MAX_RETRIES = 3
+_GROQ_RETRY_AFTER_DEFAULT = 10.0  # seconds when Retry-After header is absent
+
+
+def _groq_retry_wait(response: httpx.Response) -> float:
+    """Return Retry-After seconds from a 429 response, or the default."""
+    try:
+        return float(response.headers.get("retry-after", _GROQ_RETRY_AFTER_DEFAULT))
+    except (TypeError, ValueError):
+        return _GROQ_RETRY_AFTER_DEFAULT
+
+
 async def _groq_chat(
     messages: list[dict],
     system: str | None = None,
     temperature: float | None = None,
     max_tokens: int | None = None,
 ) -> str:
-    """Non-streaming Groq call (OpenAI-compatible)."""
+    """Non-streaming Groq call (OpenAI-compatible) — retries up to 3× on 429."""
     payload = {
         "model": settings.groq_model,
         "messages": _build_messages(messages, system),
@@ -87,24 +101,37 @@ async def _groq_chat(
         "max_tokens": max_tokens or settings.llm_max_tokens,
         "stream": False,
     }
-    r = await get_http().post(
-        f"{settings.groq_base_url}/chat/completions",
-        json=payload,
-        headers={"Authorization": f"Bearer {settings.groq_api_key}"},
-        timeout=60.0,
-    )
-    r.raise_for_status()
-    content = r.json()["choices"][0]["message"]["content"].strip()
-    # Strip Qwen/Llama extended-reasoning blocks if present
-    content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
-    return content
+    for attempt in range(_GROQ_MAX_RETRIES):
+        try:
+            r = await get_http().post(
+                f"{settings.groq_base_url}/chat/completions",
+                json=payload,
+                headers={"Authorization": f"Bearer {settings.groq_api_key}"},
+                timeout=60.0,
+            )
+            r.raise_for_status()
+            content = r.json()["choices"][0]["message"]["content"].strip()
+            # Strip Qwen/Llama extended-reasoning blocks if present
+            content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
+            return content
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code == 429 and attempt < _GROQ_MAX_RETRIES - 1:
+                wait = _groq_retry_wait(exc.response)
+                logger.warning(
+                    "Groq 429 (chat) — retry %d/%d after %.1fs",
+                    attempt + 1, _GROQ_MAX_RETRIES, wait,
+                )
+                await asyncio.sleep(wait)
+            else:
+                raise
+    raise RuntimeError("unreachable")  # loop always returns or re-raises
 
 
 async def _groq_stream(
     messages: list[dict],
     system: str | None = None,
 ) -> AsyncGenerator[str, None]:
-    """Streaming Groq call (OpenAI-compatible SSE)."""
+    """Streaming Groq call (OpenAI-compatible SSE) — retries up to 3× on 429."""
     payload = {
         "model": settings.groq_model,
         "messages": _build_messages(messages, system),
@@ -112,27 +139,40 @@ async def _groq_stream(
         "max_tokens": settings.llm_max_tokens,
         "stream": True,
     }
-    async with get_http().stream(
-        "POST",
-        f"{settings.groq_base_url}/chat/completions",
-        json=payload,
-        headers={"Authorization": f"Bearer {settings.groq_api_key}"},
-        timeout=60.0,
-    ) as resp:
-        resp.raise_for_status()
-        async for line in resp.aiter_lines():
-            if not line or not line.startswith("data: "):
-                continue
-            data = line[len("data: "):]
-            if data.strip() == "[DONE]":
-                break
-            try:
-                chunk = json.loads(data)
-                token = chunk["choices"][0].get("delta", {}).get("content", "")
-                if token:
-                    yield token
-            except (json.JSONDecodeError, KeyError, IndexError):
-                continue
+    for attempt in range(_GROQ_MAX_RETRIES):
+        try:
+            async with get_http().stream(
+                "POST",
+                f"{settings.groq_base_url}/chat/completions",
+                json=payload,
+                headers={"Authorization": f"Bearer {settings.groq_api_key}"},
+                timeout=60.0,
+            ) as resp:
+                resp.raise_for_status()
+                async for line in resp.aiter_lines():
+                    if not line or not line.startswith("data: "):
+                        continue
+                    data = line[len("data: "):]
+                    if data.strip() == "[DONE]":
+                        return
+                    try:
+                        chunk = json.loads(data)
+                        token = chunk["choices"][0].get("delta", {}).get("content", "")
+                        if token:
+                            yield token
+                    except (json.JSONDecodeError, KeyError, IndexError):
+                        continue
+                return  # stream ended normally
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code == 429 and attempt < _GROQ_MAX_RETRIES - 1:
+                wait = _groq_retry_wait(exc.response)
+                logger.warning(
+                    "Groq 429 (stream) — retry %d/%d after %.1fs",
+                    attempt + 1, _GROQ_MAX_RETRIES, wait,
+                )
+                await asyncio.sleep(wait)
+            else:
+                raise
 
 
 async def _ollama_chat_inner(

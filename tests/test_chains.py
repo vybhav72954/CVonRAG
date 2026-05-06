@@ -13,7 +13,9 @@ Coverage:
   • Metric fidelity (numbers never mutated by helpers)
 """
 
+import asyncio
 import pytest
+from unittest.mock import AsyncMock, MagicMock, patch
 from app.models import (
     CoreFact,
     FormattingConstraints,
@@ -29,6 +31,9 @@ from app.chains import (
     _format_facts,
     _format_exemplars,
     _pick_supporting_facts,
+    _groq_retry_wait,
+    _GROQ_MAX_RETRIES,
+    _GROQ_RETRY_AFTER_DEFAULT,
     SemanticMatcher,
 )
 
@@ -264,3 +269,98 @@ class TestMetricFidelity:
             relevance_score=0.9,
         )
         assert metric in _format_facts([fact])
+
+
+# ── H2: Groq 429 retry logic ─────────────────────────────────────────────────
+
+def _make_http_status_error(status_code: int, retry_after: str | None = None) -> tuple:
+    """Return (mock_response, HTTPStatusError) for a given status code."""
+    import httpx
+    resp = MagicMock(spec=httpx.Response)
+    resp.status_code = status_code
+    resp.headers = {"retry-after": retry_after} if retry_after else {}
+    exc = httpx.HTTPStatusError("mocked", request=MagicMock(), response=resp)
+    resp.raise_for_status = MagicMock(side_effect=exc)
+    return resp, exc
+
+
+class TestGroqRetryWait:
+    def test_reads_retry_after_header(self):
+        import httpx
+        resp = MagicMock(spec=httpx.Response)
+        resp.headers = {"retry-after": "30"}
+        assert _groq_retry_wait(resp) == 30.0
+
+    def test_uses_default_when_header_absent(self):
+        import httpx
+        resp = MagicMock(spec=httpx.Response)
+        resp.headers = {}
+        assert _groq_retry_wait(resp) == _GROQ_RETRY_AFTER_DEFAULT
+
+    def test_uses_default_on_non_numeric_header(self):
+        import httpx
+        resp = MagicMock(spec=httpx.Response)
+        resp.headers = {"retry-after": "soon"}
+        assert _groq_retry_wait(resp) == _GROQ_RETRY_AFTER_DEFAULT
+
+
+class TestGroqChatRetry:
+    """_groq_chat retries on 429 and raises after exhausting retries."""
+
+    def _good_response(self, content: str = "• bullet"):
+        import httpx
+        resp = MagicMock(spec=httpx.Response)
+        resp.status_code = 200
+        resp.raise_for_status = MagicMock()
+        resp.json = MagicMock(return_value={
+            "choices": [{"message": {"content": content}}]
+        })
+        return resp
+
+    @pytest.mark.anyio
+    async def test_retries_once_on_429_then_succeeds(self):
+        from app.chains import _groq_chat
+        bad_resp, _ = _make_http_status_error(429, retry_after="0")
+        good_resp = self._good_response()
+
+        mock_client = AsyncMock()
+        mock_client.post = AsyncMock(side_effect=[bad_resp, good_resp])
+
+        with patch("app.chains.get_http", return_value=mock_client), \
+             patch("asyncio.sleep", new_callable=AsyncMock):
+            result = await _groq_chat([{"role": "user", "content": "test"}])
+
+        assert mock_client.post.call_count == 2
+        assert result == "• bullet"
+
+    @pytest.mark.anyio
+    async def test_raises_after_max_retries(self):
+        import httpx
+        from app.chains import _groq_chat
+        bad_resp, _ = _make_http_status_error(429, retry_after="0")
+
+        mock_client = AsyncMock()
+        mock_client.post = AsyncMock(return_value=bad_resp)
+
+        with patch("app.chains.get_http", return_value=mock_client), \
+             patch("asyncio.sleep", new_callable=AsyncMock):
+            with pytest.raises(httpx.HTTPStatusError):
+                await _groq_chat([{"role": "user", "content": "test"}])
+
+        assert mock_client.post.call_count == _GROQ_MAX_RETRIES
+
+    @pytest.mark.anyio
+    async def test_non_429_error_raises_immediately(self):
+        import httpx
+        from app.chains import _groq_chat
+        bad_resp, _ = _make_http_status_error(500)
+
+        mock_client = AsyncMock()
+        mock_client.post = AsyncMock(return_value=bad_resp)
+
+        with patch("app.chains.get_http", return_value=mock_client), \
+             patch("asyncio.sleep", new_callable=AsyncMock):
+            with pytest.raises(httpx.HTTPStatusError):
+                await _groq_chat([{"role": "user", "content": "test"}])
+
+        assert mock_client.post.call_count == 1  # no retry for non-429

@@ -208,6 +208,51 @@ class TestOptimize:
 
         assert "event: done" in resp.text
 
+    def test_too_many_bullets_for_groq_returns_422(self, client):
+        """H3: /optimize rejects requests that exceed groq_max_bullets_per_request."""
+        from app.main import settings
+        with patch.object(settings, "groq_api_key", "test-key"), \
+             patch.object(settings, "groq_max_bullets_per_request", 2):
+            resp = client.post("/optimize", json={
+                **MINIMAL_REQUEST,
+                "total_bullets_requested": 3,
+            })
+        assert resp.status_code == 422
+        detail = resp.json()["detail"].lower()
+        assert "groq" in detail or "bullets" in detail
+
+    def test_groq_bullet_cap_not_triggered_when_within_limit(self, client):
+        """H3: requests within the Groq cap proceed normally."""
+        async def fake_run(request):
+            yield ("done", None)
+
+        from app.main import settings
+        with patch.object(settings, "groq_api_key", "test-key"), \
+             patch.object(settings, "groq_max_bullets_per_request", 5), \
+             patch("app.main.CVonRAGOrchestrator") as M:
+            M.return_value.run = fake_run
+            resp = client.post("/optimize", json={
+                **MINIMAL_REQUEST,
+                "total_bullets_requested": 1,
+            })
+        assert resp.status_code == 200
+
+    def test_groq_bullet_cap_skipped_when_no_api_key(self, client):
+        """H3: cap does not fire when GROQ_API_KEY is unset (Ollama mode)."""
+        async def fake_run(request):
+            yield ("done", None)
+
+        from app.main import settings
+        with patch.object(settings, "groq_api_key", ""), \
+             patch.object(settings, "groq_max_bullets_per_request", 2), \
+             patch("app.main.CVonRAGOrchestrator") as M:
+            M.return_value.run = fake_run
+            resp = client.post("/optimize", json={
+                **MINIMAL_REQUEST,
+                "total_bullets_requested": 3,
+            })
+        assert resp.status_code == 200
+
 
 # ── Docs ──────────────────────────────────────────────────────────────────────
 

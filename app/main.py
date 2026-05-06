@@ -302,6 +302,21 @@ async def optimize(request: OptimizationRequest):
     | `error`    | `{error_message: string}` | Pipeline error |
     | `done`     | `{data: {elapsed_seconds}}` | Stream complete |
     """
+    # H3: guard Groq free-tier quota before starting the stream.
+    # 429 backoff is handled inside chains.py, but the best defence is not
+    # sending 200+ LLM calls in the first place.
+    if settings.groq_api_key:
+        cap = settings.groq_max_bullets_per_request
+        requested = request.total_bullets_requested or 0
+        if requested > cap:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=(
+                    f"Groq free tier: total_bullets_requested ({requested}) exceeds the "
+                    f"server cap of {cap}. Reduce max_bullets_per_project or the number "
+                    f"of projects, or set GROQ_MAX_BULLETS_PER_REQUEST higher in .env."
+                ),
+            )
     return StreamingResponse(
         _sse_stream(request),
         media_type="text/event-stream",
