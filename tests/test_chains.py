@@ -116,6 +116,16 @@ class TestCleanBullet:
         result = _clean_bullet("Some fact text here", "")
         assert "Some fact" in result
 
+    def test_preserves_internal_asterisks(self):
+        """Internal *args / **kwargs must survive markdown stripping (M9)."""
+        result = _clean_bullet("• df.apply(*args, **kwargs)", "•")
+        assert "*args" in result
+        assert "**kwargs" in result
+
+    def test_strips_italic_wrapper(self):
+        result = _clean_bullet("*• Built a model*", "•")
+        assert result.count("*") == 0
+
 
 # ── _strip_json_fences ────────────────────────────────────────────────────────
 
@@ -228,6 +238,31 @@ class TestPickSupportingFacts:
         primary = make_scored_fact("f-001", keywords=["SARIMA"])
         facts   = [primary, make_scored_fact("f-002", keywords=["Docker"])]
         assert _pick_supporting_facts(primary, facts, exclude_idx=0) == []
+
+    def test_fallback_when_primary_has_no_keywords(self):
+        """Empty primary keywords → return next highest-scored facts instead of nothing."""
+        # make_scored_fact uses `keywords or [...]` so construct directly to get truly empty list
+        primary = ScoredFact(
+            fact=CoreFact(fact_id="f-001", text="placeholder", tools=[], metrics=[], outcome=""),
+            project_id="p-001", relevance_score=0.9, matched_jd_keywords=[],
+        )
+        f2 = make_scored_fact("f-002", keywords=["SQL"])
+        f3 = make_scored_fact("f-003", keywords=["Python"])
+        facts  = [primary, f2, f3]
+        result = _pick_supporting_facts(primary, facts, exclude_idx=0)
+        ids    = [s.fact.fact_id for s in result]
+        assert "f-002" in ids
+        assert "f-001" not in ids
+
+    def test_fallback_respects_max_supporting(self):
+        """Fallback still caps at max_supporting."""
+        primary = ScoredFact(
+            fact=CoreFact(fact_id="f-001", text="placeholder", tools=[], metrics=[], outcome=""),
+            project_id="p-001", relevance_score=0.9, matched_jd_keywords=[],
+        )
+        others = [make_scored_fact(f"f-{i:03d}", keywords=["X"]) for i in range(2, 6)]
+        result = _pick_supporting_facts(primary, [primary] + others, exclude_idx=0, max_supporting=2)
+        assert len(result) == 2
 
 
 # ── SemanticMatcher.infer_tone ────────────────────────────────────────────────

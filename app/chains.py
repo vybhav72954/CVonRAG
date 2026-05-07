@@ -707,8 +707,10 @@ def _clean_bullet(text: str, prefix: str) -> str:
     """Strip LLM artefacts and enforce the bullet prefix."""
     # Remove Qwen2.5 extended-reasoning blocks
     text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
-    # Remove markdown bold/italic
-    text = re.sub(r"\*+", "", text)
+    # Unwrap markdown bold (**text**) then italic (*text*).
+    # Use targeted patterns so internal asterisks like *args or **kwargs are preserved.
+    text = re.sub(r"\*\*(.+?)\*\*", r"\1", text, flags=re.DOTALL)
+    text = re.sub(r"(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)", r"\1", text, flags=re.DOTALL)
     # Remove any leading dash/asterisk the LLM might have added
     text = re.sub(r"^[-–—*]\s*", "", text.strip())
     text = text.strip()
@@ -724,12 +726,16 @@ def _pick_supporting_facts(
     exclude_idx: int,
     max_supporting: int = 2,
 ) -> list[ScoredFact]:
-    """Return facts that share JD keywords with the primary (up to max_supporting)."""
+    """Return facts sharing JD keywords with the primary; fall back to next highest-scored when primary has none."""
     primary_kw = set(primary.matched_jd_keywords)
-    return [
-        sf for j, sf in enumerate(all_facts)
-        if j != exclude_idx and set(sf.matched_jd_keywords) & primary_kw
-    ][:max_supporting]
+    if primary_kw:
+        return [
+            sf for j, sf in enumerate(all_facts)
+            if j != exclude_idx and set(sf.matched_jd_keywords) & primary_kw
+        ][:max_supporting]
+    # Primary has no keywords (LLM returned empty list) — return the next highest-scored facts.
+    # all_facts is already sorted by relevance_score descending by score_facts().
+    return [sf for j, sf in enumerate(all_facts) if j != exclude_idx][:max_supporting]
 
 
 def _strip_json_fences(text: str) -> str:

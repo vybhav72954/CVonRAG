@@ -19,6 +19,7 @@ Architecture:
 
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import logging
@@ -32,6 +33,14 @@ from app.models import CoreFact, ProjectData
 logger   = logging.getLogger(__name__)
 settings = get_settings()
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Constants
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Max bullets sent to the LLM per project for fact extraction.
+# Raised from 20 to 50 so power users (25+ bullets) no longer lose facts silently.
+_EXTRACT_MAX_BULLETS = 50
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Raw document types
@@ -320,8 +329,11 @@ def _strip_fences(text: str) -> str:
 
 
 def _make_slug(title: str) -> str:
-    """'Time Series Analysis – Hourly Wages' → 'time-series-analysi'"""
-    return re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")[:20]
+    """Stable slug: 20-char prefix + 6-char SHA1 suffix prevents collisions on similar titles."""
+    lower  = title.lower()
+    prefix = re.sub(r"[^a-z0-9]+", "-", lower).strip("-")[:20]
+    suffix = hashlib.sha1(lower.encode()).hexdigest()[:6]
+    return f"{prefix}-{suffix}"
 
 
 async def extract_facts(project: RawProject, http_client=None) -> list[CoreFact]:
@@ -334,8 +346,15 @@ async def extract_facts(project: RawProject, http_client=None) -> list[CoreFact]
     """
     from app.chains import _ollama_chat  # deferred import to avoid circular dep
 
-    slug         = _make_slug(project.title)
-    bullets_text = "\n".join(f"- {b}" for b in project.bullets[:20])
+    slug    = _make_slug(project.title)
+    bullets = project.bullets
+    if len(bullets) > _EXTRACT_MAX_BULLETS:
+        logger.warning(
+            "Project '%s' has %d bullets; truncating to %d for fact extraction.",
+            project.title, len(bullets), _EXTRACT_MAX_BULLETS,
+        )
+        bullets = bullets[:_EXTRACT_MAX_BULLETS]
+    bullets_text = "\n".join(f"- {b}" for b in bullets)
 
     try:
         raw = await _ollama_chat(

@@ -76,9 +76,33 @@ class TestEmbeddings:
                 
     @pytest.mark.asyncio
     async def test_embed_text_connection_error(self):
-        with patch("httpx.AsyncClient.post", new=AsyncMock(side_effect=httpx.RequestError("offline"))):
+        with patch("httpx.AsyncClient.post", new=AsyncMock(side_effect=httpx.RequestError("offline"))), \
+             patch("app.vector_store.asyncio.sleep", new=AsyncMock()):
             with pytest.raises(RuntimeError, match="unavailable"):
                 await embed_text("Hello")
+
+    @pytest.mark.asyncio
+    async def test_embed_text_retries_on_connection_error(self):
+        from app.vector_store import _EMBED_MAX_RETRIES
+        mock_post = AsyncMock(side_effect=httpx.RequestError("transient"))
+        with patch("httpx.AsyncClient.post", mock_post), \
+             patch("app.vector_store.asyncio.sleep", new=AsyncMock()):
+            with pytest.raises(RuntimeError, match="unavailable"):
+                await embed_text("Hello")
+        assert mock_post.call_count == _EMBED_MAX_RETRIES
+
+    @pytest.mark.asyncio
+    async def test_embed_text_succeeds_on_retry(self):
+        """If the first call fails but the second succeeds, the vector is returned."""
+        good_response = MagicMock()
+        good_response.json.return_value = {"embedding": [0.9, 0.8]}
+        good_response.raise_for_status.return_value = None
+        mock_post = AsyncMock(side_effect=[httpx.RequestError("blip"), good_response])
+        with patch("httpx.AsyncClient.post", mock_post), \
+             patch("app.vector_store.asyncio.sleep", new=AsyncMock()):
+            vec = await embed_text("Hello")
+        assert vec == [0.9, 0.8]
+        assert mock_post.call_count == 2
 
     @pytest.mark.asyncio
     async def test_embed_texts_batch(self):

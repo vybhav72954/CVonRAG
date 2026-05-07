@@ -75,21 +75,34 @@ def _get_embed_sem() -> asyncio.Semaphore:
     return _EMBED_SEM
 
 
+_EMBED_MAX_RETRIES = 3
+
+
 async def embed_text(text: str) -> list[float]:
-    """Single embedding via Ollama /api/embeddings."""
-    try:
-        r = await get_http().post(
-            f"{settings.ollama_base_url}/api/embeddings",
-            json={"model": settings.ollama_embed_model, "prompt": text},
-        )
-        r.raise_for_status()
-        return r.json()["embedding"]
-    except httpx.HTTPStatusError as exc:
-        logger.error("Ollama embedding HTTP %s for text %.40s…: %s", exc.response.status_code, text, exc)
-        raise RuntimeError(f"Embedding failed (HTTP {exc.response.status_code})") from exc
-    except httpx.RequestError as exc:
-        logger.error("Ollama embedding connection error: %s", exc)
-        raise RuntimeError("Embedding service unavailable — is Ollama running?") from exc
+    """Single embedding via Ollama /api/embeddings, with exponential-backoff retry on connection errors."""
+    last_exc: httpx.RequestError | None = None
+    for attempt in range(_EMBED_MAX_RETRIES):
+        try:
+            r = await get_http().post(
+                f"{settings.ollama_base_url}/api/embeddings",
+                json={"model": settings.ollama_embed_model, "prompt": text},
+            )
+            r.raise_for_status()
+            return r.json()["embedding"]
+        except httpx.HTTPStatusError as exc:
+            logger.error("Ollama embedding HTTP %s for text %.40s…: %s", exc.response.status_code, text, exc)
+            raise RuntimeError(f"Embedding failed (HTTP {exc.response.status_code})") from exc
+        except httpx.RequestError as exc:
+            last_exc = exc
+            if attempt < _EMBED_MAX_RETRIES - 1:
+                wait = 2 ** attempt  # 1 s, 2 s
+                logger.warning(
+                    "Ollama embed connection error (attempt %d/%d), retrying in %ds: %s",
+                    attempt + 1, _EMBED_MAX_RETRIES, wait, exc,
+                )
+                await asyncio.sleep(wait)
+    logger.error("Ollama embedding failed after %d attempts: %s", _EMBED_MAX_RETRIES, last_exc)
+    raise RuntimeError("Embedding service unavailable — is Ollama running?") from last_exc
 
 
 async def _embed_text_throttled(text: str) -> list[float]:
