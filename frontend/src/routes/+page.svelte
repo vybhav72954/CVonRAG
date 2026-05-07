@@ -3,7 +3,7 @@
   import { parseCV, recommendProjects, optimizeResume, checkHealth } from '$lib/api';
   import {
     step,
-    parsedProjects, parseStatus, parseProgress, parseError, resetParse,
+    parsedProjects, parseStatus, parseProgress, parseError, parseWarnings, resetParse,
     jdText, roleType, charLimit, maxBullets, topK,
     recommendations, recommendStatus, recommendError, selectedIds, resetRecommend,
     genStatus, tokenBuffer, bullets, genError, elapsed, resetGeneration,
@@ -44,7 +44,17 @@
       onProgress: ({ message }) => { parseStatus.set('streaming'); parseProgress.set(message); },
       onProject:  ({ project }) => parsedProjects.update(ps => [...ps, project]),
       onDone:     ()            => parseStatus.set('done'),
-      onError:    msg           => { parseStatus.set('error'); parseError.set(msg); },
+      // F2: distinguish a per-project error (stream continues, projects exist) from
+      // a fatal error (no projects parsed, stream broken). The first is a warning
+      // the user should see alongside their results; the second is fatal.
+      onError:    msg           => {
+        const haveAny = $parsedProjects.length > 0;
+        parseWarnings.update(w => [...w, msg]);
+        if (!haveAny) {
+          parseStatus.set('error');
+          parseError.set(msg);
+        }
+      },
     });
   }
 
@@ -330,6 +340,26 @@
         Re-upload
       </button>
     </div>
+
+    <!-- Per-project parse warnings (F2): visible alongside successful projects -->
+    {#if $parseWarnings.length > 0}
+    <div class="warning-banner">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="flex-shrink:0;margin-top:2px">
+        <path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/>
+        <line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/>
+      </svg>
+      <div style="flex:1">
+        <p style="font-weight:600;font-size:0.8125rem;color:var(--amber);margin-bottom:0.25rem">
+          {$parseWarnings.length} project{$parseWarnings.length !== 1 ? 's were' : ' was'} skipped during parsing
+        </p>
+        <ul style="margin:0;padding-left:1rem;font-size:0.75rem;color:var(--text-secondary);line-height:1.5">
+          {#each $parseWarnings as w}
+            <li>{w}</li>
+          {/each}
+        </ul>
+      </div>
+    </div>
+    {/if}
 
     {#each $parsedProjects as project (project.project_id)}
     {@const expanded = expandedProject === project.project_id}
@@ -1085,5 +1115,17 @@
     border: 1px solid var(--red-border);
     color: #fca5a5;
     font-size: 0.8125rem;
+  }
+
+  /* ── Warning banner (F2 — partial parse failures) ──────────────────── */
+  .warning-banner {
+    display: flex;
+    align-items: flex-start;
+    gap: 0.625rem;
+    padding: 0.75rem 1rem;
+    border-radius: var(--radius-sm);
+    background: var(--amber-dim);
+    border: 1px solid var(--amber-border);
+    color: var(--amber);
   }
 </style>

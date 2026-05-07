@@ -17,6 +17,12 @@ export const parsedProjects = writable([]);   // all ProjectData[] from /parse
 export const parseStatus    = writable('idle');  // idle|uploading|streaming|done|error
 export const parseProgress  = writable('');
 export const parseError     = writable('');
+// Per-project errors (F2): the backend's /parse stream emits one `error` event
+// per failed project then continues with the rest. Without a separate channel,
+// the final `done` would flip parseStatus from 'error' to 'done' and the user
+// would never see the partial-failure messages. parseWarnings is rendered
+// independently of status so the messages survive the transition.
+export const parseWarnings  = writable([]);
 
 // ── Step 2: JD + recommendation ───────────────────────────────────────────────
 export const jdText          = writable('');
@@ -50,6 +56,7 @@ export function resetParse() {
   parseStatus.set('idle');
   parseProgress.set('');
   parseError.set('');
+  parseWarnings.set([]);
 }
 
 export function resetRecommend() {

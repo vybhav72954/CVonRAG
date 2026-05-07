@@ -11,6 +11,48 @@ const REQUEST_TIMEOUT_MS = 90_000;
  *  stream itself can run as long as the backend keeps producing events. */
 const STREAM_HEADERS_TIMEOUT_MS = 120_000;
 
+// ── Per-endpoint cancellation (F1) ───────────────────────────────────────────
+// One in-flight request per endpoint family. Calling an exported function again
+// aborts the prior request so its mid-flight callbacks can't pollute new state.
+// Stale-event gating uses identity comparison: callbacks check whether their
+// own controller is still the active one before touching the page's stores.
+
+const active = { parse: null, recommend: null, optimize: null };
+
+function takeOver(key) {
+  active[key]?.abort();        // silent on the old request
+  const c = new AbortController();
+  active[key] = c;
+  return c;
+}
+
+function isCurrent(key, c) {
+  return active[key] === c;
+}
+
+function release(key, c) {
+  if (active[key] === c) active[key] = null;
+}
+
+// ── Error detail normaliser (F3) ─────────────────────────────────────────────
+// FastAPI returns `{detail: "..."}` for HTTPException but `{detail: [{loc, msg, ...}, ...]}`
+// for Pydantic ValidationError. The page renders the message as-is, so an array
+// would stringify to "[object Object],[object Object]". Flatten here.
+
+function formatErrorDetail(body, fallback) {
+  const d = body?.detail;
+  if (Array.isArray(d)) {
+    return d
+      .map(e => {
+        const loc = Array.isArray(e?.loc) ? e.loc.slice(1).join('.') : null;  // drop "body" prefix
+        const msg = e?.msg ?? JSON.stringify(e);
+        return loc ? `${loc}: ${msg}` : msg;
+      })
+      .join('; ');
+  }
+  return d ?? fallback;
+}
+
 // ── SSE frame parser ──────────────────────────────────────────────────────────
 
 function parseSSEFrames(buffer) {
@@ -68,8 +110,8 @@ export async function parseCV(file, { onProgress, onProject, onDone, onError } =
   form.append('file', file);
 
   // Timeout applies until response headers arrive. Once the SSE stream starts,
-  // the abort signal is cleared so individual events aren't cut off mid-flight.
-  const controller = new AbortController();
+  // we clear the timer so individual events aren't cut off mid-flight.
+  const controller = takeOver('parse');
   const timer = setTimeout(() => controller.abort(), STREAM_HEADERS_TIMEOUT_MS);
 
   let resp;
@@ -77,25 +119,35 @@ export async function parseCV(file, { onProgress, onProject, onDone, onError } =
     resp = await fetch(`${BASE}/parse`, { method: 'POST', body: form, signal: controller.signal });
   } catch (err) {
     clearTimeout(timer);
+    if (!isCurrent('parse', controller)) return;  // superseded → silent (F1)
     onError?.(err.name === 'AbortError'
       ? 'Parse request timed out before the backend responded.'
       : `Network error: ${err.message}`);
+    release('parse', controller);
     return;
   }
   clearTimeout(timer);
 
   if (!resp.ok) {
-    const detail = await resp.json().catch(() => ({ detail: resp.statusText }));
-    onError?.(detail.detail ?? `HTTP ${resp.status}`);
+    const body = await resp.json().catch(() => null);
+    if (isCurrent('parse', controller)) {
+      onError?.(formatErrorDetail(body, `HTTP ${resp.status} ${resp.statusText}`));
+    }
+    release('parse', controller);
     return;
   }
 
   await readSSEStream(resp, ({ type, data }) => {
+    if (!isCurrent('parse', controller)) return;  // superseded → drop event (F1)
     if (type === 'progress') onProgress?.(data.data);
     if (type === 'project')  onProject?.(data.data);
     if (type === 'done')     onDone?.(data.data);
     if (type === 'error')    onError?.(data.error_message ?? 'Unknown error');
-  }, onError);
+  }, msg => {
+    if (!isCurrent('parse', controller)) return;
+    onError?.(msg);
+  });
+  release('parse', controller);
 }
 
 // ── POST /recommend — score all projects against JD ───────────────────────────
@@ -108,7 +160,7 @@ export async function parseCV(file, { onProgress, onProject, onDone, onError } =
  * @param {{ onDone?: (data: any) => void, onError?: (msg: string) => void }} [callbacks]
  */
 export async function recommendProjects(payload, { onDone, onError } = {}) {
-  const controller = new AbortController();
+  const controller = takeOver('recommend');
   const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
 
   try {
@@ -118,20 +170,26 @@ export async function recommendProjects(payload, { onDone, onError } = {}) {
       body: JSON.stringify(payload),
       signal: controller.signal,
     });
-    clearTimeout(timer);
 
     if (!resp.ok) {
-      const detail = await resp.json().catch(() => ({ detail: resp.statusText }));
-      onError?.(detail.detail ?? `HTTP ${resp.status}`);
+      const body = await resp.json().catch(() => null);
+      clearTimeout(timer);
+      if (isCurrent('recommend', controller)) {
+        onError?.(formatErrorDetail(body, `HTTP ${resp.status} ${resp.statusText}`));
+      }
       return;
     }
-    onDone?.(await resp.json());
+    const json = await resp.json();
+    clearTimeout(timer);
+    if (isCurrent('recommend', controller)) onDone?.(json);
   } catch (err) {
     clearTimeout(timer);
-    const msg = err.name === 'AbortError'
+    if (!isCurrent('recommend', controller)) return;  // superseded → silent (F1)
+    onError?.(err.name === 'AbortError'
       ? 'JD analysis timed out: the AI took too long. Try again or shorten the JD.'
-      : err.message;
-    onError?.(msg);
+      : err.message);
+  } finally {
+    release('recommend', controller);
   }
 }
 
@@ -143,7 +201,7 @@ export async function recommendProjects(payload, { onDone, onError } = {}) {
  * @param {{ onToken?: (data: any) => void, onBullet?: (data: any) => void, onDone?: (data: any) => void, onError?: (msg: string) => void }} [callbacks]
  */
 export async function optimizeResume(payload, { onToken, onBullet, onDone, onError } = {}) {
-  const controller = new AbortController();
+  const controller = takeOver('optimize');
   const timer = setTimeout(() => controller.abort(), STREAM_HEADERS_TIMEOUT_MS);
 
   let resp;
@@ -156,25 +214,35 @@ export async function optimizeResume(payload, { onToken, onBullet, onDone, onErr
     });
   } catch (err) {
     clearTimeout(timer);
+    if (!isCurrent('optimize', controller)) return;  // superseded → silent (F1)
     onError?.(err.name === 'AbortError'
       ? 'Optimize request timed out before the backend responded.'
       : `Network error: ${err.message}`);
+    release('optimize', controller);
     return;
   }
   clearTimeout(timer);
 
   if (!resp.ok) {
-    const detail = await resp.json().catch(() => ({ detail: resp.statusText }));
-    onError?.(detail.detail ?? `HTTP ${resp.status}`);
+    const body = await resp.json().catch(() => null);
+    if (isCurrent('optimize', controller)) {
+      onError?.(formatErrorDetail(body, `HTTP ${resp.status} ${resp.statusText}`));
+    }
+    release('optimize', controller);
     return;
   }
 
   await readSSEStream(resp, ({ type, data }) => {
+    if (!isCurrent('optimize', controller)) return;  // superseded → drop event (F1)
     if (type === 'token') onToken?.(data.data);
     if (type === 'bullet') onBullet?.(data.data);
     if (type === 'done') onDone?.(data.data);
     if (type === 'error') onError?.(data.error_message ?? 'Unknown error');
-  }, onError);
+  }, msg => {
+    if (!isCurrent('optimize', controller)) return;
+    onError?.(msg);
+  });
+  release('optimize', controller);
 }
 
 /** GET /health — quick backend liveness check.
