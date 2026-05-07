@@ -288,10 +288,11 @@ Schema:
 
 _FACT_SCORING_SYSTEM = """\
 You are a resume-fit scoring engine. Score each fact's relevance to the JD on 0.0–1.0.
-Return ONLY a valid JSON array — no fences, no preamble.
+Return ONLY a valid JSON array — no fences, no preamble. Echo the input "id" verbatim
+for every fact (do not invent, reorder, or drop ids).
 
 Schema:
-[{"fact_id": "string", "relevance_score": float, "matched_jd_keywords": ["string"]}]"""
+[{"id": "string", "relevance_score": float, "matched_jd_keywords": ["string"]}]"""
 
 
 class SemanticMatcher:
@@ -318,12 +319,19 @@ class SemanticMatcher:
         jd_analysis: dict,
         projects: list[ProjectData],
     ) -> list[ScoredFact]:
+        # Use a positional id ("i0", "i1", …) for the LLM round-trip so two
+        # projects can't collide via shared fact_ids — the user's fact_id is
+        # never globally unique (e.g., the LLM can hand back "fact-1" for both).
         flat: list[tuple[str, CoreFact]] = [
             (p.project_id, f)
             for p in projects
             for f in p.core_facts
         ]
-        payload = [{"fact_id": f.fact_id, "text": f.text} for _, f in flat]
+        ids     = [f"i{idx}" for idx in range(len(flat))]
+        payload = [
+            {"id": iid, "text": f.text}
+            for iid, (_, f) in zip(ids, flat)
+        ]
         prompt  = (
             f"JD Analysis:\n{json.dumps(jd_analysis, indent=2)}\n\n"
             f"Facts:\n{json.dumps(payload, indent=2)}"
@@ -344,19 +352,19 @@ class SemanticMatcher:
                     "Fact scoring retry failed — assigning 0.5 to all. Raw: %.200s", raw
                 )
                 scores = [
-                    {"fact_id": f.fact_id, "relevance_score": 0.5, "matched_jd_keywords": []}
-                    for _, f in flat
+                    {"id": iid, "relevance_score": 0.5, "matched_jd_keywords": []}
+                    for iid in ids
                 ]
 
-        score_map = {s["fact_id"]: s for s in scores}
+        score_map = {s.get("id"): s for s in scores if isinstance(s, dict)}
         result = [
             ScoredFact(
                 fact=fact,
                 project_id=project_id,
-                relevance_score=float(score_map.get(fact.fact_id, {}).get("relevance_score", 0.5)),
-                matched_jd_keywords=score_map.get(fact.fact_id, {}).get("matched_jd_keywords", []),
+                relevance_score=float(score_map.get(iid, {}).get("relevance_score", 0.5)),
+                matched_jd_keywords=score_map.get(iid, {}).get("matched_jd_keywords", []),
             )
-            for project_id, fact in flat
+            for iid, (project_id, fact) in zip(ids, flat)
         ]
         result.sort(key=lambda x: x.relevance_score, reverse=True)
         return result

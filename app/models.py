@@ -86,18 +86,24 @@ class FormattingConstraints(BaseModel):
 
 # ── Top-level API request ─────────────────────────────────────────────────────
 
+_MAX_TOTAL_BULLETS = 50
+
+
 class OptimizationRequest(BaseModel):
     job_description: Annotated[str, Field(min_length=50, max_length=10_000)]
     projects: Annotated[list[ProjectData], Field(min_length=1, max_length=20)]
     constraints: FormattingConstraints = Field(default_factory=FormattingConstraints)
     target_role_type: RoleType = RoleType.GENERAL
-    total_bullets_requested: Annotated[int, Field(ge=1, le=50)] | None = None
+    total_bullets_requested: Annotated[int, Field(ge=1, le=_MAX_TOTAL_BULLETS)] | None = None
 
     @model_validator(mode="after")
     def cap_total_bullets(self) -> "OptimizationRequest":
         if self.total_bullets_requested is None:
-            self.total_bullets_requested = (
-                len(self.projects) * self.constraints.max_bullets_per_project
+            # Clamp to the same upper bound the Field enforces so the validator
+            # can't produce a value the field declaration would have rejected.
+            self.total_bullets_requested = min(
+                _MAX_TOTAL_BULLETS,
+                len(self.projects) * self.constraints.max_bullets_per_project,
             )
         return self
 

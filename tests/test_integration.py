@@ -37,8 +37,8 @@ JD_ANALYSIS = {
 }
 
 FACT_SCORES = [
-    {"fact_id": "f-001", "relevance_score": 0.95, "matched_jd_keywords": ["SARIMA"]},
-    {"fact_id": "f-002", "relevance_score": 0.80, "matched_jd_keywords": ["MLOps"]},
+    {"id": "i0", "relevance_score": 0.95, "matched_jd_keywords": ["SARIMA"]},
+    {"id": "i1", "relevance_score": 0.80, "matched_jd_keywords": ["MLOps"]},
 ]
 
 

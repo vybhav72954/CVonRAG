@@ -6,6 +6,7 @@ FastAPI endpoint tests via TestClient (no running services needed).
 import json
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 from app.main import app
@@ -366,6 +367,33 @@ class TestRateLimit:
         assert parse_resp.status_code == 429
         assert opt_resp.status_code == 200
 
+    @pytest.mark.anyio
+    async def test_gc_drops_expired_entries(self):
+        """N2 regression: expired (ip, key) entries get swept so the dict can't grow forever.
+
+        Direct unit test against _RateLimiter — no FastAPI test client needed.
+        """
+        from app.main import _RateLimiter, settings
+        with patch.object(settings, "rate_limit_enabled", True):
+            limiter = _RateLimiter()
+            limiter._GC_EVERY_N_CHECKS = 3  # force GC quickly
+
+            # Two distinct IPs each register one call
+            await limiter.check("1.1.1.1", "k", max_calls=10, window_seconds=60)
+            await limiter.check("2.2.2.2", "k", max_calls=10, window_seconds=60)
+            assert len(limiter._windows) == 2
+
+            # Make the timestamps look ancient (past the cutoff window)
+            for dq in limiter._windows.values():
+                dq[0] = -1e9
+
+            # Trigger GC by hitting _GC_EVERY_N_CHECKS calls
+            await limiter.check("3.3.3.3", "k", max_calls=10, window_seconds=60)
+
+            # Old IPs swept; only the live entry remains
+            assert len(limiter._windows) == 1
+            assert ("3.3.3.3", "k") in limiter._windows
+
 
 # ── Docs ──────────────────────────────────────────────────────────────────────
 
@@ -541,3 +569,47 @@ class TestFileMagic:
             files={"file": ("cv.docx", b"PK", self._DOCX_MIME)},  # valid magic, too short
         )
         assert resp.status_code == 400  # not 415
+
+
+# ── Streaming upload cap (N3) ─────────────────────────────────────────────────
+
+class TestUploadSizeCap:
+    """N3: oversized uploads are rejected without materialising the full file in RAM."""
+
+    _DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+
+    def test_oversized_body_returns_413(self, client):
+        """An 11 MB upload is rejected with 413 (cap is 10 MB)."""
+        oversized = _DOCX_MAGIC + b"x" * (11 * 1024 * 1024)
+        resp = client.post(
+            "/parse",
+            files={"file": ("big.docx", oversized, self._DOCX_MIME)},
+        )
+        assert resp.status_code == 413
+        assert "too large" in resp.json()["detail"].lower()
+
+    def test_size_check_runs_before_full_read(self):
+        """The chunked reader bails after exceeding max_bytes — it does not read past the cap."""
+        import asyncio
+        from app.main import _read_upload_capped
+
+        class _StubUpload:
+            """Mimics UploadFile.read(size) over a pre-buffered stream."""
+            def __init__(self, data: bytes) -> None:
+                self._buf = data
+                self._pos = 0
+                self.read_calls = 0
+
+            async def read(self, size: int) -> bytes:
+                self.read_calls += 1
+                chunk = self._buf[self._pos:self._pos + size]
+                self._pos += len(chunk)
+                return chunk
+
+        # 200 KB of payload, cap at 100 KB → expect 413 before second-half is read.
+        stub = _StubUpload(b"x" * (200 * 1024))
+        with pytest.raises(HTTPException) as exc_info:
+            asyncio.run(_read_upload_capped(stub, max_bytes=100 * 1024))
+        assert exc_info.value.status_code == 413
+        # Should have stopped reading well before consuming the whole buffer.
+        assert stub._pos <= 100 * 1024 + 64 * 1024  # cap + one chunk overshoot

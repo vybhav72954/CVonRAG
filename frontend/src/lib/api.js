@@ -90,10 +90,11 @@ export async function parseCV(file, { onProgress, onProject, onDone, onError } =
 /**
  * Ask the AI which projects are most relevant to this JD.
  * Times out after REQUEST_TIMEOUT_MS to prevent infinite hangs.
+ * Uses the same callback contract as parseCV / optimizeResume.
  * @param {{ projects: Array, job_description: string, top_k: number }} payload
- * @returns {Promise<{ recommendations: Array } | null>}
+ * @param {{ onDone?: (data: any) => void, onError?: (msg: string) => void }} [callbacks]
  */
-export async function recommendProjects(payload) {
+export async function recommendProjects(payload, { onDone, onError } = {}) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
 
@@ -108,15 +109,16 @@ export async function recommendProjects(payload) {
 
     if (!resp.ok) {
       const detail = await resp.json().catch(() => ({ detail: resp.statusText }));
-      throw new Error(detail.detail ?? `HTTP ${resp.status}`);
+      onError?.(detail.detail ?? `HTTP ${resp.status}`);
+      return;
     }
-    return resp.json();
+    onDone?.(await resp.json());
   } catch (err) {
     clearTimeout(timer);
-    if (err.name === 'AbortError') {
-      throw new Error('JD analysis timed out: the AI took too long. Try again or shorten the JD.');
-    }
-    throw err;
+    const msg = err.name === 'AbortError'
+      ? 'JD analysis timed out: the AI took too long. Try again or shorten the JD.'
+      : err.message;
+    onError?.(msg);
   }
 }
 

@@ -15,7 +15,7 @@ import asyncio
 import json
 import logging
 import time
-from collections import defaultdict, deque
+from collections import deque
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from math import ceil
@@ -61,11 +61,19 @@ class _RateLimiter:
 
     Safe for a single-process deployment. For multi-worker or distributed
     deployments, replace with a Redis-backed solution (e.g. slowapi + Redis).
+
+    Memory hygiene: a periodic sweep drops (ip, key) entries whose newest
+    timestamp is past the window — without it, every IP ever seen would
+    accumulate a stale deque indefinitely (N2).
     """
 
+    _GC_EVERY_N_CHECKS = 200
+
     def __init__(self) -> None:
-        self._windows: dict[tuple[str, str], deque] = defaultdict(deque)
+        # Plain dict (not defaultdict) so the GC sweep can `del` entries safely.
+        self._windows: dict[tuple[str, str], deque] = {}
         self._lock = asyncio.Lock()
+        self._checks_since_gc = 0
 
     async def check(
         self, ip: str, key: str, max_calls: int, window_seconds: int
@@ -76,14 +84,25 @@ class _RateLimiter:
         now    = time.monotonic()
         cutoff = now - window_seconds
         async with self._lock:
-            dq = self._windows[(ip, key)]
+            self._checks_since_gc += 1
+            if self._checks_since_gc >= self._GC_EVERY_N_CHECKS:
+                self._gc(cutoff)
+                self._checks_since_gc = 0
+
+            dq = self._windows.setdefault((ip, key), deque())
             while dq and dq[0] < cutoff:
                 dq.popleft()
             if len(dq) >= max_calls:
-                oldest = dq[0] if dq else now
-                return max(window_seconds - (now - oldest), 0.1)
+                # dq is non-empty here (len >= max_calls >= 1).
+                return max(window_seconds - (now - dq[0]), 0.1)
             dq.append(now)
             return None
+
+    def _gc(self, cutoff: float) -> None:
+        """Drop entries whose newest timestamp is older than the window cutoff."""
+        stale = [k for k, dq in self._windows.items() if not dq or dq[-1] < cutoff]
+        for k in stale:
+            del self._windows[k]
 
 
 _limiter = _RateLimiter()
@@ -156,6 +175,9 @@ _SSE_HEADERS = {
 _MAGIC_DOCX = b"PK\x03\x04"
 _MAGIC_PDF  = b"%PDF"
 
+_MAX_UPLOAD_BYTES = 10 * 1024 * 1024     # 10 MB hard limit
+_UPLOAD_CHUNK     = 64 * 1024            # 64 KB read chunk
+
 
 def _validate_file_magic(file_bytes: bytes, fname: str) -> bool:
     """Return True when the file's leading bytes match the declared extension."""
@@ -164,6 +186,29 @@ def _validate_file_magic(file_bytes: bytes, fname: str) -> bool:
     if fname.endswith(".pdf"):
         return file_bytes[:4] == _MAGIC_PDF
     return False
+
+
+async def _read_upload_capped(file: UploadFile, max_bytes: int) -> bytes:
+    """Read an UploadFile in chunks, raising 413 once max_bytes is exceeded.
+
+    The previous implementation called `file.read()` with no size argument and
+    only checked the length afterwards, so a 1 GB upload would materialise in
+    full before being rejected (N3).
+    """
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        chunk = await file.read(_UPLOAD_CHUNK)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > max_bytes:
+            raise HTTPException(
+                status_code=413,
+                detail=f"File too large (max {max_bytes // (1024 * 1024)} MB).",
+            )
+        chunks.append(chunk)
+    return b"".join(chunks)
 
 
 # ── SSE helpers ───────────────────────────────────────────────────────────────
@@ -292,9 +337,15 @@ async def parse_cv(request: Request, file: UploadFile = File(...)):
             detail="Unsupported file type. Upload a .docx or .pdf file.",
         )
 
-    file_bytes = await file.read()
-    if len(file_bytes) > 10 * 1024 * 1024:   # 10 MB hard limit
-        raise HTTPException(status_code=413, detail="File too large (max 10 MB).")
+    # Cheap pre-check: reject before reading the body when Content-Length is sent.
+    declared = request.headers.get("content-length")
+    if declared and declared.isdigit() and int(declared) > _MAX_UPLOAD_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"File too large (max {_MAX_UPLOAD_BYTES // (1024 * 1024)} MB).",
+        )
+
+    file_bytes = await _read_upload_capped(file, _MAX_UPLOAD_BYTES)
 
     if len(file_bytes) < 100:
         raise HTTPException(status_code=400, detail="File appears to be empty or corrupt.")

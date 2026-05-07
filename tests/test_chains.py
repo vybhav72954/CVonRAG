@@ -340,7 +340,7 @@ class TestScoreFactsRetry:
     @pytest.mark.anyio
     async def test_succeeds_on_first_try_no_retry(self):
         """When the LLM returns valid JSON immediately, _ollama_chat is called once."""
-        good_json = '[{"fact_id": "f-001", "relevance_score": 0.9, "matched_jd_keywords": ["SARIMA"]}]'
+        good_json = '[{"id": "i0", "relevance_score": 0.9, "matched_jd_keywords": ["SARIMA"]}]'
         with patch("app.chains._ollama_chat", new=AsyncMock(return_value=good_json)) as mock_chat:
             matcher = SemanticMatcher()
             result = await matcher.score_facts({}, [self._make_project()])
@@ -353,7 +353,7 @@ class TestScoreFactsRetry:
     async def test_retries_with_json_mode_on_first_parse_failure(self):
         """On first parse failure, score_facts retries once with json_mode=True."""
         bad_raw  = "Here are the scores: blah blah (malformed)"
-        good_json = '[{"fact_id": "f-001", "relevance_score": 0.7, "matched_jd_keywords": []}]'
+        good_json = '[{"id": "i0", "relevance_score": 0.7, "matched_jd_keywords": []}]'
         with patch("app.chains._ollama_chat", new=AsyncMock(side_effect=[bad_raw, good_json])) as mock_chat:
             matcher = SemanticMatcher()
             result = await matcher.score_facts({}, [self._make_project()])
@@ -378,13 +378,46 @@ class TestScoreFactsRetry:
     @pytest.mark.anyio
     async def test_first_call_does_not_use_json_mode(self):
         """The initial call is made without json_mode so we don't waste quota on overhead."""
-        good_json = '[{"fact_id": "f-001", "relevance_score": 0.8, "matched_jd_keywords": []}]'
+        good_json = '[{"id": "i0", "relevance_score": 0.8, "matched_jd_keywords": []}]'
         with patch("app.chains._ollama_chat", new=AsyncMock(return_value=good_json)) as mock_chat:
             matcher = SemanticMatcher()
             await matcher.score_facts({}, [self._make_project()])
 
         first_kwargs = mock_chat.call_args_list[0][1]
         assert not first_kwargs.get("json_mode", False)
+
+    @pytest.mark.anyio
+    async def test_no_collision_when_two_projects_share_fact_ids(self):
+        """N1 regression: two projects with identical fact_ids must get distinct scores.
+
+        Prior to the index-based score_map, score_map[fact_id] was the LAST entry
+        in the LLM response sharing that fact_id, so the second project clobbered
+        the first. Now scoring uses positional ids (i0, i1, ...).
+        """
+        from app.models import ProjectData
+        proj_a = ProjectData(
+            project_id="p-A",
+            title="Forecasting",
+            core_facts=[CoreFact(fact_id="f-1", text="Built SARIMA model")],
+        )
+        proj_b = ProjectData(
+            project_id="p-B",
+            title="Pricing",
+            core_facts=[CoreFact(fact_id="f-1", text="Optimised prices via SLSQP")],
+        )
+        # LLM scores i0 high (the first fact), i1 low (the second fact).
+        good_json = (
+            '[{"id": "i0", "relevance_score": 0.95, "matched_jd_keywords": ["SARIMA"]},'
+            ' {"id": "i1", "relevance_score": 0.10, "matched_jd_keywords": []}]'
+        )
+        with patch("app.chains._ollama_chat", new=AsyncMock(return_value=good_json)):
+            result = await SemanticMatcher().score_facts({}, [proj_a, proj_b])
+
+        by_pid = {sf.project_id: sf for sf in result}
+        assert by_pid["p-A"].relevance_score == 0.95
+        assert by_pid["p-B"].relevance_score == 0.10
+        assert by_pid["p-A"].matched_jd_keywords == ["SARIMA"]
+        assert by_pid["p-B"].matched_jd_keywords == []
 
 
 # ── H2: Groq 429 retry logic ─────────────────────────────────────────────────
