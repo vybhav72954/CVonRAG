@@ -80,7 +80,6 @@ _EMBED_MAX_RETRIES = 3
 
 async def embed_text(text: str) -> list[float]:
     """Single embedding via Ollama /api/embeddings, with exponential-backoff retry on connection errors."""
-    last_exc: httpx.RequestError | None = None
     for attempt in range(_EMBED_MAX_RETRIES):
         try:
             r = await get_http().post(
@@ -93,16 +92,27 @@ async def embed_text(text: str) -> list[float]:
             logger.error("Ollama embedding HTTP %s for text %.40s…: %s", exc.response.status_code, text, exc)
             raise RuntimeError(f"Embedding failed (HTTP {exc.response.status_code})") from exc
         except httpx.RequestError as exc:
-            last_exc = exc
-            if attempt < _EMBED_MAX_RETRIES - 1:
-                wait = 2 ** attempt  # 1 s, 2 s
-                logger.warning(
-                    "Ollama embed connection error (attempt %d/%d), retrying in %ds: %s",
-                    attempt + 1, _EMBED_MAX_RETRIES, wait, exc,
+            # Raise inline on the final attempt (P4) — the previous design held
+            # `last_exc` across iterations and raised after the loop, which read
+            # `from None` if the loop body ever failed to execute (e.g. someone
+            # set _EMBED_MAX_RETRIES=0). This way the cause is always real.
+            if attempt == _EMBED_MAX_RETRIES - 1:
+                logger.error(
+                    "Ollama embedding failed after %d attempts: %s",
+                    _EMBED_MAX_RETRIES, exc,
                 )
-                await asyncio.sleep(wait)
-    logger.error("Ollama embedding failed after %d attempts: %s", _EMBED_MAX_RETRIES, last_exc)
-    raise RuntimeError("Embedding service unavailable — is Ollama running?") from last_exc
+                raise RuntimeError("Embedding service unavailable — is Ollama running?") from exc
+            wait = 2 ** attempt  # 1 s, 2 s
+            logger.warning(
+                "Ollama embed connection error (attempt %d/%d), retrying in %ds: %s",
+                attempt + 1, _EMBED_MAX_RETRIES, wait, exc,
+            )
+            await asyncio.sleep(wait)
+    # Unreachable when _EMBED_MAX_RETRIES >= 1; a misconfig safety net so a 0
+    # iteration doesn't return None implicitly and surface as TypeError later.
+    raise RuntimeError(
+        f"_EMBED_MAX_RETRIES must be >= 1 (got {_EMBED_MAX_RETRIES})."
+    )
 
 
 async def _embed_text_throttled(text: str) -> list[float]:

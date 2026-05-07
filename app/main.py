@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import secrets
 import time
 from collections import deque
 from collections.abc import AsyncGenerator
@@ -487,7 +488,11 @@ async def ingest(
     `X-Ingest-Secret: <secret>` in the request header.
     """
     if settings.ingest_secret:
-        if x_ingest_secret != settings.ingest_secret:
+        # Constant-time comparison (P3) — `!=` short-circuits on first byte
+        # mismatch, leaking secret prefix length via timing. compare_digest is
+        # bounded by max(len(a), len(b)). Coerce missing header to "" so the
+        # function never sees None.
+        if not secrets.compare_digest(x_ingest_secret or "", settings.ingest_secret):
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Invalid or missing X-Ingest-Secret header.",

@@ -740,16 +740,28 @@ def _pick_supporting_facts(
     exclude_idx: int,
     max_supporting: int = 2,
 ) -> list[ScoredFact]:
-    """Return facts sharing JD keywords with the primary; fall back to next highest-scored when primary has none."""
+    """Return supporting facts ordered by relevance.
+
+    Prefers facts sharing JD keywords with the primary; falls back to the next
+    highest-scored facts when the primary has no matched keywords.
+
+    Sorts defensively (P5): the previous implementation relied on `all_facts`
+    being pre-sorted by relevance descending. That invariant was held by
+    `score_facts` + the orchestrator's setdefault-append, but a refactor that
+    reorders facts upstream would have silently degraded supporting-fact picks.
+    """
+    candidates = sorted(
+        (sf for j, sf in enumerate(all_facts) if j != exclude_idx),
+        key=lambda sf: sf.relevance_score,
+        reverse=True,
+    )
     primary_kw = set(primary.matched_jd_keywords)
     if primary_kw:
         return [
-            sf for j, sf in enumerate(all_facts)
-            if j != exclude_idx and set(sf.matched_jd_keywords) & primary_kw
+            sf for sf in candidates
+            if set(sf.matched_jd_keywords) & primary_kw
         ][:max_supporting]
-    # Primary has no keywords (LLM returned empty list) — return the next highest-scored facts.
-    # all_facts is already sorted by relevance_score descending by score_facts().
-    return [sf for j, sf in enumerate(all_facts) if j != exclude_idx][:max_supporting]
+    return candidates[:max_supporting]
 
 
 def _strip_json_fences(text: str) -> str:
