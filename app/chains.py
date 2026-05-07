@@ -301,18 +301,20 @@ class SemanticMatcher:
     async def analyze_jd(self, jd: str) -> dict:
         msgs = [{"role": "user", "content": f"Job Description:\n\n{jd}"}]
         raw  = await _ollama_chat(system=_JD_ANALYSIS_SYSTEM, messages=msgs, temperature=0.05)
-        try:
-            return json.loads(_strip_json_fences(raw))
-        except json.JSONDecodeError:
-            logger.warning("JD analysis JSON parse failed — retrying with json_mode. Raw: %.200s", raw)
-            raw = await _ollama_chat(
-                system=_JD_ANALYSIS_SYSTEM, messages=msgs, temperature=0.05, json_mode=True,
-            )
-            try:
-                return json.loads(_strip_json_fences(raw))
-            except json.JSONDecodeError:
-                logger.warning("JD analysis retry failed — returning empty analysis. Raw: %.200s", raw)
-                return {}
+        # Guard against valid-JSON-wrong-shape (P1): "null", arrays, scalars all
+        # parse without error but downstream `.get(...)` calls would AttributeError.
+        parsed = _safe_parse_json(raw)
+        if isinstance(parsed, dict):
+            return parsed
+        logger.warning("JD analysis returned non-dict — retrying with json_mode. Raw: %.200s", raw)
+        raw = await _ollama_chat(
+            system=_JD_ANALYSIS_SYSTEM, messages=msgs, temperature=0.05, json_mode=True,
+        )
+        parsed = _safe_parse_json(raw)
+        if isinstance(parsed, dict):
+            return parsed
+        logger.warning("JD analysis retry failed — returning empty analysis. Raw: %.200s", raw)
+        return {}
 
     async def score_facts(
         self,
@@ -338,23 +340,26 @@ class SemanticMatcher:
         )
         msgs = [{"role": "user", "content": prompt}]
         raw  = await _ollama_chat(system=_FACT_SCORING_SYSTEM, messages=msgs, temperature=0.05)
-        try:
-            scores: list[dict] = json.loads(_strip_json_fences(raw))
-        except json.JSONDecodeError:
-            logger.warning("Fact scoring JSON parse failed — retrying with json_mode. Raw: %.200s", raw)
+        # Guard against valid-JSON-wrong-shape (P2): "null" parses fine but then
+        # `for s in scores` raises TypeError; a dict-of-keys would silently pass
+        # the `isinstance(s, dict)` filter as False and yield empty score_map.
+        parsed = _safe_parse_json(raw)
+        scores: list[dict] | None = parsed if isinstance(parsed, list) else None
+        if scores is None:
+            logger.warning("Fact scoring returned non-list — retrying with json_mode. Raw: %.200s", raw)
             raw = await _ollama_chat(
                 system=_FACT_SCORING_SYSTEM, messages=msgs, temperature=0.05, json_mode=True,
             )
-            try:
-                scores = json.loads(_strip_json_fences(raw))
-            except json.JSONDecodeError:
-                logger.warning(
-                    "Fact scoring retry failed — assigning 0.5 to all. Raw: %.200s", raw
-                )
-                scores = [
-                    {"id": iid, "relevance_score": 0.5, "matched_jd_keywords": []}
-                    for iid in ids
-                ]
+            parsed = _safe_parse_json(raw)
+            scores = parsed if isinstance(parsed, list) else None
+        if scores is None:
+            logger.warning(
+                "Fact scoring retry failed — assigning 0.5 to all. Raw: %.200s", raw
+            )
+            scores = [
+                {"id": iid, "relevance_score": 0.5, "matched_jd_keywords": []}
+                for iid in ids
+            ]
 
         score_map = {s.get("id"): s for s in scores if isinstance(s, dict)}
         result = [
@@ -755,3 +760,16 @@ def _strip_json_fences(text: str) -> str:
     text = re.sub(r"^```(?:json)?\s*", "", text.strip())
     text = re.sub(r"\s*```$", "", text)
     return text.strip()
+
+
+def _safe_parse_json(text: str):
+    """Parse fenced LLM JSON, returning None on JSONDecodeError.
+
+    Caller decides what shape it expects (dict vs list) via isinstance — guards
+    against valid-JSON-wrong-shape outputs like "null", scalars, or arrays where
+    a dict was expected (P1, P2).
+    """
+    try:
+        return json.loads(_strip_json_fences(text))
+    except json.JSONDecodeError:
+        return None
