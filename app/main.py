@@ -501,10 +501,12 @@ async def ingest(
             message=f"Upserted {count} bullets into '{settings.qdrant_collection}'.",
         )
     except Exception as exc:
+        # Log full detail server-side; return a generic message so we don't
+        # leak internals (stack-trace fragments, infra hostnames, etc.) to clients.
         logger.exception("Ingestion failed: %s", exc)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Ingestion error: {exc}",
+            detail="Ingestion failed — see server logs for details.",
         )
 
 

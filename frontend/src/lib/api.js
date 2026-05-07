@@ -7,6 +7,9 @@ const BASE = import.meta.env.VITE_API_URL ?? 'http://localhost:8000';
 
 /** Default timeout for non-streaming requests (ms). */
 const REQUEST_TIMEOUT_MS = 90_000;
+/** Headers-arrival timeout for streaming requests (ms). After headers, the
+ *  stream itself can run as long as the backend keeps producing events. */
+const STREAM_HEADERS_TIMEOUT_MS = 120_000;
 
 // ── SSE frame parser ──────────────────────────────────────────────────────────
 
@@ -64,13 +67,23 @@ export async function parseCV(file, { onProgress, onProject, onDone, onError } =
   const form = new FormData();
   form.append('file', file);
 
+  // Timeout applies until response headers arrive. Once the SSE stream starts,
+  // the abort signal is cleared so individual events aren't cut off mid-flight.
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), STREAM_HEADERS_TIMEOUT_MS);
+
   let resp;
   try {
-    resp = await fetch(`${BASE}/parse`, { method: 'POST', body: form });
+    resp = await fetch(`${BASE}/parse`, { method: 'POST', body: form, signal: controller.signal });
   } catch (err) {
-    onError?.(`Network error: ${err.message}`);
+    clearTimeout(timer);
+    onError?.(err.name === 'AbortError'
+      ? 'Parse request timed out before the backend responded.'
+      : `Network error: ${err.message}`);
     return;
   }
+  clearTimeout(timer);
+
   if (!resp.ok) {
     const detail = await resp.json().catch(() => ({ detail: resp.statusText }));
     onError?.(detail.detail ?? `HTTP ${resp.status}`);
@@ -130,6 +143,8 @@ export async function recommendProjects(payload, { onDone, onError } = {}) {
  * @param {{ onToken?: (data: any) => void, onBullet?: (data: any) => void, onDone?: (data: any) => void, onError?: (msg: string) => void }} [callbacks]
  */
 export async function optimizeResume(payload, { onToken, onBullet, onDone, onError } = {}) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), STREAM_HEADERS_TIMEOUT_MS);
 
   let resp;
   try {
@@ -137,11 +152,17 @@ export async function optimizeResume(payload, { onToken, onBullet, onDone, onErr
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
+      signal: controller.signal,
     });
   } catch (err) {
-    onError?.(`Network error: ${err.message}`);
+    clearTimeout(timer);
+    onError?.(err.name === 'AbortError'
+      ? 'Optimize request timed out before the backend responded.'
+      : `Network error: ${err.message}`);
     return;
   }
+  clearTimeout(timer);
+
   if (!resp.ok) {
     const detail = await resp.json().catch(() => ({ detail: resp.statusText }));
     onError?.(detail.detail ?? `HTTP ${resp.status}`);

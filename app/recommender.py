@@ -126,13 +126,23 @@ async def recommend_projects(
             f"Job Description (excerpt):\n{jd_snippet}\n\n"
             f"Top projects:\n{json.dumps(top_summary, indent=2)}"
         )
+        # Mirror the H5 pattern from chains.py: try plain first, retry with
+        # json_mode=True on JSONDecodeError, fall through to the skill-list
+        # fallback if both fail. Keeps recommender consistent with score_facts/
+        # analyze_jd so reasoning models don't degrade the UX silently (N19).
+        msgs = [{"role": "user", "content": prompt}]
         try:
-            raw = await _ollama_chat(
-                system=_REASON_SYSTEM,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.2,
-            )
-            reasons = json.loads(_strip_json_fences(raw))
+            raw = await _ollama_chat(system=_REASON_SYSTEM, messages=msgs, temperature=0.2)
+            try:
+                reasons = json.loads(_strip_json_fences(raw))
+            except json.JSONDecodeError:
+                logger.warning(
+                    "Reason JSON parse failed — retrying with json_mode. Raw: %.200s", raw,
+                )
+                raw = await _ollama_chat(
+                    system=_REASON_SYSTEM, messages=msgs, temperature=0.2, json_mode=True,
+                )
+                reasons = json.loads(_strip_json_fences(raw))
             if not isinstance(reasons, dict):
                 reasons = {}
         except Exception as exc:

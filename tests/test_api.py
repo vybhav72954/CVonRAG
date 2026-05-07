@@ -113,11 +113,15 @@ class TestIngest:
         assert client.post("/ingest", json={"bullets": [{"text": "Hi"}]}).status_code == 422
 
     def test_qdrant_error_returns_500(self, client):
+        """N17: 500 returns a generic detail (no exception leak); details live in server logs."""
         with patch("app.main.ingest_gold_standard_bullets",
-                   new=AsyncMock(side_effect=Exception("Qdrant down"))):
+                   new=AsyncMock(side_effect=Exception("Qdrant down — secret-host:6333"))):
             resp = client.post("/ingest", json=INGEST_BODY)
         assert resp.status_code == 500
-        assert "Qdrant down" in resp.json()["detail"]
+        detail = resp.json()["detail"]
+        assert "secret-host" not in detail        # internal info not leaked
+        assert "Qdrant down" not in detail        # raw exception not leaked
+        assert "server logs" in detail.lower()    # tells the operator where to look
 
     def test_invalid_role_type_rejected_at_ingest(self, client):
         """N6: a typo in role_type fails fast with 422 — never poisons Qdrant."""
@@ -552,7 +556,7 @@ class TestFileMagic:
 
     def test_valid_docx_magic_passes_check(self, client):
         """A .docx file with correct PK magic proceeds past validation."""
-        async def _mock_stream(fb, fn, hc):
+        async def _mock_stream(fb, fn):
             yield ("done", {"total_projects": 0, "total_facts": 0})
 
         with patch("app.main.parse_and_stream", side_effect=_mock_stream):
@@ -564,7 +568,7 @@ class TestFileMagic:
 
     def test_valid_pdf_magic_passes_check(self, client):
         """A .pdf file with correct %PDF magic proceeds past validation."""
-        async def _mock_stream(fb, fn, hc):
+        async def _mock_stream(fb, fn):
             yield ("done", {"total_projects": 0, "total_facts": 0})
 
         with patch("app.main.parse_and_stream", side_effect=_mock_stream):

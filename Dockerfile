@@ -39,6 +39,12 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=20s --retries=3 \
 
 EXPOSE 8000
 
+# Trust X-Forwarded-For from any upstream so the H1 rate limiter sees real
+# client IPs instead of the proxy's. SAFETY: this is correct ONLY when the
+# container sits behind a real reverse proxy (Render, Railway, Fly, Vercel
+# edge, Nginx, …). If you expose this image directly to the public internet,
+# attackers can spoof X-Forwarded-For to bypass the per-IP rate limit (N18).
+# Pin --forwarded-allow-ips to the proxy's CIDR in that case.
 CMD ["uvicorn", "app.main:app", \
      "--host", "0.0.0.0", \
      "--port", "8000", \
