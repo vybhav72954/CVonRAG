@@ -337,13 +337,11 @@ def _make_slug(title: str) -> str:
     return f"{prefix}-{suffix}"
 
 
-async def extract_facts(project: RawProject, http_client=None) -> list[CoreFact]:
+async def extract_facts(project: RawProject) -> list[CoreFact]:
     """
     Extract structured CoreFacts from a project's raw bullets via LLM.
     Uses the shared _ollama_chat() from chains.py (routes to Groq or Ollama).
     On any failure, falls back to one fact per bullet (up to 4).
-
-    Note: http_client param is kept for backward compatibility but no longer used.
     """
     from app.chains import _ollama_chat  # deferred import to avoid circular dep
 
@@ -410,7 +408,6 @@ async def extract_facts(project: RawProject, http_client=None) -> list[CoreFact]
 async def parse_and_stream(
     file_bytes: bytes,
     filename:   str,
-    http_client=None,        # DEPRECATED — kept for backward compat, unused
 ) -> AsyncGenerator[tuple[str, dict], None]:
     """
     Full parse pipeline as an async generator.
@@ -452,7 +449,7 @@ async def parse_and_stream(
             "total":   total,
         })
 
-        facts = await extract_facts(raw_proj, http_client)
+        facts = await extract_facts(raw_proj)
 
         # Guard: every project must have at least one fact
         if not facts:

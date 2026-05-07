@@ -26,7 +26,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-from app.chains import CVonRAGOrchestrator, close_http, get_http
+from app.chains import CVonRAGOrchestrator, close_http
 from app.config import get_settings
 from app.models import (
     GeneratedBullet,
@@ -229,8 +229,8 @@ async def _sse_stream(request: OptimizationRequest) -> AsyncGenerator[str, None]
 
             elif event_type == "bullet":
                 bullet: GeneratedBullet = payload  # type: ignore[assignment]
-                yield _sse(StreamChunk(event_type=StreamEventType.BULLET,   data=bullet.model_dump()))
-                yield _sse(StreamChunk(event_type=StreamEventType.METADATA, data=bullet.metadata.model_dump()))
+                # The bullet payload already contains .metadata; no separate event needed.
+                yield _sse(StreamChunk(event_type=StreamEventType.BULLET, data=bullet.model_dump()))
 
             elif event_type == "done":
                 yield _sse(StreamChunk(
@@ -360,8 +360,6 @@ async def parse_cv(request: Request, file: UploadFile = File(...)):
             ),
         )
 
-    http_client = get_http()
-
     async def _stream():
         _PARSE_EVENT_MAP = {
             "progress": StreamEventType.PROGRESS,
@@ -369,7 +367,7 @@ async def parse_cv(request: Request, file: UploadFile = File(...)):
             "done":     StreamEventType.DONE,
             "error":    StreamEventType.ERROR,
         }
-        async for event_type, data in parse_and_stream(file_bytes, file.filename, http_client):
+        async for event_type, data in parse_and_stream(file_bytes, file.filename):
             sse_event = _PARSE_EVENT_MAP.get(event_type, event_type)
             if event_type == "error":
                 yield _sse(StreamChunk(
@@ -428,8 +426,7 @@ async def optimize(request: Request, body: OptimizationRequest):
     | Event type | Payload | Description |
     |---|---|---|
     | `token`    | `{data: string}` | Raw LLM token (typewriter) |
-    | `bullet`   | `{data: GeneratedBullet}` | Final validated bullet |
-    | `metadata` | `{data: BulletMetadata}` | Char count, iterations, sources |
+    | `bullet`   | `{data: GeneratedBullet}` | Final validated bullet (includes `.metadata`) |
     | `error`    | `{error_message: string}` | Pipeline error |
     | `done`     | `{data: {elapsed_seconds}}` | Stream complete |
     """

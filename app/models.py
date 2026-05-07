@@ -34,10 +34,9 @@ class JDTone(StrEnum):
 
 
 class StreamEventType(StrEnum):
-    # /optimize events
+    # /optimize events (bullet event includes its metadata under .metadata)
     TOKEN    = "token"
     BULLET   = "bullet"
-    METADATA = "metadata"
     # /parse events
     PROGRESS = "progress"
     PROJECT  = "project"
@@ -185,7 +184,6 @@ class RecommendRequest(BaseModel):
 
 class RecommendResponse(BaseModel):
     recommendations: list[ProjectRecommendation]
-    jd_summary:      str = ""   # brief LLM-generated JD summary for UI display
 
 
 # ── Health ────────────────────────────────────────────────────────────────────

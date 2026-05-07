@@ -626,8 +626,9 @@ class CVonRAGOrchestrator:
             top_k=settings.retrieval_top_k,
         )
 
+        # OptimizationRequest.cap_total_bullets() guarantees a non-None int here.
         bullet_index      = 0
-        bullets_remaining = request.total_bullets_requested or 999
+        bullets_remaining = request.total_bullets_requested
 
         for project in request.projects:
             if bullets_remaining <= 0:

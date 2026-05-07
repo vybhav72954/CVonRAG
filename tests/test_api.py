@@ -316,7 +316,7 @@ class TestRateLimit:
         assert int(resp.headers["Retry-After"]) > 0
 
     def test_parse_429_after_limit_exceeded(self, client):
-        async def _mock_stream(file_bytes, filename, http_client):
+        async def _mock_stream(file_bytes, filename):
             yield ("done", {"total_projects": 0, "total_facts": 0})
 
         from app.main import settings, _limiter
@@ -356,7 +356,7 @@ class TestRateLimit:
 
     def test_different_keys_tracked_independently(self, client):
         """Rate limit state for /parse and /optimize are independent buckets."""
-        async def _mock_stream(file_bytes, filename, http_client):
+        async def _mock_stream(file_bytes, filename):
             yield ("done", {"total_projects": 0, "total_facts": 0})
 
         async def fake_run(_r):
@@ -456,7 +456,7 @@ class TestParse:
         from unittest.mock import AsyncMock, patch, MagicMock
         import json as _json
 
-        async def _mock_stream(file_bytes, filename, http_client):
+        async def _mock_stream(file_bytes, filename):
             yield ("progress", {"message": "Found 1 project.", "current": 0, "total": 1})
             yield ("project",  {
                 "project": {
@@ -491,7 +491,7 @@ class TestParse:
     def test_valid_pdf_streams_sse(self, client):
         from unittest.mock import patch
 
-        async def _mock_stream(file_bytes, filename, http_client):
+        async def _mock_stream(file_bytes, filename):
             yield ("done", {"total_projects": 0, "total_facts": 0})
 
         with patch("app.main.parse_and_stream", side_effect=_mock_stream):
@@ -505,7 +505,7 @@ class TestParse:
     def test_parse_error_yields_error_event(self, client):
         from unittest.mock import patch
 
-        async def _mock_stream(file_bytes, filename, http_client):
+        async def _mock_stream(file_bytes, filename):
             yield ("error", {"error_message": "corrupt file"})
 
         with patch("app.main.parse_and_stream", side_effect=_mock_stream):

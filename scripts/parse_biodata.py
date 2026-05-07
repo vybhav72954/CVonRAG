@@ -291,12 +291,10 @@ def stream_optimize(request_payload: dict, api_url: str) -> None:
                 elif event_type == "bullet":
                     bullet_data = parsed.get("data", {})
                     text = bullet_data.get("text", "")
+                    meta = bullet_data.get("metadata", {})
                     print()   # newline after token stream
                     log(f"\n[bold cyan]━━ FINAL BULLET ━━[/bold cyan]")
                     log(f"[white]{text}[/white]")
-
-                elif event_type == "metadata":
-                    meta = parsed.get("data", {})
                     log(
                         f"[dim]  {meta.get('char_count')} chars | "
                         f"{meta.get('iterations_taken')} iter | "

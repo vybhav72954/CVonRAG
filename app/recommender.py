@@ -141,7 +141,6 @@ async def recommend_projects(
 
     # ── Phase 4: assemble recommendations ────────────────────────────────────
     recommendations: list[ProjectRecommendation] = []
-    score_dict = {pid: (score, skills) for pid, score, skills in project_scores}
 
     for rank, (pid, score, skills) in enumerate(project_scores, start=1):
         project   = project_map[pid]
