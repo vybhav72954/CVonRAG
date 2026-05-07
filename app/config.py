@@ -6,7 +6,9 @@ Zero paid API keys required.
 """
 
 from __future__ import annotations
+import logging
 from functools import lru_cache
+from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -33,11 +35,11 @@ class Settings(BaseSettings):
     ollama_base_url: str = "http://localhost:11434"
 
     # LLM — only used when Groq is not configured:
-    #   qwen2.5:3b   ~2 GB RAM  (fast, okay quality — CI/testing)
+    #   qwen2.5:3b   ~2 GB RAM  (fast, fits 4 GB GPU — default)
     #   qwen2.5:7b   ~5 GB RAM  (good quality — development)
-    #   qwen2.5:14b  ~10 GB RAM (great quality — recommended production)
+    #   qwen2.5:14b  ~10 GB RAM (recommended for quality — see DEVELOPER.md)
     #   qwen2.5:32b  ~20 GB RAM (best quality — strong GPU only)
-    ollama_llm_model: str = "qwen2.5:14b"
+    ollama_llm_model: str = "qwen2.5:3b"
 
     # Embedding model — always via Ollama (nomic-embed-text, 768-dim)
     ollama_embed_model: str = "nomic-embed-text"
@@ -95,6 +97,18 @@ class Settings(BaseSettings):
     # Set INGEST_SECRET in .env to protect the /ingest endpoint.
     # Leave blank to allow unauthenticated access (dev only).
     ingest_secret: str = ""
+
+    @model_validator(mode="after")
+    def _warn_production_cors(self) -> "Settings":
+        if (
+            self.app_env == "production"
+            and self.cors_origins == ["http://localhost:5173"]
+        ):
+            logging.getLogger("cvonrag").warning(
+                "CORS_ORIGINS is still the dev default in production — "
+                "set CORS_ORIGINS=[\"https://your-frontend.com\"] in .env before deploying."
+            )
+        return self
 
 
 @lru_cache()

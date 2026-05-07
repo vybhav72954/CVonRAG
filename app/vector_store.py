@@ -75,21 +75,44 @@ def _get_embed_sem() -> asyncio.Semaphore:
     return _EMBED_SEM
 
 
+_EMBED_MAX_RETRIES = 3
+
+
 async def embed_text(text: str) -> list[float]:
-    """Single embedding via Ollama /api/embeddings."""
-    try:
-        r = await get_http().post(
-            f"{settings.ollama_base_url}/api/embeddings",
-            json={"model": settings.ollama_embed_model, "prompt": text},
-        )
-        r.raise_for_status()
-        return r.json()["embedding"]
-    except httpx.HTTPStatusError as exc:
-        logger.error("Ollama embedding HTTP %s for text %.40s…: %s", exc.response.status_code, text, exc)
-        raise RuntimeError(f"Embedding failed (HTTP {exc.response.status_code})") from exc
-    except httpx.RequestError as exc:
-        logger.error("Ollama embedding connection error: %s", exc)
-        raise RuntimeError("Embedding service unavailable — is Ollama running?") from exc
+    """Single embedding via Ollama /api/embeddings, with exponential-backoff retry on connection errors."""
+    for attempt in range(_EMBED_MAX_RETRIES):
+        try:
+            r = await get_http().post(
+                f"{settings.ollama_base_url}/api/embeddings",
+                json={"model": settings.ollama_embed_model, "prompt": text},
+            )
+            r.raise_for_status()
+            return r.json()["embedding"]
+        except httpx.HTTPStatusError as exc:
+            logger.error("Ollama embedding HTTP %s for text %.40s…: %s", exc.response.status_code, text, exc)
+            raise RuntimeError(f"Embedding failed (HTTP {exc.response.status_code})") from exc
+        except httpx.RequestError as exc:
+            # Raise inline on the final attempt (P4) — the previous design held
+            # `last_exc` across iterations and raised after the loop, which read
+            # `from None` if the loop body ever failed to execute (e.g. someone
+            # set _EMBED_MAX_RETRIES=0). This way the cause is always real.
+            if attempt == _EMBED_MAX_RETRIES - 1:
+                logger.error(
+                    "Ollama embedding failed after %d attempts: %s",
+                    _EMBED_MAX_RETRIES, exc,
+                )
+                raise RuntimeError("Embedding service unavailable — is Ollama running?") from exc
+            wait = 2 ** attempt  # 1 s, 2 s
+            logger.warning(
+                "Ollama embed connection error (attempt %d/%d), retrying in %ds: %s",
+                attempt + 1, _EMBED_MAX_RETRIES, wait, exc,
+            )
+            await asyncio.sleep(wait)
+    # Unreachable when _EMBED_MAX_RETRIES >= 1; a misconfig safety net so a 0
+    # iteration doesn't return None implicitly and surface as TypeError later.
+    raise RuntimeError(
+        f"_EMBED_MAX_RETRIES must be >= 1 (got {_EMBED_MAX_RETRIES})."
+    )
 
 
 async def _embed_text_throttled(text: str) -> list[float]:
@@ -172,6 +195,23 @@ async def ingest_gold_standard_bullets(bullets: list[dict]) -> int:
 
 # ── Phase-3 Retrieval ─────────────────────────────────────────────────────────
 
+def _coerce_role_type(value) -> RoleType:
+    """Map a payload role_type to the enum, defaulting to GENERAL on bad data.
+
+    Defends against legacy or corrupted payloads (N6). Ingestion now validates
+    role_type via the enum, but anything written before that fix could still be
+    in Qdrant — without this guard, RoleType("typo") raises ValueError and kills
+    the entire retrieval list-comprehension.
+    """
+    if isinstance(value, RoleType):
+        return value
+    try:
+        return RoleType(value) if value is not None else RoleType.GENERAL
+    except ValueError:
+        logger.warning("Unknown role_type in payload (%r) — defaulting to GENERAL.", value)
+        return RoleType.GENERAL
+
+
 async def retrieve_style_exemplars(
     query_text: str,
     role_type: RoleType | None = None,
@@ -190,19 +230,20 @@ async def retrieve_style_exemplars(
             must=[FieldCondition(key="role_type", match=MatchValue(value=role_type.value))]
         )
 
-    hits: list[ScoredPoint] = await get_qdrant().search(
+    result = await get_qdrant().query_points(
         collection_name=settings.qdrant_collection,
-        query_vector=query_vector,
+        query=query_vector,
         query_filter=query_filter,
         limit=k,
         with_payload=True,
     )
+    hits: list[ScoredPoint] = result.points
 
     return [
         StyleExemplar(
             exemplar_id=str(h.id),
             text=(h.payload or {}).get("text", ""),
-            role_type=RoleType((h.payload or {}).get("role_type", RoleType.GENERAL)),
+            role_type=_coerce_role_type((h.payload or {}).get("role_type")),
             similarity_score=float(h.score),
             uses_separator=(h.payload or {}).get("uses_separator"),
             uses_arrow=bool((h.payload or {}).get("uses_arrow", False)),

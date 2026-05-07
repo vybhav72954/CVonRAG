@@ -14,8 +14,9 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import secrets
 import time
-from collections import defaultdict, deque
+from collections import deque
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from math import ceil
@@ -26,7 +27,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-from app.chains import CVonRAGOrchestrator, close_http, get_http
+from app.chains import CVonRAGOrchestrator, close_http
 from app.config import get_settings
 from app.models import (
     GeneratedBullet,
@@ -34,6 +35,7 @@ from app.models import (
     OptimizationRequest,
     RecommendRequest,
     RecommendResponse,
+    RoleType,
     StreamChunk,
     StreamEventType,
 )
@@ -61,11 +63,27 @@ class _RateLimiter:
 
     Safe for a single-process deployment. For multi-worker or distributed
     deployments, replace with a Redis-backed solution (e.g. slowapi + Redis).
+
+    Memory hygiene: a periodic sweep drops (ip, key) entries whose newest
+    timestamp is past the window — without it, every IP ever seen would
+    accumulate a stale deque indefinitely (N2).
+
+    INVARIANT (P7): every caller MUST pass the same `window_seconds`. The GC
+    uses the *current* call's cutoff to decide which entries are stale; if two
+    routes used different windows, the shorter window's GC sweep would drop
+    entries still valid for the longer window. All routes today share
+    `settings.rate_limit_window`. If a per-route override is ever introduced,
+    track the largest window and GC against that.
     """
 
+    _GC_EVERY_N_CHECKS = 200
+
     def __init__(self) -> None:
-        self._windows: dict[tuple[str, str], deque] = defaultdict(deque)
+        # Plain dict (not defaultdict) so the GC sweep can `del` entries safely.
+        self._windows: dict[tuple[str, str], deque] = {}
         self._lock = asyncio.Lock()
+        self._checks_since_gc = 0
+        self._window_seconds: int | None = None  # locked-in on first check (P7)
 
     async def check(
         self, ip: str, key: str, max_calls: int, window_seconds: int
@@ -76,14 +94,35 @@ class _RateLimiter:
         now    = time.monotonic()
         cutoff = now - window_seconds
         async with self._lock:
-            dq = self._windows[(ip, key)]
+            # Enforce the single-window invariant (P7) — fail loud rather than
+            # silently mis-GC. Reset via `_windows.clear()` clears this too.
+            if self._window_seconds is None:
+                self._window_seconds = window_seconds
+            elif self._window_seconds != window_seconds:
+                raise RuntimeError(
+                    f"_RateLimiter received mixed windows ({self._window_seconds}s vs "
+                    f"{window_seconds}s). GC is only correct under a single shared window."
+                )
+
+            self._checks_since_gc += 1
+            if self._checks_since_gc >= self._GC_EVERY_N_CHECKS:
+                self._gc(cutoff)
+                self._checks_since_gc = 0
+
+            dq = self._windows.setdefault((ip, key), deque())
             while dq and dq[0] < cutoff:
                 dq.popleft()
             if len(dq) >= max_calls:
-                oldest = dq[0] if dq else now
-                return max(window_seconds - (now - oldest), 0.1)
+                # dq is non-empty here (len >= max_calls >= 1).
+                return max(window_seconds - (now - dq[0]), 0.1)
             dq.append(now)
             return None
+
+    def _gc(self, cutoff: float) -> None:
+        """Drop entries whose newest timestamp is older than the window cutoff."""
+        stale = [k for k, dq in self._windows.items() if not dq or dq[-1] < cutoff]
+        for k in stale:
+            del self._windows[k]
 
 
 _limiter = _RateLimiter()
@@ -156,6 +195,9 @@ _SSE_HEADERS = {
 _MAGIC_DOCX = b"PK\x03\x04"
 _MAGIC_PDF  = b"%PDF"
 
+_MAX_UPLOAD_BYTES = 10 * 1024 * 1024     # 10 MB hard limit
+_UPLOAD_CHUNK     = 64 * 1024            # 64 KB read chunk
+
 
 def _validate_file_magic(file_bytes: bytes, fname: str) -> bool:
     """Return True when the file's leading bytes match the declared extension."""
@@ -164,6 +206,29 @@ def _validate_file_magic(file_bytes: bytes, fname: str) -> bool:
     if fname.endswith(".pdf"):
         return file_bytes[:4] == _MAGIC_PDF
     return False
+
+
+async def _read_upload_capped(file: UploadFile, max_bytes: int) -> bytes:
+    """Read an UploadFile in chunks, raising 413 once max_bytes is exceeded.
+
+    The previous implementation called `file.read()` with no size argument and
+    only checked the length afterwards, so a 1 GB upload would materialise in
+    full before being rejected (N3).
+    """
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        chunk = await file.read(_UPLOAD_CHUNK)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > max_bytes:
+            raise HTTPException(
+                status_code=413,
+                detail=f"File too large (max {max_bytes // (1024 * 1024)} MB).",
+            )
+        chunks.append(chunk)
+    return b"".join(chunks)
 
 
 # ── SSE helpers ───────────────────────────────────────────────────────────────
@@ -183,8 +248,8 @@ async def _sse_stream(request: OptimizationRequest) -> AsyncGenerator[str, None]
 
             elif event_type == "bullet":
                 bullet: GeneratedBullet = payload  # type: ignore[assignment]
-                yield _sse(StreamChunk(event_type=StreamEventType.BULLET,   data=bullet.model_dump()))
-                yield _sse(StreamChunk(event_type=StreamEventType.METADATA, data=bullet.metadata.model_dump()))
+                # The bullet payload already contains .metadata; no separate event needed.
+                yield _sse(StreamChunk(event_type=StreamEventType.BULLET, data=bullet.model_dump()))
 
             elif event_type == "done":
                 yield _sse(StreamChunk(
@@ -292,9 +357,15 @@ async def parse_cv(request: Request, file: UploadFile = File(...)):
             detail="Unsupported file type. Upload a .docx or .pdf file.",
         )
 
-    file_bytes = await file.read()
-    if len(file_bytes) > 10 * 1024 * 1024:   # 10 MB hard limit
-        raise HTTPException(status_code=413, detail="File too large (max 10 MB).")
+    # Cheap pre-check: reject before reading the body when Content-Length is sent.
+    declared = request.headers.get("content-length")
+    if declared and declared.isdigit() and int(declared) > _MAX_UPLOAD_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"File too large (max {_MAX_UPLOAD_BYTES // (1024 * 1024)} MB).",
+        )
+
+    file_bytes = await _read_upload_capped(file, _MAX_UPLOAD_BYTES)
 
     if len(file_bytes) < 100:
         raise HTTPException(status_code=400, detail="File appears to be empty or corrupt.")
@@ -308,8 +379,6 @@ async def parse_cv(request: Request, file: UploadFile = File(...)):
             ),
         )
 
-    http_client = get_http()
-
     async def _stream():
         _PARSE_EVENT_MAP = {
             "progress": StreamEventType.PROGRESS,
@@ -317,7 +386,7 @@ async def parse_cv(request: Request, file: UploadFile = File(...)):
             "done":     StreamEventType.DONE,
             "error":    StreamEventType.ERROR,
         }
-        async for event_type, data in parse_and_stream(file_bytes, file.filename, http_client):
+        async for event_type, data in parse_and_stream(file_bytes, file.filename):
             sse_event = _PARSE_EVENT_MAP.get(event_type, event_type)
             if event_type == "error":
                 yield _sse(StreamChunk(
@@ -376,8 +445,7 @@ async def optimize(request: Request, body: OptimizationRequest):
     | Event type | Payload | Description |
     |---|---|---|
     | `token`    | `{data: string}` | Raw LLM token (typewriter) |
-    | `bullet`   | `{data: GeneratedBullet}` | Final validated bullet |
-    | `metadata` | `{data: BulletMetadata}` | Char count, iterations, sources |
+    | `bullet`   | `{data: GeneratedBullet}` | Final validated bullet (includes `.metadata`) |
     | `error`    | `{error_message: string}` | Pipeline error |
     | `done`     | `{data: {elapsed_seconds}}` | Stream complete |
     """
@@ -408,15 +476,24 @@ async def optimize(request: Request, body: OptimizationRequest):
 
 class IngestItem(BaseModel):
     text: str                     = Field(..., min_length=10)
-    role_type: str                = Field(default="general")
+    # Use the enum so a typo at ingest fails fast with 422 instead of poisoning
+    # Qdrant and crashing retrieve_style_exemplars later (N6).
+    role_type: RoleType           = Field(default=RoleType.GENERAL)
     uses_separator: str | None    = None
     uses_arrow: bool              = False
     uses_abbreviations: list[str] = Field(default_factory=list)
     sentence_structure: str | None = None
 
 
+# Per-request ingest cap (P10). Each bullet triggers an Ollama embed call
+# throttled to 3 concurrent — 100 bullets ≈ 30s, 500 would tie up Ollama for
+# minutes. The seeding script (scripts/ingest_pdfs.py) already chunks at 50,
+# so 100 leaves 2× headroom without enabling abuse if /ingest is exposed.
+_MAX_BULLETS_PER_INGEST = 100
+
+
 class IngestRequest(BaseModel):
-    bullets: list[IngestItem] = Field(..., min_length=1, max_length=500)
+    bullets: list[IngestItem] = Field(..., min_length=1, max_length=_MAX_BULLETS_PER_INGEST)
 
 
 class IngestResponse(BaseModel):
@@ -436,7 +513,11 @@ async def ingest(
     `X-Ingest-Secret: <secret>` in the request header.
     """
     if settings.ingest_secret:
-        if x_ingest_secret != settings.ingest_secret:
+        # Constant-time comparison (P3) — `!=` short-circuits on first byte
+        # mismatch, leaking secret prefix length via timing. compare_digest is
+        # bounded by max(len(a), len(b)). Coerce missing header to "" so the
+        # function never sees None.
+        if not secrets.compare_digest(x_ingest_secret or "", settings.ingest_secret):
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Invalid or missing X-Ingest-Secret header.",
@@ -450,10 +531,12 @@ async def ingest(
             message=f"Upserted {count} bullets into '{settings.qdrant_collection}'.",
         )
     except Exception as exc:
+        # Log full detail server-side; return a generic message so we don't
+        # leak internals (stack-trace fragments, infra hostnames, etc.) to clients.
         logger.exception("Ingestion failed: %s", exc)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Ingestion error: {exc}",
+            detail="Ingestion failed — see server logs for details.",
         )
 
 

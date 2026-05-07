@@ -34,10 +34,9 @@ class JDTone(StrEnum):
 
 
 class StreamEventType(StrEnum):
-    # /optimize events
+    # /optimize events (bullet event includes its metadata under .metadata)
     TOKEN    = "token"
     BULLET   = "bullet"
-    METADATA = "metadata"
     # /parse events
     PROGRESS = "progress"
     PROJECT  = "project"
@@ -51,7 +50,7 @@ class StreamEventType(StrEnum):
 class CoreFact(BaseModel):
     """One atomic fact. All fields are CONTENT — never altered by the pipeline."""
 
-    fact_id: str = Field(..., description="Stable ID for traceability")
+    fact_id: str = Field(..., min_length=1, description="Stable ID for traceability")
     text: str    = Field(..., min_length=5)
     tools: list[str]   = Field(default_factory=list)
     metrics: list[str] = Field(default_factory=list)
@@ -86,18 +85,24 @@ class FormattingConstraints(BaseModel):
 
 # ── Top-level API request ─────────────────────────────────────────────────────
 
+_MAX_TOTAL_BULLETS = 50
+
+
 class OptimizationRequest(BaseModel):
     job_description: Annotated[str, Field(min_length=50, max_length=10_000)]
     projects: Annotated[list[ProjectData], Field(min_length=1, max_length=20)]
     constraints: FormattingConstraints = Field(default_factory=FormattingConstraints)
     target_role_type: RoleType = RoleType.GENERAL
-    total_bullets_requested: Annotated[int, Field(ge=1, le=50)] | None = None
+    total_bullets_requested: Annotated[int, Field(ge=1, le=_MAX_TOTAL_BULLETS)] | None = None
 
     @model_validator(mode="after")
     def cap_total_bullets(self) -> "OptimizationRequest":
         if self.total_bullets_requested is None:
-            self.total_bullets_requested = (
-                len(self.projects) * self.constraints.max_bullets_per_project
+            # Clamp to the same upper bound the Field enforces so the validator
+            # can't produce a value the field declaration would have rejected.
+            self.total_bullets_requested = min(
+                _MAX_TOTAL_BULLETS,
+                len(self.projects) * self.constraints.max_bullets_per_project,
             )
         return self
 
@@ -179,7 +184,6 @@ class RecommendRequest(BaseModel):
 
 class RecommendResponse(BaseModel):
     recommendations: list[ProjectRecommendation]
-    jd_summary:      str = ""   # brief LLM-generated JD summary for UI display
 
 
 # ── Health ────────────────────────────────────────────────────────────────────

@@ -78,24 +78,24 @@
     resetRecommend();
     recommendStatus.set('loading');
 
-    try {
-      const resp = await recommendProjects({
-        job_description: $jdText,
-        projects:        $parsedProjects,
-        top_k:           $topK,
-      });
-
-      recommendations.set(resp.recommendations ?? []);
-      selectedIds.set(new Set(
-        (resp.recommendations ?? [])
-          .filter(r => r.recommended)
-          .map(r => r.project_id)
-      ));
-      recommendStatus.set('done');
-    } catch (err) {
-      recommendError.set(err.message);
-      recommendStatus.set('error');
-    }
+    await recommendProjects(
+      { job_description: $jdText, projects: $parsedProjects, top_k: $topK },
+      {
+        onDone(resp) {
+          recommendations.set(resp.recommendations ?? []);
+          selectedIds.set(new Set(
+            (resp.recommendations ?? [])
+              .filter(r => r.recommended)
+              .map(r => r.project_id)
+          ));
+          recommendStatus.set('done');
+        },
+        onError(msg) {
+          recommendError.set(msg);
+          recommendStatus.set('error');
+        },
+      },
+    );
   }
 
   function toggleProject(id) {

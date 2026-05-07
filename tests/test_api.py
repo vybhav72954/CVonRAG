@@ -6,6 +6,7 @@ FastAPI endpoint tests via TestClient (no running services needed).
 import json
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 from app.main import app
@@ -112,11 +113,27 @@ class TestIngest:
         assert client.post("/ingest", json={"bullets": [{"text": "Hi"}]}).status_code == 422
 
     def test_qdrant_error_returns_500(self, client):
+        """N17: 500 returns a generic detail (no exception leak); details live in server logs."""
         with patch("app.main.ingest_gold_standard_bullets",
-                   new=AsyncMock(side_effect=Exception("Qdrant down"))):
+                   new=AsyncMock(side_effect=Exception("Qdrant down — secret-host:6333"))):
             resp = client.post("/ingest", json=INGEST_BODY)
         assert resp.status_code == 500
-        assert "Qdrant down" in resp.json()["detail"]
+        detail = resp.json()["detail"]
+        assert "secret-host" not in detail        # internal info not leaked
+        assert "Qdrant down" not in detail        # raw exception not leaked
+        assert "server logs" in detail.lower()    # tells the operator where to look
+
+    def test_invalid_role_type_rejected_at_ingest(self, client):
+        """N6: a typo in role_type fails fast with 422 — never poisons Qdrant."""
+        body = {"bullets": [{"text": "Built SARIMA forecasting model", "role_type": "data_sciecne"}]}
+        resp = client.post("/ingest", json=body)
+        assert resp.status_code == 422
+
+    def test_valid_enum_role_type_accepted(self, client):
+        """N6: the six enum values are accepted; default ('general') still works."""
+        body = {"bullets": [{"text": "Built SARIMA forecasting model", "role_type": "data_science"}]}
+        with patch("app.main.ingest_gold_standard_bullets", new=AsyncMock(return_value=1)):
+            assert client.post("/ingest", json=body).status_code == 200
 
 
 class TestIngestAuth:
@@ -303,7 +320,7 @@ class TestRateLimit:
         assert int(resp.headers["Retry-After"]) > 0
 
     def test_parse_429_after_limit_exceeded(self, client):
-        async def _mock_stream(file_bytes, filename, http_client):
+        async def _mock_stream(file_bytes, filename):
             yield ("done", {"total_projects": 0, "total_facts": 0})
 
         from app.main import settings, _limiter
@@ -343,7 +360,7 @@ class TestRateLimit:
 
     def test_different_keys_tracked_independently(self, client):
         """Rate limit state for /parse and /optimize are independent buckets."""
-        async def _mock_stream(file_bytes, filename, http_client):
+        async def _mock_stream(file_bytes, filename):
             yield ("done", {"total_projects": 0, "total_facts": 0})
 
         async def fake_run(_r):
@@ -365,6 +382,33 @@ class TestRateLimit:
             opt_resp = client.post("/optimize", json=MINIMAL_REQUEST)
         assert parse_resp.status_code == 429
         assert opt_resp.status_code == 200
+
+    @pytest.mark.anyio
+    async def test_gc_drops_expired_entries(self):
+        """N2 regression: expired (ip, key) entries get swept so the dict can't grow forever.
+
+        Direct unit test against _RateLimiter — no FastAPI test client needed.
+        """
+        from app.main import _RateLimiter, settings
+        with patch.object(settings, "rate_limit_enabled", True):
+            limiter = _RateLimiter()
+            limiter._GC_EVERY_N_CHECKS = 3  # force GC quickly
+
+            # Two distinct IPs each register one call
+            await limiter.check("1.1.1.1", "k", max_calls=10, window_seconds=60)
+            await limiter.check("2.2.2.2", "k", max_calls=10, window_seconds=60)
+            assert len(limiter._windows) == 2
+
+            # Make the timestamps look ancient (past the cutoff window)
+            for dq in limiter._windows.values():
+                dq[0] = -1e9
+
+            # Trigger GC by hitting _GC_EVERY_N_CHECKS calls
+            await limiter.check("3.3.3.3", "k", max_calls=10, window_seconds=60)
+
+            # Old IPs swept; only the live entry remains
+            assert len(limiter._windows) == 1
+            assert ("3.3.3.3", "k") in limiter._windows
 
 
 # ── Docs ──────────────────────────────────────────────────────────────────────
@@ -416,7 +460,7 @@ class TestParse:
         from unittest.mock import AsyncMock, patch, MagicMock
         import json as _json
 
-        async def _mock_stream(file_bytes, filename, http_client):
+        async def _mock_stream(file_bytes, filename):
             yield ("progress", {"message": "Found 1 project.", "current": 0, "total": 1})
             yield ("project",  {
                 "project": {
@@ -451,7 +495,7 @@ class TestParse:
     def test_valid_pdf_streams_sse(self, client):
         from unittest.mock import patch
 
-        async def _mock_stream(file_bytes, filename, http_client):
+        async def _mock_stream(file_bytes, filename):
             yield ("done", {"total_projects": 0, "total_facts": 0})
 
         with patch("app.main.parse_and_stream", side_effect=_mock_stream):
@@ -465,7 +509,7 @@ class TestParse:
     def test_parse_error_yields_error_event(self, client):
         from unittest.mock import patch
 
-        async def _mock_stream(file_bytes, filename, http_client):
+        async def _mock_stream(file_bytes, filename):
             yield ("error", {"error_message": "corrupt file"})
 
         with patch("app.main.parse_and_stream", side_effect=_mock_stream):
@@ -512,7 +556,7 @@ class TestFileMagic:
 
     def test_valid_docx_magic_passes_check(self, client):
         """A .docx file with correct PK magic proceeds past validation."""
-        async def _mock_stream(fb, fn, hc):
+        async def _mock_stream(fb, fn):
             yield ("done", {"total_projects": 0, "total_facts": 0})
 
         with patch("app.main.parse_and_stream", side_effect=_mock_stream):
@@ -524,7 +568,7 @@ class TestFileMagic:
 
     def test_valid_pdf_magic_passes_check(self, client):
         """A .pdf file with correct %PDF magic proceeds past validation."""
-        async def _mock_stream(fb, fn, hc):
+        async def _mock_stream(fb, fn):
             yield ("done", {"total_projects": 0, "total_facts": 0})
 
         with patch("app.main.parse_and_stream", side_effect=_mock_stream):
@@ -541,3 +585,47 @@ class TestFileMagic:
             files={"file": ("cv.docx", b"PK", self._DOCX_MIME)},  # valid magic, too short
         )
         assert resp.status_code == 400  # not 415
+
+
+# ── Streaming upload cap (N3) ─────────────────────────────────────────────────
+
+class TestUploadSizeCap:
+    """N3: oversized uploads are rejected without materialising the full file in RAM."""
+
+    _DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+
+    def test_oversized_body_returns_413(self, client):
+        """An 11 MB upload is rejected with 413 (cap is 10 MB)."""
+        oversized = _DOCX_MAGIC + b"x" * (11 * 1024 * 1024)
+        resp = client.post(
+            "/parse",
+            files={"file": ("big.docx", oversized, self._DOCX_MIME)},
+        )
+        assert resp.status_code == 413
+        assert "too large" in resp.json()["detail"].lower()
+
+    def test_size_check_runs_before_full_read(self):
+        """The chunked reader bails after exceeding max_bytes — it does not read past the cap."""
+        import asyncio
+        from app.main import _read_upload_capped
+
+        class _StubUpload:
+            """Mimics UploadFile.read(size) over a pre-buffered stream."""
+            def __init__(self, data: bytes) -> None:
+                self._buf = data
+                self._pos = 0
+                self.read_calls = 0
+
+            async def read(self, size: int) -> bytes:
+                self.read_calls += 1
+                chunk = self._buf[self._pos:self._pos + size]
+                self._pos += len(chunk)
+                return chunk
+
+        # 200 KB of payload, cap at 100 KB → expect 413 before second-half is read.
+        stub = _StubUpload(b"x" * (200 * 1024))
+        with pytest.raises(HTTPException) as exc_info:
+            asyncio.run(_read_upload_capped(stub, max_bytes=100 * 1024))
+        assert exc_info.value.status_code == 413
+        # Should have stopped reading well before consuming the whole buffer.
+        assert stub._pos <= 100 * 1024 + 64 * 1024  # cap + one chunk overshoot

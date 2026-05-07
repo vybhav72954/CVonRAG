@@ -32,11 +32,14 @@ from app.models import CoreFact
 
 class TestMakeSlug:
     def test_simple_title(self):
-        assert _make_slug("Cuckoo.ai") == "cuckoo-ai"
+        slug = _make_slug("Cuckoo.ai")
+        parts = slug.rsplit("-", 1)
+        assert parts[0] == "cuckoo-ai"
+        assert len(parts[1]) == 6                    # 6-char hex hash suffix
 
     def test_long_title_truncated(self):
         slug = _make_slug("Time Series Analysis – Hourly Wages and More Stuff")
-        assert len(slug) <= 20
+        assert len(slug) <= 27                        # 20 prefix + dash + 6 hash
 
     def test_special_characters_removed(self):
         slug = _make_slug("SARIMA(2,0,0)(1,0,0)[12] Analysis")
@@ -45,6 +48,11 @@ class TestMakeSlug:
 
     def test_returns_lowercase(self):
         assert _make_slug("MyProject") == _make_slug("myproject")
+
+    def test_similar_titles_produce_unique_slugs(self):
+        s1 = _make_slug("Time Series Analysis – Hourly Wages")
+        s2 = _make_slug("Time Series Analysis of Stock Returns")
+        assert s1 != s2
 
 
 class TestStripFences:
@@ -358,14 +366,31 @@ class TestExtractFacts:
         assert len(facts) == 3
 
     @pytest.mark.asyncio
-    async def test_bullets_capped_at_20(self):
-        """Should not crash on a project with many bullets."""
-        project = RawProject("Big Project", [f"Bullet {i} with metric {i}%" for i in range(50)])
+    async def test_handles_many_bullets_within_cap(self):
+        """Projects at or below _EXTRACT_MAX_BULLETS bullets should not trigger a warning."""
+        from app.parser import _EXTRACT_MAX_BULLETS
+        project = RawProject("Big Project", [f"Bullet {i} with metric {i}%" for i in range(_EXTRACT_MAX_BULLETS)])
         raw = json.dumps([
             {"fact_id": "bp-1", "text": "Summary fact", "tools": [], "metrics": ["5%"], "outcome": ""}
         ])
-        with patch("app.chains._ollama_chat", new=_mock_llm(raw)):
+        with patch("app.chains._ollama_chat", new=_mock_llm(raw)), \
+             patch("app.parser.logger") as mock_log:
             facts = await extract_facts(project)
+        mock_log.warning.assert_not_called()
+        assert len(facts) >= 1
+
+    @pytest.mark.asyncio
+    async def test_warns_and_truncates_beyond_cap(self):
+        """Warns when a project exceeds _EXTRACT_MAX_BULLETS bullets (M7)."""
+        from app.parser import _EXTRACT_MAX_BULLETS
+        oversized = RawProject("Big Project", [f"Bullet {i} with metric {i}%" for i in range(_EXTRACT_MAX_BULLETS + 5)])
+        raw = json.dumps([
+            {"fact_id": "bp-1", "text": "Summary fact", "tools": [], "metrics": ["5%"], "outcome": ""}
+        ])
+        with patch("app.chains._ollama_chat", new=_mock_llm(raw)), \
+             patch("app.parser.logger") as mock_log:
+            facts = await extract_facts(oversized)
+        mock_log.warning.assert_called_once()
         assert len(facts) >= 1
 
     @pytest.mark.asyncio
@@ -480,6 +505,49 @@ class TestParseAndStream:
         types = [e[0] for e in events]
         assert "project" in types
         assert "done"    in types
+
+    @pytest.mark.asyncio
+    async def test_caps_facts_at_project_data_max(self):
+        """N5: LLM returning >12 facts must not blow up ProjectData validation.
+
+        Cap fires inside extract_facts; downstream construction sees ≤12 facts.
+        """
+        from app.parser import _MAX_FACTS_PER_PROJECT
+        # LLM returns 15 valid facts — more than ProjectData accepts (max_length=12).
+        with patch("app.parser.parse_docx_bytes",
+                   return_value=[RawProject("Big P", [f"bullet {i} with {i}%" for i in range(15)])]), \
+             patch("app.chains._ollama_chat", new=_mock_llm_for_extract(15)):
+            events = [(et, d) async for et, d in
+                      parse_and_stream(b"x", "test.docx")]
+
+        # Stream completed normally — no error event from validation.
+        types = [e[0] for e in events]
+        assert "done" in types
+        assert types[-1] == "done"
+        proj_event = next(d for et, d in events if et == "project")
+        assert len(proj_event["project"]["core_facts"]) == _MAX_FACTS_PER_PROJECT
+
+    @pytest.mark.asyncio
+    async def test_validation_error_yields_per_project_error_and_continues(self):
+        """N9: a Pydantic validation failure on one project must not kill the SSE.
+
+        Yields an error event for the bad project and continues with the next.
+        """
+        with patch("app.parser.parse_docx_bytes", return_value=[
+            RawProject("Bad Project", ["Bullet with 87% metric"]),
+            RawProject("Good Project", ["Bullet with 42% metric"]),
+        ]), patch("app.chains._ollama_chat", new=_mock_llm_for_extract(1)), \
+             patch("app.parser.ProjectData", side_effect=[ValueError("bad"), MagicMock(model_dump=lambda: {"title": "Good Project", "core_facts": []})]):
+            events = [(et, d) async for et, d in
+                      parse_and_stream(b"x", "test.docx")]
+
+        types = [e[0] for e in events]
+        assert "error" in types               # the bad project surfaced an error event
+        assert "project" in types             # the good project still yielded
+        assert types[-1] == "done"            # stream completed normally
+        # done count reflects only successfully-yielded projects
+        done = next(d for et, d in events if et == "done")
+        assert done["total_projects"] == 1
 
     @pytest.mark.asyncio
     async def test_progress_events_precede_project_events(self):

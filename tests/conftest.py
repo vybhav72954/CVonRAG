@@ -29,4 +29,8 @@ def _isolate_settings_from_local_env(monkeypatch):
     monkeypatch.setattr(main_settings, "rate_limit_enabled", False)
 
     # Clear any accumulated window state so tests start clean.
+    # _checks_since_gc and _window_seconds also reset (P8) so an unrelated test
+    # can't trip the GC threshold or P7's mixed-window guard on the next call.
     _limiter._windows.clear()
+    _limiter._checks_since_gc = 0
+    _limiter._window_seconds = None

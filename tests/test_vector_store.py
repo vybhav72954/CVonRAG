@@ -76,9 +76,33 @@ class TestEmbeddings:
                 
     @pytest.mark.asyncio
     async def test_embed_text_connection_error(self):
-        with patch("httpx.AsyncClient.post", new=AsyncMock(side_effect=httpx.RequestError("offline"))):
+        with patch("httpx.AsyncClient.post", new=AsyncMock(side_effect=httpx.RequestError("offline"))), \
+             patch("app.vector_store.asyncio.sleep", new=AsyncMock()):
             with pytest.raises(RuntimeError, match="unavailable"):
                 await embed_text("Hello")
+
+    @pytest.mark.asyncio
+    async def test_embed_text_retries_on_connection_error(self):
+        from app.vector_store import _EMBED_MAX_RETRIES
+        mock_post = AsyncMock(side_effect=httpx.RequestError("transient"))
+        with patch("httpx.AsyncClient.post", mock_post), \
+             patch("app.vector_store.asyncio.sleep", new=AsyncMock()):
+            with pytest.raises(RuntimeError, match="unavailable"):
+                await embed_text("Hello")
+        assert mock_post.call_count == _EMBED_MAX_RETRIES
+
+    @pytest.mark.asyncio
+    async def test_embed_text_succeeds_on_retry(self):
+        """If the first call fails but the second succeeds, the vector is returned."""
+        good_response = MagicMock()
+        good_response.json.return_value = {"embedding": [0.9, 0.8]}
+        good_response.raise_for_status.return_value = None
+        mock_post = AsyncMock(side_effect=[httpx.RequestError("blip"), good_response])
+        with patch("httpx.AsyncClient.post", mock_post), \
+             patch("app.vector_store.asyncio.sleep", new=AsyncMock()):
+            vec = await embed_text("Hello")
+        assert vec == [0.9, 0.8]
+        assert mock_post.call_count == 2
 
     @pytest.mark.asyncio
     async def test_embed_texts_batch(self):
@@ -174,14 +198,42 @@ class TestRetrieval:
                 "uses_separator": "|",
             }
         )
-        mock_client.search.return_value = [mock_point]
-        
+        mock_response = MagicMock()
+        mock_response.points = [mock_point]
+        mock_client.query_points.return_value = mock_response
+
         with patch("app.vector_store.embed_text", new=AsyncMock(return_value=[0.1])), \
              patch("app.vector_store._qdrant", mock_client):
-            
+
             exemplars = await retrieve_style_exemplars("query param")
-            
+
         assert len(exemplars) == 1
         assert exemplars[0].similarity_score == 0.9
         assert exemplars[0].uses_separator == "|"
         assert exemplars[0].role_type == RoleType.DATA_SCIENCE
+
+    @pytest.mark.asyncio
+    async def test_invalid_role_type_in_payload_defaults_to_general(self):
+        """N6: legacy/corrupted payloads with bad role_type must not crash retrieval.
+
+        Pre-fix, RoleType('data_sciecne') raised ValueError and the entire
+        list-comprehension died, breaking /optimize for everyone.
+        """
+        from qdrant_client.http.models import ScoredPoint
+        mock_client = AsyncMock()
+        mock_point = ScoredPoint(
+            id="999",
+            version=1,
+            score=0.7,
+            payload={"text": "Bullet", "role_type": "data_sciecne"},  # typo
+        )
+        mock_response = MagicMock()
+        mock_response.points = [mock_point]
+        mock_client.query_points.return_value = mock_response
+
+        with patch("app.vector_store.embed_text", new=AsyncMock(return_value=[0.1])), \
+             patch("app.vector_store._qdrant", mock_client):
+            exemplars = await retrieve_style_exemplars("q")
+
+        assert len(exemplars) == 1
+        assert exemplars[0].role_type == RoleType.GENERAL  # graceful default

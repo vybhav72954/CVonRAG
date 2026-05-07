@@ -288,10 +288,11 @@ Schema:
 
 _FACT_SCORING_SYSTEM = """\
 You are a resume-fit scoring engine. Score each fact's relevance to the JD on 0.0–1.0.
-Return ONLY a valid JSON array — no fences, no preamble.
+Return ONLY a valid JSON array — no fences, no preamble. Echo the input "id" verbatim
+for every fact (do not invent, reorder, or drop ids).
 
 Schema:
-[{"fact_id": "string", "relevance_score": float, "matched_jd_keywords": ["string"]}]"""
+[{"id": "string", "relevance_score": float, "matched_jd_keywords": ["string"]}]"""
 
 
 class SemanticMatcher:
@@ -300,63 +301,75 @@ class SemanticMatcher:
     async def analyze_jd(self, jd: str) -> dict:
         msgs = [{"role": "user", "content": f"Job Description:\n\n{jd}"}]
         raw  = await _ollama_chat(system=_JD_ANALYSIS_SYSTEM, messages=msgs, temperature=0.05)
-        try:
-            return json.loads(_strip_json_fences(raw))
-        except json.JSONDecodeError:
-            logger.warning("JD analysis JSON parse failed — retrying with json_mode. Raw: %.200s", raw)
-            raw = await _ollama_chat(
-                system=_JD_ANALYSIS_SYSTEM, messages=msgs, temperature=0.05, json_mode=True,
-            )
-            try:
-                return json.loads(_strip_json_fences(raw))
-            except json.JSONDecodeError:
-                logger.warning("JD analysis retry failed — returning empty analysis. Raw: %.200s", raw)
-                return {}
+        # Guard against valid-JSON-wrong-shape (P1): "null", arrays, scalars all
+        # parse without error but downstream `.get(...)` calls would AttributeError.
+        parsed = _safe_parse_json(raw)
+        if isinstance(parsed, dict):
+            return parsed
+        logger.warning("JD analysis returned non-dict — retrying with json_mode. Raw: %.200s", raw)
+        raw = await _ollama_chat(
+            system=_JD_ANALYSIS_SYSTEM, messages=msgs, temperature=0.05, json_mode=True,
+        )
+        parsed = _safe_parse_json(raw)
+        if isinstance(parsed, dict):
+            return parsed
+        logger.warning("JD analysis retry failed — returning empty analysis. Raw: %.200s", raw)
+        return {}
 
     async def score_facts(
         self,
         jd_analysis: dict,
         projects: list[ProjectData],
     ) -> list[ScoredFact]:
+        # Use a positional id ("i0", "i1", …) for the LLM round-trip so two
+        # projects can't collide via shared fact_ids — the user's fact_id is
+        # never globally unique (e.g., the LLM can hand back "fact-1" for both).
         flat: list[tuple[str, CoreFact]] = [
             (p.project_id, f)
             for p in projects
             for f in p.core_facts
         ]
-        payload = [{"fact_id": f.fact_id, "text": f.text} for _, f in flat]
+        ids     = [f"i{idx}" for idx in range(len(flat))]
+        payload = [
+            {"id": iid, "text": f.text}
+            for iid, (_, f) in zip(ids, flat)
+        ]
         prompt  = (
             f"JD Analysis:\n{json.dumps(jd_analysis, indent=2)}\n\n"
             f"Facts:\n{json.dumps(payload, indent=2)}"
         )
         msgs = [{"role": "user", "content": prompt}]
         raw  = await _ollama_chat(system=_FACT_SCORING_SYSTEM, messages=msgs, temperature=0.05)
-        try:
-            scores: list[dict] = json.loads(_strip_json_fences(raw))
-        except json.JSONDecodeError:
-            logger.warning("Fact scoring JSON parse failed — retrying with json_mode. Raw: %.200s", raw)
+        # Guard against valid-JSON-wrong-shape (P2): "null" parses fine but then
+        # `for s in scores` raises TypeError; a dict-of-keys would silently pass
+        # the `isinstance(s, dict)` filter as False and yield empty score_map.
+        parsed = _safe_parse_json(raw)
+        scores: list[dict] | None = parsed if isinstance(parsed, list) else None
+        if scores is None:
+            logger.warning("Fact scoring returned non-list — retrying with json_mode. Raw: %.200s", raw)
             raw = await _ollama_chat(
                 system=_FACT_SCORING_SYSTEM, messages=msgs, temperature=0.05, json_mode=True,
             )
-            try:
-                scores = json.loads(_strip_json_fences(raw))
-            except json.JSONDecodeError:
-                logger.warning(
-                    "Fact scoring retry failed — assigning 0.5 to all. Raw: %.200s", raw
-                )
-                scores = [
-                    {"fact_id": f.fact_id, "relevance_score": 0.5, "matched_jd_keywords": []}
-                    for _, f in flat
-                ]
+            parsed = _safe_parse_json(raw)
+            scores = parsed if isinstance(parsed, list) else None
+        if scores is None:
+            logger.warning(
+                "Fact scoring retry failed — assigning 0.5 to all. Raw: %.200s", raw
+            )
+            scores = [
+                {"id": iid, "relevance_score": 0.5, "matched_jd_keywords": []}
+                for iid in ids
+            ]
 
-        score_map = {s["fact_id"]: s for s in scores}
+        score_map = {s.get("id"): s for s in scores if isinstance(s, dict)}
         result = [
             ScoredFact(
                 fact=fact,
                 project_id=project_id,
-                relevance_score=float(score_map.get(fact.fact_id, {}).get("relevance_score", 0.5)),
-                matched_jd_keywords=score_map.get(fact.fact_id, {}).get("matched_jd_keywords", []),
+                relevance_score=float(score_map.get(iid, {}).get("relevance_score", 0.5)),
+                matched_jd_keywords=score_map.get(iid, {}).get("matched_jd_keywords", []),
             )
-            for project_id, fact in flat
+            for iid, (project_id, fact) in zip(ids, flat)
         ]
         result.sort(key=lambda x: x.relevance_score, reverse=True)
         return result
@@ -569,8 +582,9 @@ async def _chunk_stream(text: str) -> AsyncGenerator[str, None]:
     one sentence type out and a different one snap into place. Now we run the
     correction loop silently, then chunk-stream the final draft.
     """
+    # Empty draft → nothing to stream (P9). Previously yielded "" which sent
+    # a wasted SSE token frame and confused stricter SSE consumers.
     if not text:
-        yield ""
         return
     parts = re.findall(r"\S+\s*", text) or [text]
     delay = settings.bullet_stream_chunk_delay
@@ -618,8 +632,9 @@ class CVonRAGOrchestrator:
             top_k=settings.retrieval_top_k,
         )
 
+        # OptimizationRequest.cap_total_bullets() guarantees a non-None int here.
         bullet_index      = 0
-        bullets_remaining = request.total_bullets_requested or 999
+        bullets_remaining = request.total_bullets_requested
 
         for project in request.projects:
             if bullets_remaining <= 0:
@@ -707,8 +722,10 @@ def _clean_bullet(text: str, prefix: str) -> str:
     """Strip LLM artefacts and enforce the bullet prefix."""
     # Remove Qwen2.5 extended-reasoning blocks
     text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
-    # Remove markdown bold/italic
-    text = re.sub(r"\*+", "", text)
+    # Unwrap markdown bold (**text**) then italic (*text*).
+    # Use targeted patterns so internal asterisks like *args or **kwargs are preserved.
+    text = re.sub(r"\*\*(.+?)\*\*", r"\1", text, flags=re.DOTALL)
+    text = re.sub(r"(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)", r"\1", text, flags=re.DOTALL)
     # Remove any leading dash/asterisk the LLM might have added
     text = re.sub(r"^[-–—*]\s*", "", text.strip())
     text = text.strip()
@@ -724,12 +741,28 @@ def _pick_supporting_facts(
     exclude_idx: int,
     max_supporting: int = 2,
 ) -> list[ScoredFact]:
-    """Return facts that share JD keywords with the primary (up to max_supporting)."""
+    """Return supporting facts ordered by relevance.
+
+    Prefers facts sharing JD keywords with the primary; falls back to the next
+    highest-scored facts when the primary has no matched keywords.
+
+    Sorts defensively (P5): the previous implementation relied on `all_facts`
+    being pre-sorted by relevance descending. That invariant was held by
+    `score_facts` + the orchestrator's setdefault-append, but a refactor that
+    reorders facts upstream would have silently degraded supporting-fact picks.
+    """
+    candidates = sorted(
+        (sf for j, sf in enumerate(all_facts) if j != exclude_idx),
+        key=lambda sf: sf.relevance_score,
+        reverse=True,
+    )
     primary_kw = set(primary.matched_jd_keywords)
-    return [
-        sf for j, sf in enumerate(all_facts)
-        if j != exclude_idx and set(sf.matched_jd_keywords) & primary_kw
-    ][:max_supporting]
+    if primary_kw:
+        return [
+            sf for sf in candidates
+            if set(sf.matched_jd_keywords) & primary_kw
+        ][:max_supporting]
+    return candidates[:max_supporting]
 
 
 def _strip_json_fences(text: str) -> str:
@@ -740,3 +773,16 @@ def _strip_json_fences(text: str) -> str:
     text = re.sub(r"^```(?:json)?\s*", "", text.strip())
     text = re.sub(r"\s*```$", "", text)
     return text.strip()
+
+
+def _safe_parse_json(text: str):
+    """Parse fenced LLM JSON, returning None on JSONDecodeError.
+
+    Caller decides what shape it expects (dict vs list) via isinstance — guards
+    against valid-JSON-wrong-shape outputs like "null", scalars, or arrays where
+    a dict was expected (P1, P2).
+    """
+    try:
+        return json.loads(_strip_json_fences(text))
+    except json.JSONDecodeError:
+        return None
