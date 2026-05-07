@@ -204,10 +204,36 @@ class TestRetrieval:
 
         with patch("app.vector_store.embed_text", new=AsyncMock(return_value=[0.1])), \
              patch("app.vector_store._qdrant", mock_client):
-            
+
             exemplars = await retrieve_style_exemplars("query param")
-            
+
         assert len(exemplars) == 1
         assert exemplars[0].similarity_score == 0.9
         assert exemplars[0].uses_separator == "|"
         assert exemplars[0].role_type == RoleType.DATA_SCIENCE
+
+    @pytest.mark.asyncio
+    async def test_invalid_role_type_in_payload_defaults_to_general(self):
+        """N6: legacy/corrupted payloads with bad role_type must not crash retrieval.
+
+        Pre-fix, RoleType('data_sciecne') raised ValueError and the entire
+        list-comprehension died, breaking /optimize for everyone.
+        """
+        from qdrant_client.http.models import ScoredPoint
+        mock_client = AsyncMock()
+        mock_point = ScoredPoint(
+            id="999",
+            version=1,
+            score=0.7,
+            payload={"text": "Bullet", "role_type": "data_sciecne"},  # typo
+        )
+        mock_response = MagicMock()
+        mock_response.points = [mock_point]
+        mock_client.query_points.return_value = mock_response
+
+        with patch("app.vector_store.embed_text", new=AsyncMock(return_value=[0.1])), \
+             patch("app.vector_store._qdrant", mock_client):
+            exemplars = await retrieve_style_exemplars("q")
+
+        assert len(exemplars) == 1
+        assert exemplars[0].role_type == RoleType.GENERAL  # graceful default

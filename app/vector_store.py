@@ -185,6 +185,23 @@ async def ingest_gold_standard_bullets(bullets: list[dict]) -> int:
 
 # ── Phase-3 Retrieval ─────────────────────────────────────────────────────────
 
+def _coerce_role_type(value) -> RoleType:
+    """Map a payload role_type to the enum, defaulting to GENERAL on bad data.
+
+    Defends against legacy or corrupted payloads (N6). Ingestion now validates
+    role_type via the enum, but anything written before that fix could still be
+    in Qdrant — without this guard, RoleType("typo") raises ValueError and kills
+    the entire retrieval list-comprehension.
+    """
+    if isinstance(value, RoleType):
+        return value
+    try:
+        return RoleType(value) if value is not None else RoleType.GENERAL
+    except ValueError:
+        logger.warning("Unknown role_type in payload (%r) — defaulting to GENERAL.", value)
+        return RoleType.GENERAL
+
+
 async def retrieve_style_exemplars(
     query_text: str,
     role_type: RoleType | None = None,
@@ -216,7 +233,7 @@ async def retrieve_style_exemplars(
         StyleExemplar(
             exemplar_id=str(h.id),
             text=(h.payload or {}).get("text", ""),
-            role_type=RoleType((h.payload or {}).get("role_type", RoleType.GENERAL)),
+            role_type=_coerce_role_type((h.payload or {}).get("role_type")),
             similarity_score=float(h.score),
             uses_separator=(h.payload or {}).get("uses_separator"),
             uses_arrow=bool((h.payload or {}).get("uses_arrow", False)),

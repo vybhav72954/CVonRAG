@@ -51,7 +51,7 @@ class StreamEventType(StrEnum):
 class CoreFact(BaseModel):
     """One atomic fact. All fields are CONTENT — never altered by the pipeline."""
 
-    fact_id: str = Field(..., description="Stable ID for traceability")
+    fact_id: str = Field(..., min_length=1, description="Stable ID for traceability")
     text: str    = Field(..., min_length=5)
     tools: list[str]   = Field(default_factory=list)
     metrics: list[str] = Field(default_factory=list)

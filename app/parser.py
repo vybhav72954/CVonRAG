@@ -27,6 +27,7 @@ import re
 from collections.abc import AsyncGenerator
 from dataclasses import dataclass, field
 
+from app.chains import _strip_json_fences as _strip_fences
 from app.config import get_settings
 from app.models import CoreFact, ProjectData
 
@@ -41,6 +42,11 @@ settings = get_settings()
 # Max bullets sent to the LLM per project for fact extraction.
 # Raised from 20 to 50 so power users (25+ bullets) no longer lose facts silently.
 _EXTRACT_MAX_BULLETS = 50
+
+# Hard cap on facts per project — must match ProjectData.core_facts max_length=12.
+# Without it, an over-eager LLM returning 15+ facts blows up Pydantic validation
+# inside the SSE stream and the client never receives an error event (N5).
+_MAX_FACTS_PER_PROJECT = 12
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Raw document types
@@ -320,12 +326,7 @@ Critical rules:
 """
 
 
-def _strip_fences(text: str) -> str:
-    """Remove ```json ... ``` fences that some models add."""
-    text = text.strip()
-    text = re.sub(r"^```(?:json)?\s*", "", text)
-    text = re.sub(r"\s*```$", "", text)
-    return text.strip()
+# `_strip_fences` is re-exported from chains as a module-level alias (see top of file).
 
 
 def _make_slug(title: str) -> str:
@@ -393,6 +394,12 @@ async def extract_facts(project: RawProject, http_client=None) -> list[CoreFact]
             logger.debug("Skipping malformed fact %d: %s", i, exc)
             continue
 
+    if len(facts) > _MAX_FACTS_PER_PROJECT:
+        logger.warning(
+            "LLM returned %d facts for '%s'; truncating to %d (ProjectData cap).",
+            len(facts), project.title, _MAX_FACTS_PER_PROJECT,
+        )
+        facts = facts[:_MAX_FACTS_PER_PROJECT]
     return facts
 
 
@@ -435,7 +442,8 @@ async def parse_and_stream(
     })
 
     # ── Step 2: extract facts for each project ────────────────────────────────
-    total_facts = 0
+    total_facts     = 0
+    yielded_projects = 0
 
     for i, raw_proj in enumerate(raw_projects):
         yield ("progress", {
@@ -456,18 +464,32 @@ async def parse_and_stream(
                 outcome="",
             )]
 
-        slug    = _make_slug(raw_proj.title)
-        project = ProjectData(
-            project_id=f"p-{i:03d}-{slug}",
-            title=raw_proj.title,
-            core_facts=facts,
-        )
+        # Wrap ProjectData construction (N9): a validation failure here used to kill
+        # the whole SSE silently. Yield a per-project error event and continue with
+        # the remaining projects so the user gets partial results plus a clear signal.
+        try:
+            slug    = _make_slug(raw_proj.title)
+            project = ProjectData(
+                project_id=f"p-{i:03d}-{slug}",
+                title=raw_proj.title,
+                core_facts=facts,
+            )
+        except Exception as exc:
+            logger.warning("ProjectData validation failed for '%s': %s", raw_proj.title, exc)
+            yield ("error", {
+                "error_message": (
+                    f"Could not finalise project '{raw_proj.title}': {exc}. "
+                    f"Skipping and continuing."
+                ),
+            })
+            continue
 
         total_facts += len(facts)
+        yielded_projects += 1
         yield ("project", {
             "project": project.model_dump(),
             "index":   i,
             "total":   total,
         })
 
-    yield ("done", {"total_projects": total, "total_facts": total_facts})
+    yield ("done", {"total_projects": yielded_projects, "total_facts": total_facts})

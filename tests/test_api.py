@@ -119,6 +119,18 @@ class TestIngest:
         assert resp.status_code == 500
         assert "Qdrant down" in resp.json()["detail"]
 
+    def test_invalid_role_type_rejected_at_ingest(self, client):
+        """N6: a typo in role_type fails fast with 422 — never poisons Qdrant."""
+        body = {"bullets": [{"text": "Built SARIMA forecasting model", "role_type": "data_sciecne"}]}
+        resp = client.post("/ingest", json=body)
+        assert resp.status_code == 422
+
+    def test_valid_enum_role_type_accepted(self, client):
+        """N6: the six enum values are accepted; default ('general') still works."""
+        body = {"bullets": [{"text": "Built SARIMA forecasting model", "role_type": "data_science"}]}
+        with patch("app.main.ingest_gold_standard_bullets", new=AsyncMock(return_value=1)):
+            assert client.post("/ingest", json=body).status_code == 200
+
 
 class TestIngestAuth:
     """Cover the INGEST_SECRET enforcement path. The auth gate fires only when

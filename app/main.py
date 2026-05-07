@@ -34,6 +34,7 @@ from app.models import (
     OptimizationRequest,
     RecommendRequest,
     RecommendResponse,
+    RoleType,
     StreamChunk,
     StreamEventType,
 )
@@ -459,7 +460,9 @@ async def optimize(request: Request, body: OptimizationRequest):
 
 class IngestItem(BaseModel):
     text: str                     = Field(..., min_length=10)
-    role_type: str                = Field(default="general")
+    # Use the enum so a typo at ingest fails fast with 422 instead of poisoning
+    # Qdrant and crashing retrieve_style_exemplars later (N6).
+    role_type: RoleType           = Field(default=RoleType.GENERAL)
     uses_separator: str | None    = None
     uses_arrow: bool              = False
     uses_abbreviations: list[str] = Field(default_factory=list)

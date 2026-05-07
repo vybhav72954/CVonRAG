@@ -507,6 +507,49 @@ class TestParseAndStream:
         assert "done"    in types
 
     @pytest.mark.asyncio
+    async def test_caps_facts_at_project_data_max(self):
+        """N5: LLM returning >12 facts must not blow up ProjectData validation.
+
+        Cap fires inside extract_facts; downstream construction sees ≤12 facts.
+        """
+        from app.parser import _MAX_FACTS_PER_PROJECT
+        # LLM returns 15 valid facts — more than ProjectData accepts (max_length=12).
+        with patch("app.parser.parse_docx_bytes",
+                   return_value=[RawProject("Big P", [f"bullet {i} with {i}%" for i in range(15)])]), \
+             patch("app.chains._ollama_chat", new=_mock_llm_for_extract(15)):
+            events = [(et, d) async for et, d in
+                      parse_and_stream(b"x", "test.docx")]
+
+        # Stream completed normally — no error event from validation.
+        types = [e[0] for e in events]
+        assert "done" in types
+        assert types[-1] == "done"
+        proj_event = next(d for et, d in events if et == "project")
+        assert len(proj_event["project"]["core_facts"]) == _MAX_FACTS_PER_PROJECT
+
+    @pytest.mark.asyncio
+    async def test_validation_error_yields_per_project_error_and_continues(self):
+        """N9: a Pydantic validation failure on one project must not kill the SSE.
+
+        Yields an error event for the bad project and continues with the next.
+        """
+        with patch("app.parser.parse_docx_bytes", return_value=[
+            RawProject("Bad Project", ["Bullet with 87% metric"]),
+            RawProject("Good Project", ["Bullet with 42% metric"]),
+        ]), patch("app.chains._ollama_chat", new=_mock_llm_for_extract(1)), \
+             patch("app.parser.ProjectData", side_effect=[ValueError("bad"), MagicMock(model_dump=lambda: {"title": "Good Project", "core_facts": []})]):
+            events = [(et, d) async for et, d in
+                      parse_and_stream(b"x", "test.docx")]
+
+        types = [e[0] for e in events]
+        assert "error" in types               # the bad project surfaced an error event
+        assert "project" in types             # the good project still yielded
+        assert types[-1] == "done"            # stream completed normally
+        # done count reflects only successfully-yielded projects
+        done = next(d for et, d in events if et == "done")
+        assert done["total_projects"] == 1
+
+    @pytest.mark.asyncio
     async def test_progress_events_precede_project_events(self):
         with patch("app.parser.parse_docx_bytes",
                    return_value=[RawProject("P1", ["b1 with metric 40%"])]), \
