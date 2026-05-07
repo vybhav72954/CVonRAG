@@ -67,6 +67,13 @@ class _RateLimiter:
     Memory hygiene: a periodic sweep drops (ip, key) entries whose newest
     timestamp is past the window — without it, every IP ever seen would
     accumulate a stale deque indefinitely (N2).
+
+    INVARIANT (P7): every caller MUST pass the same `window_seconds`. The GC
+    uses the *current* call's cutoff to decide which entries are stale; if two
+    routes used different windows, the shorter window's GC sweep would drop
+    entries still valid for the longer window. All routes today share
+    `settings.rate_limit_window`. If a per-route override is ever introduced,
+    track the largest window and GC against that.
     """
 
     _GC_EVERY_N_CHECKS = 200
@@ -76,6 +83,7 @@ class _RateLimiter:
         self._windows: dict[tuple[str, str], deque] = {}
         self._lock = asyncio.Lock()
         self._checks_since_gc = 0
+        self._window_seconds: int | None = None  # locked-in on first check (P7)
 
     async def check(
         self, ip: str, key: str, max_calls: int, window_seconds: int
@@ -86,6 +94,16 @@ class _RateLimiter:
         now    = time.monotonic()
         cutoff = now - window_seconds
         async with self._lock:
+            # Enforce the single-window invariant (P7) — fail loud rather than
+            # silently mis-GC. Reset via `_windows.clear()` clears this too.
+            if self._window_seconds is None:
+                self._window_seconds = window_seconds
+            elif self._window_seconds != window_seconds:
+                raise RuntimeError(
+                    f"_RateLimiter received mixed windows ({self._window_seconds}s vs "
+                    f"{window_seconds}s). GC is only correct under a single shared window."
+                )
+
             self._checks_since_gc += 1
             if self._checks_since_gc >= self._GC_EVERY_N_CHECKS:
                 self._gc(cutoff)
@@ -467,8 +485,15 @@ class IngestItem(BaseModel):
     sentence_structure: str | None = None
 
 
+# Per-request ingest cap (P10). Each bullet triggers an Ollama embed call
+# throttled to 3 concurrent — 100 bullets ≈ 30s, 500 would tie up Ollama for
+# minutes. The seeding script (scripts/ingest_pdfs.py) already chunks at 50,
+# so 100 leaves 2× headroom without enabling abuse if /ingest is exposed.
+_MAX_BULLETS_PER_INGEST = 100
+
+
 class IngestRequest(BaseModel):
-    bullets: list[IngestItem] = Field(..., min_length=1, max_length=500)
+    bullets: list[IngestItem] = Field(..., min_length=1, max_length=_MAX_BULLETS_PER_INGEST)
 
 
 class IngestResponse(BaseModel):

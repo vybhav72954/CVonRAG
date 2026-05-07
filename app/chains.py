@@ -582,8 +582,9 @@ async def _chunk_stream(text: str) -> AsyncGenerator[str, None]:
     one sentence type out and a different one snap into place. Now we run the
     correction loop silently, then chunk-stream the final draft.
     """
+    # Empty draft → nothing to stream (P9). Previously yielded "" which sent
+    # a wasted SSE token frame and confused stricter SSE consumers.
     if not text:
-        yield ""
         return
     parts = re.findall(r"\S+\s*", text) or [text]
     delay = settings.bullet_stream_chunk_delay

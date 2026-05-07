@@ -20,6 +20,8 @@ from __future__ import annotations
 import json
 import logging
 
+import httpx
+
 from app.chains import SemanticMatcher, _ollama_chat, _strip_json_fences
 from app.config import get_settings
 from app.models import ProjectData, ProjectRecommendation
@@ -131,6 +133,9 @@ async def recommend_projects(
         # fallback if both fail. Keeps recommender consistent with score_facts/
         # analyze_jd so reasoning models don't degrade the UX silently (N19).
         msgs = [{"role": "user", "content": prompt}]
+        # Narrow the catch (P6) to LLM transport / parse failures so that real
+        # bugs (Pydantic crashes, KeyErrors in our own assembly code, etc.)
+        # surface as 500s instead of being swallowed into the skill-list fallback.
         try:
             raw = await _ollama_chat(system=_REASON_SYSTEM, messages=msgs, temperature=0.2)
             try:
@@ -145,8 +150,8 @@ async def recommend_projects(
                 reasons = json.loads(_strip_json_fences(raw))
             if not isinstance(reasons, dict):
                 reasons = {}
-        except Exception as exc:
-            logger.warning("Reason generation failed: %s — using fallback.", exc)
+        except (httpx.HTTPError, json.JSONDecodeError, RuntimeError) as exc:
+            logger.warning("Reason generation failed (%s) — using fallback.", exc)
             reasons = {}
 
     # ── Phase 4: assemble recommendations ────────────────────────────────────
