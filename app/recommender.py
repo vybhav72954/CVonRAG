@@ -133,9 +133,14 @@ async def recommend_projects(
         # fallback if both fail. Keeps recommender consistent with score_facts/
         # analyze_jd so reasoning models don't degrade the UX silently (N19).
         msgs = [{"role": "user", "content": prompt}]
-        # Narrow the catch (P6) to LLM transport / parse failures so that real
-        # bugs (Pydantic crashes, KeyErrors in our own assembly code, etc.)
-        # surface as 500s instead of being swallowed into the skill-list fallback.
+        # Catch LLM transport / parse failures and chains.py response-shape
+        # errors. P6 originally narrowed this to `(httpx.HTTPError,
+        # json.JSONDecodeError, RuntimeError)` to let real bugs surface, but
+        # `_groq_chat` does `r.json()["choices"][0]["message"]["content"]` —
+        # a malformed 200 OK body raises KeyError/IndexError/TypeError, which
+        # are LLM-side failures, not bugs in our assembly code. Reason
+        # generation is a non-critical UI affordance, so degrade to the
+        # skill-list fallback for any of these instead of returning 500.
         try:
             raw = await _ollama_chat(system=_REASON_SYSTEM, messages=msgs, temperature=0.2)
             try:
@@ -150,7 +155,10 @@ async def recommend_projects(
                 reasons = json.loads(_strip_json_fences(raw))
             if not isinstance(reasons, dict):
                 reasons = {}
-        except (httpx.HTTPError, json.JSONDecodeError, RuntimeError) as exc:
+        except (
+            httpx.HTTPError, json.JSONDecodeError, RuntimeError,
+            KeyError, IndexError, TypeError,
+        ) as exc:
             logger.warning("Reason generation failed (%s) — using fallback.", exc)
             reasons = {}
 
