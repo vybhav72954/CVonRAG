@@ -571,3 +571,21 @@ curl http://localhost:8000/health | python -m json.tool
 # API docs: http://localhost:8000/docs
 # Qdrant:   http://localhost:6333/dashboard
 ```
+
+
+```
+# 1. Validate extraction quality on one PDF first (no writes):
+python scripts/ingest_pdfs.py --debug_pdf "Soham Chatterjee.pdf"
+
+# 2. Dry-run across all PDFs (still no writes):
+python scripts/ingest_pdfs.py --pdf_dir "Z:/PGDBA Content/Competition/CVonRAG/docs/good_cvs" --dry_run
+
+# 3. Re-seed with Groq tagging for proper role_type filtering:
+python scripts/ingest_pdfs.py --pdf_dir "Z:/PGDBA Content/Competition/CVonRAG/docs/good_cvs"
+
+# The script upserts (new UUIDs each run), so you'll want to drop the collection first if you don't want stale
+# duplicates:
+curl -X DELETE http://localhost:6333/collections/gold_standard_cvs
+
+Then /ingest recreates it fresh on the first call.
+```

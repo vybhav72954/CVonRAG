@@ -433,7 +433,7 @@
     <div style="display:flex;justify-content:flex-end;padding-top:0.5rem">
       <button class="btn-primary" on:click={goToJD}>
         Continue to Job Description
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="margin-left:6px">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
           <line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/>
         </svg>
       </button>
@@ -503,7 +503,7 @@
   <!-- Analyse button -->
   {#if $recommendStatus === 'idle' || $recommendStatus === 'error'}
   <button class="btn-primary" style="width:100%;padding:0.875rem" disabled={$jdText.length < 50} on:click={analyseJD}>
-    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="margin-right:8px">
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
       <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/>
     </svg>
     Analyse JD: Find Best Projects
@@ -607,7 +607,7 @@
       {/if}
       <button class="btn-primary" style="width:100%;padding:0.875rem" disabled={selectedCount === 0} on:click={generate}>
         Generate bullets for {selectedCount} project{selectedCount !== 1 ? 's' : ''}
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="margin-left:8px">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
           <line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/>
         </svg>
       </button>
@@ -617,7 +617,7 @@
 
   <div style="padding-top:0.5rem">
     <button class="btn-ghost" on:click={() => step.set(1)}>
-      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="margin-right:4px">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
         <line x1="19" y1="12" x2="5" y2="12"/><polyline points="12 19 5 12 12 5"/>
       </svg>
       Back
