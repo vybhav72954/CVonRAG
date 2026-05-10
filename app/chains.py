@@ -292,7 +292,8 @@ Schema:
 _FACT_SCORING_SYSTEM = """\
 You are a resume-fit scoring engine. Score each fact's relevance to the JD on 0.0–1.0.
 Return ONLY a valid JSON array — no fences, no preamble. Echo the input "id" verbatim
-for every fact (do not invent, reorder, or drop ids).
+for every fact (do not invent, reorder, or drop ids). The key MUST be named "id".
+Do NOT rename it to "fact_id", "ID", "Id", or anything else.
 
 Schema:
 [{"id": "string", "relevance_score": float, "matched_jd_keywords": ["string"]}]"""
@@ -364,7 +365,24 @@ class SemanticMatcher:
                 for iid in ids
             ]
 
-        score_map = {s.get("id"): s for s in scores if isinstance(s, dict)}
+        # Q4: accept common LLM key aliases. Llama 3.3 frequently emits
+        # "fact_id" instead of the prompted "id" because CoreFact.fact_id
+        # exists elsewhere in the schema and the model anchors on it. Prior
+        # to this fix, every lookup fell through to the 0.5 default and
+        # every project rendered as a uniform 50% match.
+        def _entry_id(s: dict) -> str | None:
+            return s.get("id") or s.get("fact_id") or s.get("ID") or s.get("Id")
+
+        score_map = {_entry_id(s): s for s in scores if isinstance(s, dict) and _entry_id(s)}
+        # If the LLM dropped/mangled most IDs (>50% of facts unmatched), the
+        # data is unreliable — log loudly so a regression is visible in
+        # production rather than silently degrading to 50% across the board.
+        unmatched = sum(1 for iid in ids if iid not in score_map)
+        if ids and unmatched > len(ids) // 2:
+            logger.warning(
+                "Fact scoring: %d/%d ids unmatched in LLM response — scores will default. Raw: %.200s",
+                unmatched, len(ids), raw,
+            )
         result = [
             ScoredFact(
                 fact=fact,
@@ -401,8 +419,12 @@ CONTENT  (User JSON ONLY):
   • Specific action verbs for what the user actually did
 
 STYLE  (Exemplars ONLY):
-  • Visual separators: | • ; and special chars ↑ ↓ → & w/
   • Sentence architecture: VERB → TOOL → METRIC → IMPACT
+  • Connectors (use sparingly, vary across bullets — DO NOT default to `|`):
+      — comma + clause: "...using SARIMA, reducing RMSE to 0.250"  ← preferred
+      — semicolon `;`  : when joining two complete clauses
+      — pipe `|`       : ONLY when the two halves are visually parallel claims (max ~30% of bullets)
+      — `&`, `w/`, `↑`, `↓`, `→`, `~` for compression when needed
   • Abbreviation conventions: vs, w/, ~, approx
 
 ABSOLUTE PROHIBITIONS:
@@ -410,6 +432,7 @@ ABSOLUTE PROHIBITIONS:
   ✗ NEVER attach an Exemplar's metric to the user's tool (or vice versa)
   ✗ NEVER invent steps, deployments, or outcomes not in the User JSON
   ✗ NEVER alter any number. 87% stays 87%. 0.250 stays 0.250. RMSE stays RMSE.
+  ✗ NEVER reach for `|` as the default separator — natural prose with commas is the baseline
 
 OUTPUT: ONE plain-text bullet line. No markdown, no quotes, no explanation."""
 
@@ -424,14 +447,18 @@ JD Keywords : {jd_keywords}
 ━━ GOLD STANDARD EXEMPLARS (STYLE REFERENCE ONLY — do NOT copy content) ━━
 {exemplars}
 
-━━ FEW-SHOT TRANSFORMATION EXAMPLES ━━
+━━ FEW-SHOT TRANSFORMATION EXAMPLES (note: vary connectors — comma, semicolon, and pipe) ━━
 Fact   : "Built SARIMA(2,0,0)(1,0,0)[12] model using ACF/PACF... reduced RMSE to 0.250"
 Style  : "Enhanced forecast accuracy using ARIMAX | Reduced RMSE by 13.5%"
-Output : • Built SARIMA(2,0,0)(1,0,0)[12] model via ACF/PACF analysis | Optimized ensemble weights via constrained SLSQP, ↑ predictive accuracy by reducing RMSE to 0.250
+Output : • Built SARIMA(2,0,0)(1,0,0)[12] model via ACF/PACF analysis, optimizing ensemble weights via constrained SLSQP to reduce RMSE to 0.250
 
 Fact   : "Architected multi-agent LLM system using LangChain + GPT-4... 87% faster (8-12 weeks to 5-10 days)"
 Style  : "Handled class imbalance via undersampling; ↑ F1 score from 0.39 to 0.49"
-Output : • Architected multi-agent LLM system using LangChain & GPT-4 | Orchestrated 6 specialized agents, ↑ evaluation speed by 87% (8-12 weeks to 5-10 days)
+Output : • Architected multi-agent LLM system using LangChain & GPT-4; orchestrated 6 specialized agents, ↑ evaluation speed 87% (8-12 weeks → 5-10 days)
+
+Fact   : "Implemented WGCNA clustering on GSE54564 — Cophenetic correlation 0.941"
+Style  : "Engineered 6k+ audio features via Random Forest | 81.4% accuracy across 37 classes"
+Output : • Implemented WGCNA consensus clustering on GSE54564 expression data | achieved Cophenetic correlation 0.941 with PAC 0.358
 
 ━━ TASK ━━
 Bullet prefix : "{prefix}"

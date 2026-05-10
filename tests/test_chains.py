@@ -419,6 +419,36 @@ class TestScoreFactsRetry:
         assert by_pid["p-A"].matched_jd_keywords == ["SARIMA"]
         assert by_pid["p-B"].matched_jd_keywords == []
 
+    @pytest.mark.asyncio
+    async def test_accepts_fact_id_alias_in_response(self):
+        """Q4: Llama 3.3 routinely emits 'fact_id' instead of the prompted 'id',
+        because CoreFact.fact_id exists elsewhere in the schema and the model
+        anchors on it. Before this fix every lookup fell through to the 0.5
+        default and every project rendered as a uniform 50% match.
+        """
+        from app.models import ProjectData
+        proj = ProjectData(
+            project_id="p-A",
+            title="Forecasting",
+            core_facts=[
+                CoreFact(fact_id="f-1", text="Built SARIMA model"),
+                CoreFact(fact_id="f-2", text="Optimised prices via SLSQP"),
+            ],
+        )
+        # LLM uses "fact_id" instead of "id" — valid JSON, wrong key name.
+        wrong_key_json = (
+            '[{"fact_id": "i0", "relevance_score": 0.95, "matched_jd_keywords": ["SARIMA"]},'
+            ' {"fact_id": "i1", "relevance_score": 0.30, "matched_jd_keywords": []}]'
+        )
+        with patch("app.chains._ollama_chat", new=AsyncMock(return_value=wrong_key_json)):
+            result = await SemanticMatcher().score_facts({}, [proj])
+
+        scores = sorted([sf.relevance_score for sf in result], reverse=True)
+        assert scores == [0.95, 0.30], (
+            f"Expected scores extracted via 'fact_id' alias, got {scores} "
+            f"(0.5/0.5 means the alias fix regressed)"
+        )
+
 
 # ── H2: Groq 429 retry logic ─────────────────────────────────────────────────
 
