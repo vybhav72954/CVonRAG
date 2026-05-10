@@ -133,6 +133,14 @@ html {
   /* ── Buttons ───────────────────────────────────────────────────────── */
   .btn-primary {
     @apply px-6 py-3 rounded-xl text-sm font-semibold transition-all duration-300;
+    /* inline-flex + gap so icon and label never visually collide.
+       Previously the button used inline-block layout and SVGs had inline
+       margin-right:4px, which crowded the icon against the label on narrow
+       buttons (the "← Back" / lightning-bolt overlap reported May 2026). */
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0.5rem;
     background: var(--gradient-primary);
     color: #fff;
     border: none;
@@ -168,6 +176,10 @@ html {
 
   .btn-ghost {
     @apply px-4 py-2 rounded-lg text-sm font-medium transition-all duration-200;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0.4rem;
     background: transparent;
     border: 1px solid var(--border-hi);
     color: var(--text-secondary);

@@ -8,7 +8,9 @@ Zero paid API keys required.
 from __future__ import annotations
 import logging
 from functools import lru_cache
-from pydantic import model_validator
+from typing import Annotated
+
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -62,7 +64,10 @@ class Settings(BaseSettings):
     max_metrics_per_project: int = 4      # metric chips cap per project
 
     # ── Char-limit loop ───────────────────────────────────────────────────────
-    char_loop_max_iterations: int = 4
+    # ge=1: at least one iteration so the initial draft is always produced.
+    # _correction_loop returns None if range(1, n+1) is empty, which would
+    # crash the orchestrator on `draft.text` — fail at boot instead.
+    char_loop_max_iterations: Annotated[int, Field(ge=1)] = 4
     char_tolerance: int = 2
 
     # ── LLM generation ────────────────────────────────────────────────────────

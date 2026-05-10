@@ -4,6 +4,7 @@ Unit tests for app/recommender.py — all LLM calls mocked.
 """
 
 import json
+import httpx
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -205,11 +206,18 @@ class TestRecommendProjects:
 
         assert "SARIMA" in result[0].reason
 
+    @pytest.mark.parametrize("exc", [
+        httpx.ConnectError("Ollama down"),         # network: real failure mode
+        httpx.ReadTimeout("LLM took too long"),    # network: timeout
+        KeyError("choices"),                       # malformed Groq 200 body
+        IndexError("list out of range"),           # malformed Groq 200 body
+        RuntimeError("Embedding service unavailable"),  # raised by chains/vector_store
+    ])
     @pytest.mark.asyncio
-    async def test_fallback_reason_when_llm_fails(self):
+    async def test_fallback_reason_when_llm_fails(self, exc):
         scored = [_scored(F1, "p-ts", 0.9, ["SARIMA", "Python"])]
         with patch("app.recommender.SemanticMatcher", return_value=_mock_matcher(scored)), \
-             patch("app.recommender._ollama_chat", AsyncMock(side_effect=Exception("Ollama down"))):
+             patch("app.recommender._ollama_chat", AsyncMock(side_effect=exc)):
             result = await recommend_projects([P_TIME_SERIES], SAMPLE_JD, top_k=1)
 
         # Should not raise — fallback reason should mention matched skills

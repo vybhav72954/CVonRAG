@@ -1,22 +1,55 @@
 <script>
   import { onMount } from 'svelte';
-  import { parseCV, recommendProjects, optimizeResume, checkHealth } from '$lib/api';
+  import { get } from 'svelte/store';
+  import { parseCV, recommendProjects, optimizeResume, checkHealth, abortInFlight } from '$lib/api';
   import {
     step,
-    parsedProjects, parseStatus, parseProgress, parseError, resetParse,
+    parsedProjects, parseStatus, parseProgress, parseError, parseWarnings, resetParse,
     jdText, roleType, charLimit, maxBullets, topK,
     recommendations, recommendStatus, recommendError, selectedIds, resetRecommend,
     genStatus, tokenBuffer, bullets, genError, elapsed, resetGeneration,
     isUploading, isRecommending, isGenerating,
   } from '$lib/stores';
 
-  // ── Backend health check on mount ──────────────────────────────────────────
+  // ── Backend health check (F6) — also re-runs on focus/visibility ────────
   let backendDown = false;
   let backendMsg  = '';
 
-  onMount(async () => {
+  async function refreshHealth() {
     const { ok, reason } = await checkHealth();
-    if (!ok) { backendDown = true; backendMsg = reason; }
+    backendDown = !ok;
+    backendMsg  = ok ? '' : reason;
+  }
+
+  // Refresh-during-streaming guard: persistent stores already preserve parsed
+  // projects, JD, settings, and completed bullets across reloads, but the
+  // in-flight LLM stream cannot be resumed — those tokens are gone the moment
+  // the page unloads. Show the browser's native confirmation prompt so an
+  // accidental Cmd-R/F5 mid-generation doesn't burn a Groq quota silently.
+  function onBeforeUnload(e) {
+    const streaming =
+      get(genStatus)    === 'streaming' ||
+      get(parseStatus)  === 'uploading' ||
+      get(parseStatus)  === 'streaming' ||
+      get(recommendStatus) === 'loading';
+    if (streaming) {
+      e.preventDefault();
+      e.returnValue = '';  // Chrome requires returnValue to be set
+      return '';
+    }
+  }
+
+  onMount(() => {
+    refreshHealth();
+    const onVisible = () => { if (document.visibilityState === 'visible') refreshHealth(); };
+    document.addEventListener('visibilitychange', onVisible);
+    window.addEventListener('focus', refreshHealth);
+    window.addEventListener('beforeunload', onBeforeUnload);
+    return () => {
+      document.removeEventListener('visibilitychange', onVisible);
+      window.removeEventListener('focus', refreshHealth);
+      window.removeEventListener('beforeunload', onBeforeUnload);
+    };
   });
 
   // ── Step 1: Upload & Parse ────────────────────────────────────────────────
@@ -44,7 +77,17 @@
       onProgress: ({ message }) => { parseStatus.set('streaming'); parseProgress.set(message); },
       onProject:  ({ project }) => parsedProjects.update(ps => [...ps, project]),
       onDone:     ()            => parseStatus.set('done'),
-      onError:    msg           => { parseStatus.set('error'); parseError.set(msg); },
+      // F2: distinguish a per-project error (stream continues, projects exist) from
+      // a fatal error (no projects parsed, stream broken). The first is a warning
+      // the user should see alongside their results; the second is fatal.
+      onError:    msg           => {
+        const haveAny = $parsedProjects.length > 0;
+        parseWarnings.update(w => [...w, msg]);
+        if (!haveAny) {
+          parseStatus.set('error');
+          parseError.set(msg);
+        }
+      },
     });
   }
 
@@ -257,7 +300,12 @@
     <div
       class="dropzone-inner"
       on:click={() => fileInput.click()}
-      on:keydown={e => e.key === 'Enter' && fileInput.click()}
+      on:keydown={e => {
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault();  // Space on a focused element scrolls otherwise
+          fileInput.click();
+        }
+      }}
       role="button" tabindex="0"
     >
       <div class="drop-icon float-icon">
@@ -331,6 +379,26 @@
       </button>
     </div>
 
+    <!-- Per-project parse warnings (F2): visible alongside successful projects -->
+    {#if $parseWarnings.length > 0}
+    <div class="warning-banner">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="flex-shrink:0;margin-top:2px">
+        <path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/>
+        <line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/>
+      </svg>
+      <div style="flex:1">
+        <p style="font-weight:600;font-size:0.8125rem;color:var(--amber);margin-bottom:0.25rem">
+          {$parseWarnings.length} project{$parseWarnings.length !== 1 ? 's were' : ' was'} skipped during parsing
+        </p>
+        <ul style="margin:0;padding-left:1rem;font-size:0.75rem;color:var(--text-secondary);line-height:1.5">
+          {#each $parseWarnings as w}
+            <li>{w}</li>
+          {/each}
+        </ul>
+      </div>
+    </div>
+    {/if}
+
     {#each $parsedProjects as project (project.project_id)}
     {@const expanded = expandedProject === project.project_id}
     <div class="project-card surface-card" class:project-card--expanded={expanded}>
@@ -386,7 +454,7 @@
     <div style="display:flex;justify-content:flex-end;padding-top:0.5rem">
       <button class="btn-primary" on:click={goToJD}>
         Continue to Job Description
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="margin-left:6px">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
           <line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/>
         </svg>
       </button>
@@ -456,7 +524,7 @@
   <!-- Analyse button -->
   {#if $recommendStatus === 'idle' || $recommendStatus === 'error'}
   <button class="btn-primary" style="width:100%;padding:0.875rem" disabled={$jdText.length < 50} on:click={analyseJD}>
-    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="margin-right:8px">
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
       <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/>
     </svg>
     Analyse JD: Find Best Projects
@@ -488,7 +556,7 @@
         <h2 class="section-title">AI Recommendation</h2>
         <p class="section-subtitle">Toggle projects to include in your optimised bullets.</p>
       </div>
-      <button class="btn-ghost" on:click={() => recommendStatus.set('idle')}>Re-analyse</button>
+      <button class="btn-ghost" on:click={() => { abortInFlight('recommend'); resetRecommend(); }}>Re-analyse</button>
     </div>
 
     {#each $recommendations as rec}
@@ -560,7 +628,7 @@
       {/if}
       <button class="btn-primary" style="width:100%;padding:0.875rem" disabled={selectedCount === 0} on:click={generate}>
         Generate bullets for {selectedCount} project{selectedCount !== 1 ? 's' : ''}
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="margin-left:8px">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
           <line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/>
         </svg>
       </button>
@@ -570,7 +638,7 @@
 
   <div style="padding-top:0.5rem">
     <button class="btn-ghost" on:click={() => step.set(1)}>
-      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="margin-right:4px">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
         <line x1="19" y1="12" x2="5" y2="12"/><polyline points="12 19 5 12 12 5"/>
       </svg>
       Back
@@ -602,8 +670,8 @@
           {copiedIdx === -1 ? '✓ Copied all' : 'Copy all'}
         </button>
       {/if}
-      <button class="btn-ghost" on:click={() => { step.set(2); resetGeneration(); }}>← Projects</button>
-      <button class="btn-ghost" on:click={() => { step.set(1); resetGeneration(); resetParse(); }}>Start over</button>
+      <button class="btn-ghost" on:click={() => { abortInFlight('optimize'); step.set(2); resetGeneration(); }}>← Projects</button>
+      <button class="btn-ghost" on:click={() => { abortInFlight('optimize'); step.set(1); resetGeneration(); resetParse(); }}>Start over</button>
     </div>
   </div>
 
@@ -1085,5 +1153,17 @@
     border: 1px solid var(--red-border);
     color: #fca5a5;
     font-size: 0.8125rem;
+  }
+
+  /* ── Warning banner (F2 — partial parse failures) ──────────────────── */
+  .warning-banner {
+    display: flex;
+    align-items: flex-start;
+    gap: 0.625rem;
+    padding: 0.75rem 1rem;
+    border-radius: var(--radius-sm);
+    background: var(--amber-dim);
+    border: 1px solid var(--amber-border);
+    color: var(--amber);
   }
 </style>

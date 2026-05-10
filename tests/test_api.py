@@ -607,6 +607,8 @@ class TestUploadSizeCap:
     def test_size_check_runs_before_full_read(self):
         """The chunked reader bails after exceeding max_bytes — it does not read past the cap."""
         import asyncio
+        from typing import cast
+        from fastapi import UploadFile
         from app.main import _read_upload_capped
 
         class _StubUpload:
@@ -625,7 +627,9 @@ class TestUploadSizeCap:
         # 200 KB of payload, cap at 100 KB → expect 413 before second-half is read.
         stub = _StubUpload(b"x" * (200 * 1024))
         with pytest.raises(HTTPException) as exc_info:
-            asyncio.run(_read_upload_capped(stub, max_bytes=100 * 1024))
+            # cast: _StubUpload duck-types only the read() method we use here;
+            # full UploadFile would need ~10 abstract methods we don't exercise.
+            asyncio.run(_read_upload_capped(cast(UploadFile, stub), max_bytes=100 * 1024))
         assert exc_info.value.status_code == 413
         # Should have stopped reading well before consuming the whole buffer.
         assert stub._pos <= 100 * 1024 + 64 * 1024  # cap + one chunk overshoot
