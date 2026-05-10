@@ -15,6 +15,7 @@ import json
 import logging
 import re
 from collections.abc import AsyncGenerator
+from typing import Any
 
 import httpx
 
@@ -95,7 +96,9 @@ async def _groq_chat(
     json_mode: bool = False,
 ) -> str:
     """Non-streaming Groq call (OpenAI-compatible) — retries up to 3× on 429."""
-    payload = {
+    # dict[str, Any]: response_format is a nested dict, narrower inferred unions
+    # (bool | float | int | list[dict] | str) reject it.
+    payload: dict[str, Any] = {
         "model": settings.groq_model,
         "messages": _build_messages(messages, system),
         "temperature": temperature if temperature is not None else settings.llm_temperature,
@@ -633,6 +636,11 @@ class CVonRAGOrchestrator:
         )
 
         # OptimizationRequest.cap_total_bullets() guarantees a non-None int here.
+        # The assert lets the type checker narrow `int | None` → `int` for the
+        # rest of this function so comparisons / min() / range() / -= type-check.
+        assert request.total_bullets_requested is not None, (
+            "cap_total_bullets validator must run before orchestrator.run()"
+        )
         bullet_index      = 0
         bullets_remaining = request.total_bullets_requested
 
