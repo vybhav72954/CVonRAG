@@ -1,5 +1,6 @@
 <script>
   import { onMount } from 'svelte';
+  import { get } from 'svelte/store';
   import { parseCV, recommendProjects, optimizeResume, checkHealth, abortInFlight } from '$lib/api';
   import {
     step,
@@ -20,14 +21,34 @@
     backendMsg  = ok ? '' : reason;
   }
 
+  // Refresh-during-streaming guard: persistent stores already preserve parsed
+  // projects, JD, settings, and completed bullets across reloads, but the
+  // in-flight LLM stream cannot be resumed — those tokens are gone the moment
+  // the page unloads. Show the browser's native confirmation prompt so an
+  // accidental Cmd-R/F5 mid-generation doesn't burn a Groq quota silently.
+  function onBeforeUnload(e) {
+    const streaming =
+      get(genStatus)    === 'streaming' ||
+      get(parseStatus)  === 'uploading' ||
+      get(parseStatus)  === 'streaming' ||
+      get(recommendStatus) === 'loading';
+    if (streaming) {
+      e.preventDefault();
+      e.returnValue = '';  // Chrome requires returnValue to be set
+      return '';
+    }
+  }
+
   onMount(() => {
     refreshHealth();
     const onVisible = () => { if (document.visibilityState === 'visible') refreshHealth(); };
     document.addEventListener('visibilitychange', onVisible);
     window.addEventListener('focus', refreshHealth);
+    window.addEventListener('beforeunload', onBeforeUnload);
     return () => {
       document.removeEventListener('visibilitychange', onVisible);
       window.removeEventListener('focus', refreshHealth);
+      window.removeEventListener('beforeunload', onBeforeUnload);
     };
   });
 
