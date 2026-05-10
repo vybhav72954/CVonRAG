@@ -5,6 +5,21 @@
 
 const BASE = import.meta.env.VITE_API_URL ?? 'http://localhost:8000';
 
+// F8: production deploys that forget to set VITE_API_URL silently fall back to
+// localhost and surface as "Cannot reach backend" with no clue why. Catch the
+// misconfig at first load when the page itself is served from a non-local host.
+if (typeof window !== 'undefined' && !import.meta.env.VITE_API_URL) {
+  const host = window.location.hostname;
+  const isLocal = host === 'localhost' || host === '127.0.0.1' || host === '0.0.0.0';
+  if (!isLocal) {
+    console.warn(
+      `[CVonRAG] VITE_API_URL is not set; falling back to ${BASE}. ` +
+      `This page is served from "${host}", so backend calls will almost certainly fail. ` +
+      `Set VITE_API_URL=https://your-backend.example.com in the deploy environment.`
+    );
+  }
+}
+
 /** Default timeout for non-streaming requests (ms). */
 const REQUEST_TIMEOUT_MS = 90_000;
 /** Headers-arrival timeout for streaming requests (ms). After headers, the
@@ -32,6 +47,20 @@ function isCurrent(key, c) {
 
 function release(key, c) {
   if (active[key] === c) active[key] = null;
+}
+
+/**
+ * Abort the in-flight request for an endpoint family if any (F4).
+ * Used by the page to cancel an optimize stream when the user navigates back —
+ * F1's takeOver already does this when starting a new request, but if the user
+ * goes back and *doesn't* trigger a new one, the stream would otherwise keep
+ * burning LLM tokens until it completes naturally.
+ *
+ * @param {'parse' | 'recommend' | 'optimize'} key
+ */
+export function abortInFlight(key) {
+  active[key]?.abort();
+  active[key] = null;
 }
 
 // ── Error detail normaliser (F3) ─────────────────────────────────────────────
@@ -94,6 +123,10 @@ async function readSSEStream(resp, onEvent, onError) {
       for (const ev of events) onEvent(ev);
     }
   } catch (err) {
+    // F10: caller-initiated aborts (F1's takeOver, F4's abortInFlight, browser
+    // navigation) should never surface as an "interrupted" message. Real network
+    // failures still bubble through.
+    if (err.name === 'AbortError') return;
     onError?.(`Stream interrupted: ${err.message}`);
   }
 }

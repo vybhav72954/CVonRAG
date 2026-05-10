@@ -48,23 +48,25 @@ User → confirm      → POST /optimize → SSE bullets ←──────�
 
 ## 2. Choose your inference path
 
-As of the `spike/groq` branch, you have two options:
+The Groq + Ollama hybrid is on `master`. You have two options for the LLM:
 
 ### Option A: Groq API (recommended)
 
-Set `GROQ_API_KEY` in `.env`. All LLM calls route through Groq's free API (Llama 3.3 70B at ~500 tok/sec). Ollama is still needed for embeddings only (nomic-embed-text is tiny, runs fine on any hardware).
+Set `GROQ_API_KEY` in `.env`. All LLM calls route through Groq's free API (Llama 3.3 70B at ~500 tok/sec). Ollama is still needed for embeddings only (`nomic-embed-text` is tiny, runs fine on any hardware).
 
 **Pros:** Free, fast (~2-3 sec/bullet), 70B model quality, no GPU needed for LLM.
-**Cons:** Requires internet, rate-limited (30 req/min on free tier — fine for 60 batchmates used one-at-a-time).
+**Cons:** Requires internet, rate-limited (Groq free tier: 30 req/min). The backend caps `total_bullets_requested` at `GROQ_MAX_BULLETS_PER_REQUEST` (default 15) so a single `/optimize` call stays inside that quota even with a 4-iteration correction loop.
 
 ### Option B: Ollama local (fallback)
 
 Leave `GROQ_API_KEY` blank. All LLM calls go through local Ollama. Pick a model that fits your RAM.
 
 **Pros:** Fully offline, no API dependency.
-**Cons:** On your GTX 1650 (4GB VRAM), only qwen2.5:3b runs on GPU. Anything larger falls back to CPU (~60 sec/bullet).
+**Cons:** On a GTX 1650 (4GB VRAM), only `qwen2.5:3b` runs on GPU. Anything larger falls back to CPU (~60 sec/bullet).
 
 **Bottom line:** Use Groq. Switch to Ollama only if you need to work offline.
+
+> **Already set up?** Skip ahead to [Section 5](#5-running-the-app-every-session). Section 4 is one-time only — re-running it (especially the seeding step, 4G) can corrupt your Qdrant collection. See [Section 12 — Troubleshooting](#12-troubleshooting) for safe re-seeding.
 
 ---
 
@@ -82,14 +84,16 @@ Leave `GROQ_API_KEY` blank. All LLM calls go through local Ollama. Pick a model 
 
 ## 4. Setup — step by step
 
-Do these once. After this, every session is just 3 start commands (see Section 5).
+Do these once. After this, every session is just 4 start commands (see Section 5).
+
+> **Have you done this before?** Run `curl http://localhost:8000/health` after starting the backend (Section 5). If you see `"vector_count": 288` (or whatever you seeded), **skip 4G** — re-running the seeder appends new vectors and creates duplicates (see Section 12).
 
 ### 4A. Clone and install
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/cvonrag.git
-cd cvonrag
-git checkout spike/groq          # use the Groq-enabled branch
+git clone https://github.com/vybhav72954/CVonRAG.git
+cd CVonRAG
+# `master` is the working branch (Groq + Ollama hybrid). No need to switch.
 
 uv venv
 source .venv/bin/activate        # macOS/Linux
@@ -134,11 +138,7 @@ OLLAMA_LLM_MODEL=qwen2.5:3b
 ### 4C. Start Qdrant
 
 ```bash
-docker run -d \
-  --name qdrant \
-  -p 6333:6333 \
-  -v qdrant_storage:/qdrant/storage \
-  qdrant/qdrant:v1.12.4
+docker run -d --name qdrant -p 6333:6333 -v qdrant_storage:/qdrant/storage qdrant/qdrant:v1.12.4
 ```
 
 Verify: `curl http://localhost:6333/healthz`
@@ -164,12 +164,22 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 curl http://localhost:8000/health | python -m json.tool
 ```
 
-You should see `"status": "ok"`, `"qdrant_connected": true`. If using Groq, `"ollama_ok"` may be false for the LLM model — that's fine, only nomic-embed-text matters.
+The response distinguishes three independent backends:
+- `"qdrant_connected": true` — Qdrant is reachable
+- `"embed_ok": true` — Ollama has `nomic-embed-text` pulled (always required, even with Groq)
+- `"groq_ok": true` — Groq API reachable (only when `GROQ_API_KEY` is set)
+- `"ollama_ok": true` — Ollama LLM model is pulled (only relevant when `GROQ_API_KEY` is empty)
+
+`"status": "ok"` requires *the LLM you're using* + `embed_ok` + `qdrant_connected` to all be true. So with Groq configured, `ollama_ok` being false is expected and doesn't degrade status. With Groq blank, `groq_ok` being false is expected.
+
+`"vector_count"` shows how many style exemplars are seeded — `0` means you haven't run 4G yet.
 
 ### 4G. Seed Qdrant with Gold Standard CVs
 
+> **Run this exactly once.** `scripts/ingest_pdfs.py` mints a fresh UUID per bullet, so re-running it appends a second copy of every bullet — your retrieval will return duplicate exemplars to the LLM. If `vector_count` is already `> 0`, **stop and read [Section 12 — Troubleshooting](#12-troubleshooting) → "I want to re-seed Qdrant"**.
+
 ```bash
-# Preview what will be extracted (no writes):
+# Preview what will be extracted (no writes — safe to re-run):
 python scripts/ingest_pdfs.py --pdf_dir ~/good_cvs --dry_run
 
 # Actually seed (--skip_tag uses heuristic tagging, no LLM needed):
@@ -180,11 +190,12 @@ curl http://localhost:8000/health | python -m json.tool
 # → "vector_count": 288  (or however many bullets you have)
 ```
 
-To re-tag bullets with proper LLM-powered role types later (once Groq is configured):
-```bash
-python scripts/ingest_pdfs.py --pdf_dir ~/good_cvs
-# This time without --skip_tag, the LLM tags each bullet with role_type
-```
+The script POSTs in batches (default 50 per call). The backend caps any single `/ingest` request at `_MAX_BULLETS_PER_INGEST = 100` — so the seeder works fine but a hand-crafted call larger than 100 bullets will 422.
+
+**To upgrade tagging later (once Groq is configured):**
+The first run with `--skip_tag` gives every bullet `role_type=general`. To get proper per-bullet `role_type` (data_science, ml_engineering, etc.), you must wipe the collection first and re-seed without `--skip_tag` — see Section 12.
+
+**Protecting `/ingest` if exposed publicly:** set `INGEST_SECRET` in `.env` and pass it via `--ingest_secret` or the `X-Ingest-Secret` header. Constant-time comparison is enforced server-side.
 
 ### 4H. Install and start the frontend
 
@@ -209,22 +220,35 @@ docker start qdrant
 ollama serve
 
 # Terminal 3 — Backend
-cd cvonrag
-source .venv/bin/activate
+cd CVonRAG
+source .venv/bin/activate          # Windows: .venv\Scripts\activate
 uvicorn app.main:app --reload --port 8000
 
 # Terminal 4 — Frontend
-cd cvonrag/frontend
+cd CVonRAG/frontend
 npm run dev
 ```
 
 Then open http://localhost:5173 in your browser.
 
+**You do NOT need to re-run on a regular session:**
+- `uv pip install` (deps already installed)
+- `ollama pull nomic-embed-text` (model is on disk)
+- `python scripts/ingest_pdfs.py` (Qdrant volume `qdrant_storage` persists across `docker stop`/`start` — re-running will *duplicate* every bullet)
+- `cp .env.example .env` (would overwrite your secrets)
+- `npm install` (only after a `git pull` that changed `package.json`)
+
+If `curl http://localhost:8000/health` shows the expected `vector_count` and `status: ok`, you're good.
+
 ---
 
 ## 6. Testing
 
-All 243 tests are fully mocked — no live Ollama, Qdrant, or Groq needed.
+The full suite (~318 tests across 8 files) is fully mocked — no live Ollama, Qdrant, or Groq needed. Test counts grow with every audit, so verify the live count rather than trusting this number:
+
+```bash
+pytest --collect-only -q | tail -1     # → "318 tests collected" (or whatever today's count is)
+```
 
 ```bash
 # Run everything:
@@ -237,30 +261,20 @@ pytest tests/ -k "test_score"               # filter by name
 pytest --cov=app --cov-report=term-missing  # with coverage
 ```
 
-Expected output:
-```
-tests/test_models.py             35 passed
-tests/test_chains.py             16 passed
-tests/test_integration.py        14 passed
-tests/test_api.py                18 passed
-tests/test_char_limit_stress.py  40 passed
-tests/test_parser.py             36 passed
-tests/test_recommender.py        23 passed
-                                 ────────
-                                 243 passed
-```
+`tests/conftest.py` autouses a fixture that resets `INGEST_SECRET` to empty and disables rate limiting for the duration of each test. Tests that exercise auth or rate-limit explicitly opt in via `patch.object(settings, ...)`.
 
 ### What tests cover
 
 | File | What it tests |
 |------|---------------|
 | `test_models.py` | Pydantic schema validation, field constraints, edge cases |
-| `test_chains.py` | `_clean_bullet`, `_strip_json_fences`, metric preservation, tone inference |
+| `test_chains.py` | LLM helpers, `_clean_bullet`, `_strip_json_fences`, fact-scoring, char-limit loop, Groq retry |
 | `test_integration.py` | Full pipeline: JD analysis → scoring → retrieval → generation |
-| `test_api.py` | All FastAPI endpoints, SSE format, file upload validation |
+| `test_api.py` | All FastAPI endpoints, SSE format, file upload validation, rate limit, ingest auth |
 | `test_char_limit_stress.py` | Char-limit loop convergence, Unicode counting, boundary conditions |
 | `test_parser.py` | PDF/DOCX extraction, LLM fact extraction, streaming pipeline |
 | `test_recommender.py` | Project scoring (mean-of-top-3), recommendation ranking, reason generation |
+| `test_vector_store.py` | Qdrant retrieval, embedding retry/backoff, `role_type` payload coercion |
 
 ---
 
@@ -290,16 +304,16 @@ Phase 4: BulletAlchemist — generate bullet + ±2 char-limit correction loop
 Phase 5: CVonRAGOrchestrator — stream tokens via SSE, yield final bullets
 ```
 
-### LLM routing (spike/groq branch)
+### LLM routing
 
-All LLM calls go through `_ollama_chat()` and `_ollama_stream()` in `chains.py`. These check `settings.groq_api_key`:
+All LLM calls go through `_ollama_chat()` and `_ollama_stream()` in `chains.py`. These check `settings.groq_api_key` (the `_using_groq()` helper):
 
-- **Key set:** Routes to `_groq_chat()` / `_groq_stream()` which hit Groq's OpenAI-compatible API.
+- **Key set:** Routes to `_groq_chat()` / `_groq_stream()` which hit Groq's OpenAI-compatible API. 429s honour `Retry-After` (3 attempts).
 - **Key empty:** Falls back to `_ollama_chat_inner()` / `_ollama_stream_inner()` which hit local Ollama.
 
-Embeddings always go through Ollama (nomic-embed-text in `vector_store.py`).
+Embeddings always go through Ollama (`nomic-embed-text` in `vector_store.py`) — Groq doesn't expose a 768-dim-compatible embedding endpoint.
 
-`parser.py` also uses `_ollama_chat()` from chains (deferred import to avoid circular deps), so CV parsing also routes through Groq when configured.
+`parser.py` and `recommender.py` both reuse `_ollama_chat()` from `chains.py` (deferred import in `parser.py` to avoid circular deps), so CV parsing and recommendation reasons also route through Groq when configured.
 
 ### The content/style firewall
 
@@ -377,20 +391,24 @@ Interactive docs: http://localhost:8000/docs
 
 ## 11. Environment variables
 
+`.env.example` is the canonical reference. The tables below list the most-touched settings; everything else lives in `app/config.py`.
+
 ### Groq (recommended)
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `GROQ_API_KEY` | *(empty)* | Set to enable Groq. Get at console.groq.com |
 | `GROQ_MODEL` | `llama-3.3-70b-versatile` | Groq model name |
+| `GROQ_BASE_URL` | `https://api.groq.com/openai/v1` | Override only if proxying |
+| `GROQ_MAX_BULLETS_PER_REQUEST` | `15` | Hard cap per `/optimize` so a single request can't blow the 30 req/min free-tier quota (15 bullets × 4 iterations ≈ 62 calls) |
 
-### Ollama (fallback for LLM, always used for embeddings)
+### Ollama (LLM fallback, always used for embeddings)
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `OLLAMA_BASE_URL` | `http://localhost:11434` | Ollama server URL |
-| `OLLAMA_LLM_MODEL` | `qwen2.5:14b` | Only used when GROQ_API_KEY is empty |
-| `OLLAMA_EMBED_MODEL` | `nomic-embed-text` | Always used for embeddings |
+| `OLLAMA_LLM_MODEL` | `qwen2.5:3b` | Only used when `GROQ_API_KEY` is empty. `3b` fits 4 GB VRAM. |
+| `OLLAMA_EMBED_MODEL` | `nomic-embed-text` | Always used for embeddings — don't change unless the new model is also 768-dim |
 
 ### Qdrant
 
@@ -407,21 +425,65 @@ Interactive docs: http://localhost:8000/docs
 |----------|---------|-------------|
 | `RETRIEVAL_TOP_K` | `5` | Number of style exemplars to retrieve |
 | `CHAR_LOOP_MAX_ITERATIONS` | `4` | Max correction loop iterations |
-| `CHAR_TOLERANCE` | `2` | Acceptable chars from target (±) |
-| `LLM_TEMPERATURE` | `0.3` | LLM temperature |
+| `CHAR_TOLERANCE` | `2` | Acceptable chars from target (±) — don't lower below 2 |
+| `LLM_TEMPERATURE` | `0.3` | LLM temperature — keep ≤ 0.5 |
 | `LLM_MAX_TOKENS` | `512` | Max output tokens |
+| `BULLET_STREAM_CHUNK_DELAY` | `0.025` | Inter-word delay (s) for the typewriter. Set `0` in CI/tests. |
+
+### Rate limiting & admin
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `RATE_LIMIT_ENABLED` | `true` | Disable for local dev / load tests |
+| `RATE_LIMIT_WINDOW` | `60` | Window in seconds. **All routes must share one window** (enforced) |
+| `RATE_LIMIT_PARSE` | `10` | `/parse` calls per IP per window |
+| `RATE_LIMIT_RECOMMEND` | `20` | `/recommend` calls per IP per window |
+| `RATE_LIMIT_OPTIMIZE` | `5` | `/optimize` calls per IP per window |
+| `INGEST_SECRET` | *(empty)* | Required `X-Ingest-Secret` header for `/ingest` when set. Constant-time comparison. **Set this before exposing the API publicly.** |
 
 ### App
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `APP_ENV` | `development` | Environment name |
-| `CORS_ORIGINS` | `["*"]` | Restrict before deploying |
+| `APP_ENV` | `development` | Set to `production` on deploy |
+| `CORS_ORIGINS` | `["http://localhost:5173"]` | JSON-encoded list. **Replace with your real frontend URL before deploying** — a warning fires at startup if you leave the dev default in production |
+| `LOG_LEVEL` | `INFO` | `DEBUG` for verbose traces |
 | `PORT` | `8000` | Backend port |
 
 ---
 
 ## 12. Troubleshooting
+
+### I want to re-seed Qdrant (or I think it's already seeded)
+
+`scripts/ingest_pdfs.py` is **not idempotent** — every run mints fresh UUIDs and *appends*, so re-running with the same PDFs gives you 2× the bullets. Symptoms: retrieval returns near-duplicate exemplars, `vector_count` jumps to a multiple of 288, or the LLM starts copying-pasting the same phrasing patterns.
+
+**Check first** — is the collection already seeded?
+```bash
+curl http://localhost:8000/health | python -m json.tool
+# "vector_count": 288 → already seeded, do nothing
+# "vector_count": 576 → seeded twice, see "wipe and re-seed" below
+# "vector_count": 0   → run the seeder once (Section 4G)
+```
+
+**Wipe and re-seed** (the only safe way to re-run):
+```bash
+# 1. Drop the collection (irreversible — you'll have to re-seed)
+curl -X DELETE http://localhost:6333/collections/gold_standard_cvs
+
+# 2. Verify it's gone
+curl http://localhost:8000/health | python -m json.tool
+# → "collection_exists": false, "vector_count": 0
+
+# 3. Seed cleanly. The collection is auto-recreated on first ingest.
+python scripts/ingest_pdfs.py --pdf_dir ~/good_cvs --skip_tag
+```
+
+If you want LLM-tagged `role_type` instead of all-`general`, drop `--skip_tag` (Groq must be configured; takes ~10 min for 288 bullets at the seeding script's 2.2 s/req throttle).
+
+### Health check shows "groq_ok: false"
+
+You set `GROQ_API_KEY` but the key is wrong, expired, or your network can't reach `api.groq.com`. Check the key at console.groq.com and try `curl https://api.groq.com/openai/v1/models -H "Authorization: Bearer $GROQ_API_KEY"`.
 
 ### "httpx.ReadTimeout" or very slow generation
 
@@ -433,7 +495,7 @@ The `/recommend` endpoint has a 90-second browser timeout. If using local Ollama
 
 ### Health check shows "ollama_ok: false"
 
-If using Groq, this only matters for embedding. Make sure `ollama serve` is running and `nomic-embed-text` is pulled. The LLM model doesn't need to be pulled when using Groq.
+If using Groq, this only flags the *Ollama LLM model* — and Groq is handling LLM, so this field is irrelevant when `groq_ok: true`. The one that *does* matter regardless of LLM choice is `embed_ok` (Ollama must have `nomic-embed-text` pulled for embeddings). If `embed_ok` is false: `ollama pull nomic-embed-text` and ensure `ollama serve` is running.
 
 ### "collection_exists: false" or "vector_count: 0"
 
@@ -457,9 +519,25 @@ docker run -d --name qdrant -p 6333:6333 -v qdrant_storage:/qdrant/storage qdran
 
 Check that `VITE_API_URL` in `frontend/.env` matches your backend port (default: `http://localhost:8000`). Check browser console for CORS errors — if deploying, set `CORS_ORIGINS` in `.env`.
 
-### Tests fail after Groq swap
+### 429 "Rate limit exceeded" from `/parse`, `/recommend`, or `/optimize`
 
-Make sure you're on the `spike/groq` branch. The test mocks were updated to match the new `_ollama_chat` routing in `parser.py`. Run `pytest -x` to see the first failure.
+The backend's per-IP sliding-window limiter kicked in. Wait the seconds shown in the response, or set `RATE_LIMIT_ENABLED=false` in `.env` for local dev. Defaults: `/parse` 10/min, `/recommend` 20/min, `/optimize` 5/min.
+
+### 422 "total_bullets_requested exceeds the server cap"
+
+You're using Groq and asked for more bullets than `GROQ_MAX_BULLETS_PER_REQUEST` (default 15). Either reduce `max_bullets_per_project` × number of selected projects, or raise the cap in `.env` (only safe if you're on a paid Groq plan).
+
+### 422 from `/ingest` with "Input should be 'general' | ..."
+
+Your bullet's `role_type` doesn't match the `RoleType` enum. The seeding script handles this; if you're calling `/ingest` by hand, use one of: `software_engineering`, `data_science`, `ml_engineering`, `product_management`, `quant_finance`, `general`.
+
+### 403 "Invalid or missing X-Ingest-Secret header"
+
+You set `INGEST_SECRET` in `.env`. The seeding script reads it from `.env` automatically; for hand-rolled calls, add `-H "X-Ingest-Secret: <your-secret>"`.
+
+### Tests fail
+
+Run `pytest -x` to see the first failure. If a test references a setting your local `.env` overrides, the autouse fixture in `tests/conftest.py` should be resetting it — check that the test isn't bypassing the fixture with its own `patch.object`. You should be on `master` (or a feature branch off it).
 
 ---
 
@@ -472,13 +550,18 @@ ollama serve                      # Terminal 2
 uvicorn app.main:app --reload     # Terminal 3 (venv activated)
 cd frontend && npm run dev        # Terminal 4
 
-# ── One-time admin ───────────────────────────────────────────
+# ── One-time admin (DO NOT re-run on a primed DB!) ───────────
+python scripts/ingest_pdfs.py --pdf_dir ~/good_cvs --skip_tag
+
+# ── Re-seeding (only when you actually need to) ──────────────
+curl -X DELETE http://localhost:6333/collections/gold_standard_cvs
 python scripts/ingest_pdfs.py --pdf_dir ~/good_cvs --skip_tag
 
 # ── Testing ──────────────────────────────────────────────────
-pytest                            # all 243 tests
+pytest                            # full suite (~318 tests)
 pytest -x                         # stop on first failure
 pytest --cov=app                  # with coverage
+pytest --collect-only -q | tail -1   # verify live test count
 
 # ── Health check ─────────────────────────────────────────────
 curl http://localhost:8000/health | python -m json.tool

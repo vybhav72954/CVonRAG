@@ -1,6 +1,6 @@
 <script>
   import { onMount } from 'svelte';
-  import { parseCV, recommendProjects, optimizeResume, checkHealth } from '$lib/api';
+  import { parseCV, recommendProjects, optimizeResume, checkHealth, abortInFlight } from '$lib/api';
   import {
     step,
     parsedProjects, parseStatus, parseProgress, parseError, parseWarnings, resetParse,
@@ -10,13 +10,25 @@
     isUploading, isRecommending, isGenerating,
   } from '$lib/stores';
 
-  // ── Backend health check on mount ──────────────────────────────────────────
+  // ── Backend health check (F6) — also re-runs on focus/visibility ────────
   let backendDown = false;
   let backendMsg  = '';
 
-  onMount(async () => {
+  async function refreshHealth() {
     const { ok, reason } = await checkHealth();
-    if (!ok) { backendDown = true; backendMsg = reason; }
+    backendDown = !ok;
+    backendMsg  = ok ? '' : reason;
+  }
+
+  onMount(() => {
+    refreshHealth();
+    const onVisible = () => { if (document.visibilityState === 'visible') refreshHealth(); };
+    document.addEventListener('visibilitychange', onVisible);
+    window.addEventListener('focus', refreshHealth);
+    return () => {
+      document.removeEventListener('visibilitychange', onVisible);
+      window.removeEventListener('focus', refreshHealth);
+    };
   });
 
   // ── Step 1: Upload & Parse ────────────────────────────────────────────────
@@ -267,7 +279,12 @@
     <div
       class="dropzone-inner"
       on:click={() => fileInput.click()}
-      on:keydown={e => e.key === 'Enter' && fileInput.click()}
+      on:keydown={e => {
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault();  // Space on a focused element scrolls otherwise
+          fileInput.click();
+        }
+      }}
       role="button" tabindex="0"
     >
       <div class="drop-icon float-icon">
@@ -518,7 +535,7 @@
         <h2 class="section-title">AI Recommendation</h2>
         <p class="section-subtitle">Toggle projects to include in your optimised bullets.</p>
       </div>
-      <button class="btn-ghost" on:click={() => recommendStatus.set('idle')}>Re-analyse</button>
+      <button class="btn-ghost" on:click={() => { abortInFlight('recommend'); resetRecommend(); }}>Re-analyse</button>
     </div>
 
     {#each $recommendations as rec}
@@ -632,8 +649,8 @@
           {copiedIdx === -1 ? '✓ Copied all' : 'Copy all'}
         </button>
       {/if}
-      <button class="btn-ghost" on:click={() => { step.set(2); resetGeneration(); }}>← Projects</button>
-      <button class="btn-ghost" on:click={() => { step.set(1); resetGeneration(); resetParse(); }}>Start over</button>
+      <button class="btn-ghost" on:click={() => { abortInFlight('optimize'); step.set(2); resetGeneration(); }}>← Projects</button>
+      <button class="btn-ghost" on:click={() => { abortInFlight('optimize'); step.set(1); resetGeneration(); resetParse(); }}>Start over</button>
     </div>
   </div>
 
