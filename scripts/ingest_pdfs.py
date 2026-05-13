@@ -276,11 +276,18 @@ def _parse_tag_response(raw: str) -> dict:
 
 
 def tag_bullet_ollama(bullet_text: str, ollama_url: str, model: str, timeout: int = 120) -> dict:
-    """Call Ollama to tag a single bullet with style metadata."""
+    """Call Ollama to tag a single bullet with style metadata.
+
+    `format: "json"` constrains Ollama's sampler to emit only valid JSON
+    tokens — required for small instruction-tuned models (qwen2.5:3b,
+    llama3.2:3b, etc.) that otherwise ignore "return only JSON" instructions
+    and produce prose like 'Here is the revised bullet point: ...'.
+    """
     payload = {
         "model": model,
         "messages": [{"role": "user", "content": f'Bullet: "{bullet_text}"'}],
         "stream": False,
+        "format": "json",
         "options": {"temperature": 0.0, "num_predict": 512, "num_ctx": 2048},
         "system": _TAGGING_SYSTEM,
     }
