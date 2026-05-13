@@ -355,6 +355,9 @@ async def extract_facts(project: RawProject) -> list[CoreFact]:
         bullets = bullets[:_EXTRACT_MAX_BULLETS]
     bullets_text = "\n".join(f"- {b}" for b in bullets)
 
+    # Import the breaker exception lazily to keep parser.py's circular-import
+    # surface unchanged (it already deferred _ollama_chat above).
+    from app.chains import HostedLLMQuotaExhausted
     try:
         raw = await _ollama_chat(
             system=_EXTRACT_SYSTEM,
@@ -366,6 +369,15 @@ async def extract_facts(project: RawProject) -> list[CoreFact]:
         raw_facts = json.loads(raw)
         if not isinstance(raw_facts, list):
             raise ValueError("LLM returned non-list")
+    except HostedLLMQuotaExhausted:
+        # Quota exhaustion is not a per-project failure — it's a session-wide
+        # condition where every subsequent call will also fail. Falling back
+        # to "first 4 bullets verbatim" for each project would silently hand
+        # the user a parsed-but-stripped CV (no tools, no metrics, no
+        # outcomes), which then floors downstream scoring. Let it propagate
+        # so parse_and_stream can abort the SSE cleanly with a user-facing
+        # quota message and the user knows to retry once the limit resets.
+        raise
     except Exception as exc:
         logger.warning("Fact extraction failed for '%s': %s — falling back.", project.title, exc)
         # Fallback: first 4 bullets become facts verbatim
@@ -442,6 +454,8 @@ async def parse_and_stream(
     total_facts     = 0
     yielded_projects = 0
 
+    from app.chains import HostedLLMQuotaExhausted
+
     for i, raw_proj in enumerate(raw_projects):
         yield ("progress", {
             "message": f"Extracting: {raw_proj.title}",
@@ -449,7 +463,15 @@ async def parse_and_stream(
             "total":   total,
         })
 
-        facts = await extract_facts(raw_proj)
+        try:
+            facts = await extract_facts(raw_proj)
+        except HostedLLMQuotaExhausted as exc:
+            # No point continuing — every subsequent extract_facts call will
+            # also raise via the circuit breaker. Emit a single clean error
+            # and stop, instead of N copies of the same message and a
+            # partially-parsed CV with stripped-down facts.
+            yield ("error", {"error_message": str(exc)})
+            return
 
         # Guard: every project must have at least one fact
         if not facts:

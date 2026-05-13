@@ -88,8 +88,34 @@ class TestHealth:
             resp = client.get("/health")
         assert resp.status_code == 200
         body = resp.json()
-        for field in ("status", "model", "llm_backend", "qdrant_connected", "ollama_ok", "groq_ok", "embed_ok"):
+        for field in (
+            "status", "model", "llm_backend", "llm_provider",
+            "qdrant_connected", "ollama_ok", "groq_ok", "llm_ok", "embed_ok",
+        ):
             assert field in body
+
+    def test_reports_active_provider_openrouter(self, client):
+        """When LLM_PROVIDER=openrouter + key is set, /health must surface
+        openrouter as the active provider, model from openrouter_model, and
+        groq_ok=False even if a Groq key happens to be present.
+        """
+        from app.config import get_settings
+        settings = get_settings()
+        with patch("app.main.collection_info", new=AsyncMock(return_value={
+            "qdrant_connected": True, "collection_exists": True, "vector_count": 288,
+        })), patch("httpx.AsyncClient", new=MockAsyncClient), \
+             patch.object(settings, "llm_provider", "openrouter"), \
+             patch.object(settings, "openrouter_api_key", "sk-or-v1-test"), \
+             patch.object(settings, "openrouter_model", "meta-llama/test-model"):
+            resp = client.get("/health")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["llm_provider"] == "openrouter"
+        assert body["llm_backend"] == "openrouter"
+        assert body["model"] == "meta-llama/test-model"
+        # groq_ok stays False even though the reachability path is mocked-failing —
+        # the key invariant is that "groq_ok" only ever flips true when groq is active.
+        assert body["groq_ok"] is False
 
 
 # ── POST /ingest ──────────────────────────────────────────────────────────────

@@ -190,11 +190,13 @@ class RecommendResponse(BaseModel):
 
 class HealthResponse(BaseModel):
     status: str = "ok"
-    llm_backend: str                  # "groq" or "ollama"
+    llm_backend: str                  # "groq" | "openrouter" | "ollama"
+    llm_provider: str = "ollama"      # mirrors llm_backend; named for the LLM_PROVIDER env var
     model: str                        # active LLM model name
     qdrant_connected: bool
     collection_exists: bool
     vector_count: int = 0
-    groq_ok: bool = False             # Groq API reachable (only relevant when using Groq)
-    ollama_ok: bool = False           # Ollama LLM model loaded (only relevant when using Ollama)
-    embed_ok: bool = False            # Ollama embed model loaded (always required)
+    llm_ok: bool = False              # active hosted LLM provider reachable (groq or openrouter)
+    groq_ok: bool = False              # Back-compat: True only when active provider is groq AND reachable
+    ollama_ok: bool = False            # Ollama LLM model loaded (only relevant when using Ollama)
+    embed_ok: bool = False             # Ollama embed model loaded (always required)

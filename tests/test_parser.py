@@ -507,6 +507,33 @@ class TestParseAndStream:
         assert "done"    in types
 
     @pytest.mark.asyncio
+    async def test_quota_exhausted_aborts_stream_cleanly(self):
+        """HostedLLMQuotaExhausted on extract_facts must abort the whole parse
+        with a single error event — NOT silently fall back to bullet-verbatim
+        facts for every project. The latter produces a parsed-but-junk CV (no
+        tools, no metrics, no outcomes) that floors downstream scoring.
+        """
+        from app.chains import HostedLLMQuotaExhausted
+        with patch("app.parser.parse_docx_bytes", return_value=[
+            RawProject("P1", ["b1"]),
+            RawProject("P2", ["b2"]),
+            RawProject("P3", ["b3"]),
+        ]), patch(
+            "app.chains._ollama_chat",
+            new=AsyncMock(side_effect=HostedLLMQuotaExhausted(1074.0)),
+        ):
+            events = [(et, d) async for et, d in
+                      parse_and_stream(b"x", "test.docx")]
+
+        types = [e[0] for e in events]
+        # Exactly one error event, no project events, no done event.
+        assert types.count("error") == 1, f"Expected 1 error event, got types={types}"
+        assert "project" not in types, "Must not yield partial/degraded projects on quota exhaustion"
+        assert "done" not in types, "Must not signal completion on quota exhaustion"
+        error_event = next(d for et, d in events if et == "error")
+        assert "quota exhausted" in error_event["error_message"].lower()
+
+    @pytest.mark.asyncio
     async def test_caps_facts_at_project_data_max(self):
         """N5: LLM returning >12 facts must not blow up ProjectData validation.
 

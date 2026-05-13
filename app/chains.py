@@ -14,6 +14,7 @@ import asyncio
 import json
 import logging
 import re
+import time as _time
 from collections.abc import AsyncGenerator
 from typing import Any
 
@@ -62,9 +63,36 @@ async def close_http() -> None:
 # LLM helpers — route to Groq (if GROQ_API_KEY set) or Ollama (fallback)
 # ═════════════════════════════════════════════════════════════════════════════
 
+def _hosted_llm_config() -> tuple[str, str, str] | None:
+    """Resolve the active hosted-LLM provider.
+
+    Returns (api_key, base_url, model) for the selected provider, or None
+    if no hosted provider is configured — in which case callers fall back
+    to local Ollama. The provider selector is `settings.llm_provider`; a
+    configured-but-empty key on the selected slot also returns None.
+    """
+    if settings.llm_provider == "openrouter" and settings.openrouter_api_key:
+        return (
+            settings.openrouter_api_key,
+            settings.openrouter_base_url.rstrip("/"),
+            settings.openrouter_model,
+        )
+    if settings.llm_provider == "groq" and settings.groq_api_key:
+        return (
+            settings.groq_api_key,
+            settings.groq_base_url.rstrip("/"),
+            settings.groq_model,
+        )
+    return None
+
+
 def _using_groq() -> bool:
-    """True when a Groq API key is configured."""
-    return bool(settings.groq_api_key)
+    """Historic name — True iff *any* hosted LLM is configured.
+
+    Kept for back-compat with existing call sites in chains.py and
+    main.py. The underlying check is provider-agnostic.
+    """
+    return _hosted_llm_config() is not None
 
 
 def _build_messages(messages: list[dict], system: str | None) -> list[dict]:
@@ -78,6 +106,67 @@ def _build_messages(messages: list[dict], system: str | None) -> list[dict]:
 
 _GROQ_MAX_RETRIES = 3
 _GROQ_RETRY_AFTER_DEFAULT = 10.0  # seconds when Retry-After header is absent
+
+
+# ── Quota-exhausted circuit breaker ──────────────────────────────────────────
+#
+# Once Groq returns a 429 with Retry-After > cap (daily/monthly quota empty),
+# every subsequent call within that window will also fail with 429. Without
+# this state, the parser/orchestrator keep firing doomed calls back-to-back,
+# each one burning a request slot on Groq's side and ~50ms of client latency
+# just to learn what we already know. The breaker latches "quota exhausted
+# until monotonic time T" so subsequent _groq_chat / _groq_stream calls fail
+# instantly without touching the network. State is per-process — fine for
+# single-uvicorn deployments; multi-worker setups get one breaker per worker,
+# which is acceptable (worst case: N parallel failures instead of 1, where N
+# is the worker count, still vastly better than today).
+
+_quota_exhausted_until: float = 0.0  # monotonic clock; 0.0 = circuit closed
+
+
+def _check_quota_circuit() -> None:
+    """Raise HostedLLMQuotaExhausted immediately if we're inside the cooldown window."""
+    if _quota_exhausted_until <= 0:
+        return
+    remaining = _quota_exhausted_until - _time.monotonic()
+    if remaining > 0:
+        raise HostedLLMQuotaExhausted(remaining)
+
+
+def _trip_quota_circuit(retry_after_seconds: float) -> None:
+    """Latch the circuit open until `retry_after_seconds` from now."""
+    global _quota_exhausted_until
+    _quota_exhausted_until = _time.monotonic() + retry_after_seconds
+
+
+def _reset_quota_circuit() -> None:
+    """Test hook — clear the breaker so tests don't bleed state into each other."""
+    global _quota_exhausted_until
+    _quota_exhausted_until = 0.0
+
+
+class HostedLLMQuotaExhausted(RuntimeError):
+    """Raised when the active hosted-LLM provider's Retry-After exceeds
+    `groq_max_retry_wait_seconds`.
+
+    Per-minute rate limits typically cite ≤60s. Values in the thousands of
+    seconds mean daily/monthly quota exhaustion — there's no point blocking
+    the request for an hour, so we fail fast with this typed exception so
+    callers can surface a clean "quota exhausted" message to the user and
+    free the request slot. Raised by both Groq and OpenRouter calls (any
+    OpenAI-compatible hosted provider behind `_hosted_llm_config()`).
+    """
+
+    def __init__(self, retry_after_seconds: float):
+        self.retry_after_seconds = retry_after_seconds
+        minutes = retry_after_seconds / 60.0
+        provider = settings.llm_provider
+        super().__init__(
+            f"Quota exhausted on {provider} — server asked us to wait "
+            f"{retry_after_seconds:.0f}s ({minutes:.1f} min). "
+            f"Either wait, switch to Ollama (clear the {provider} API key), "
+            f"or flip LLM_PROVIDER / upgrade your plan."
+        )
 
 
 def _groq_retry_wait(response: httpx.Response) -> float:
@@ -95,11 +184,23 @@ async def _groq_chat(
     max_tokens: int | None = None,
     json_mode: bool = False,
 ) -> str:
-    """Non-streaming Groq call (OpenAI-compatible) — retries up to 3× on 429."""
+    """Non-streaming hosted-LLM call (OpenAI-compatible) — retries up to 3× on 429.
+
+    Name kept as `_groq_chat` for historical reasons; routes to whichever
+    hosted provider `_hosted_llm_config()` resolves (Groq or OpenRouter).
+    """
+    # Circuit breaker: if a prior call learned the quota is exhausted, fail
+    # fast without burning another request slot. The breaker auto-clears once
+    # the cooldown has elapsed (next call retries the provider normally).
+    _check_quota_circuit()
+    cfg = _hosted_llm_config()
+    if cfg is None:
+        raise RuntimeError("No hosted LLM provider configured")
+    api_key, base_url, model = cfg
     # dict[str, Any]: response_format is a nested dict, narrower inferred unions
     # (bool | float | int | list[dict] | str) reject it.
     payload: dict[str, Any] = {
-        "model": settings.groq_model,
+        "model": model,
         "messages": _build_messages(messages, system),
         "temperature": temperature if temperature is not None else settings.llm_temperature,
         "max_tokens": max_tokens or settings.llm_max_tokens,
@@ -110,9 +211,9 @@ async def _groq_chat(
     for attempt in range(_GROQ_MAX_RETRIES):
         try:
             r = await get_http().post(
-                f"{settings.groq_base_url}/chat/completions",
+                f"{base_url}/chat/completions",
                 json=payload,
-                headers={"Authorization": f"Bearer {settings.groq_api_key}"},
+                headers={"Authorization": f"Bearer {api_key}"},
                 timeout=60.0,
             )
             r.raise_for_status()
@@ -123,9 +224,20 @@ async def _groq_chat(
         except httpx.HTTPStatusError as exc:
             if exc.response.status_code == 429 and attempt < _GROQ_MAX_RETRIES - 1:
                 wait = _groq_retry_wait(exc.response)
+                if wait > settings.groq_max_retry_wait_seconds:
+                    # Latch the circuit breaker so concurrent / subsequent calls
+                    # in this process fail instantly instead of each making
+                    # another doomed network roundtrip.
+                    _trip_quota_circuit(wait)
+                    logger.warning(
+                        "%s 429 (chat) — quota exhausted (Retry-After=%.0fs > cap=%ds), "
+                        "tripping circuit breaker for %.0fs and failing fast.",
+                        settings.llm_provider, wait, settings.groq_max_retry_wait_seconds, wait,
+                    )
+                    raise HostedLLMQuotaExhausted(wait) from exc
                 logger.warning(
-                    "Groq 429 (chat) — retry %d/%d after %.1fs",
-                    attempt + 1, _GROQ_MAX_RETRIES, wait,
+                    "%s 429 (chat) — retry %d/%d after %.1fs",
+                    settings.llm_provider, attempt + 1, _GROQ_MAX_RETRIES, wait,
                 )
                 await asyncio.sleep(wait)
             else:
@@ -137,9 +249,18 @@ async def _groq_stream(
     messages: list[dict],
     system: str | None = None,
 ) -> AsyncGenerator[str, None]:
-    """Streaming Groq call (OpenAI-compatible SSE) — retries up to 3× on 429."""
+    """Streaming hosted-LLM call (OpenAI-compatible SSE) — retries up to 3× on 429.
+
+    Name kept as `_groq_stream` for historical reasons; routes to whichever
+    hosted provider `_hosted_llm_config()` resolves (Groq or OpenRouter).
+    """
+    _check_quota_circuit()
+    cfg = _hosted_llm_config()
+    if cfg is None:
+        raise RuntimeError("No hosted LLM provider configured")
+    api_key, base_url, model = cfg
     payload = {
-        "model": settings.groq_model,
+        "model": model,
         "messages": _build_messages(messages, system),
         "temperature": settings.llm_temperature,
         "max_tokens": settings.llm_max_tokens,
@@ -149,9 +270,9 @@ async def _groq_stream(
         try:
             async with get_http().stream(
                 "POST",
-                f"{settings.groq_base_url}/chat/completions",
+                f"{base_url}/chat/completions",
                 json=payload,
-                headers={"Authorization": f"Bearer {settings.groq_api_key}"},
+                headers={"Authorization": f"Bearer {api_key}"},
                 timeout=60.0,
             ) as resp:
                 resp.raise_for_status()
@@ -172,9 +293,17 @@ async def _groq_stream(
         except httpx.HTTPStatusError as exc:
             if exc.response.status_code == 429 and attempt < _GROQ_MAX_RETRIES - 1:
                 wait = _groq_retry_wait(exc.response)
+                if wait > settings.groq_max_retry_wait_seconds:
+                    _trip_quota_circuit(wait)
+                    logger.warning(
+                        "%s 429 (stream) — quota exhausted (Retry-After=%.0fs > cap=%ds), "
+                        "tripping circuit breaker for %.0fs and failing fast.",
+                        settings.llm_provider, wait, settings.groq_max_retry_wait_seconds, wait,
+                    )
+                    raise HostedLLMQuotaExhausted(wait) from exc
                 logger.warning(
-                    "Groq 429 (stream) — retry %d/%d after %.1fs",
-                    attempt + 1, _GROQ_MAX_RETRIES, wait,
+                    "%s 429 (stream) — retry %d/%d after %.1fs",
+                    settings.llm_provider, attempt + 1, _GROQ_MAX_RETRIES, wait,
                 )
                 await asyncio.sleep(wait)
             else:
@@ -298,6 +427,23 @@ Do NOT rename it to "fact_id", "ID", "Id", or anything else.
 Schema:
 [{"id": "string", "relevance_score": float, "matched_jd_keywords": ["string"]}]"""
 
+# Envelope variant used ONLY on the json_mode retry. Groq's response_format
+# `{"type": "json_object"}` REQUIRES the model to return an object, which is
+# incompatible with the array-shaped primary schema above — without this
+# envelope the retry can only produce wrapped output like {"scored_facts": [...]}
+# which fails the isinstance(list) check and falls through to all-0.5 defaults
+# (the original "every project at 50%" bug). Asking for {"scores": [...]} up
+# front gives us a parseable response from json_mode and a known unwrap key.
+_FACT_SCORING_SYSTEM_ENVELOPE = """\
+You are a resume-fit scoring engine. Score each fact's relevance to the JD on 0.0–1.0.
+Return ONLY a valid JSON OBJECT with a single top-level key "scores" — no fences,
+no preamble. Echo the input "id" verbatim for every fact (do not invent, reorder,
+or drop ids). The id key MUST be named "id". Do NOT rename it to "fact_id", "ID",
+"Id", or anything else.
+
+Schema:
+{"scores": [{"id": "string", "relevance_score": float, "matched_jd_keywords": ["string"]}]}"""
+
 
 class SemanticMatcher:
     """Phase 2: analyse the JD and score every CoreFact for relevance."""
@@ -343,19 +489,54 @@ class SemanticMatcher:
             f"Facts:\n{json.dumps(payload, indent=2)}"
         )
         msgs = [{"role": "user", "content": prompt}]
-        raw  = await _ollama_chat(system=_FACT_SCORING_SYSTEM, messages=msgs, temperature=0.05)
+        # Budget output tokens by fact count. Each entry is ~60–90 chars
+        # (`{"id":"iNN","relevance_score":0.NN,"matched_jd_keywords":["a","b"]}`)
+        # = ~25 tokens. Settings default (`llm_max_tokens = 512`) caps at ~20
+        # facts; with 50+ facts across all projects the response was truncated
+        # mid-array, and every fact past the cut-off defaulted to 0.5, which
+        # rolled up to the "every top project at 50%" symptom (the displayed
+        # cap-at-50 effect because 0.5 defaults out-sort real low LLM scores
+        # in the top-3 mean rollup). Floor of 1024 covers small CVs cheaply.
+        scoring_max_tokens = max(settings.llm_max_tokens, 1024, len(payload) * 40)
+        raw  = await _ollama_chat(
+            system=_FACT_SCORING_SYSTEM,
+            messages=msgs,
+            temperature=0.05,
+            max_tokens=scoring_max_tokens,
+        )
         # Guard against valid-JSON-wrong-shape (P2): "null" parses fine but then
         # `for s in scores` raises TypeError; a dict-of-keys would silently pass
         # the `isinstance(s, dict)` filter as False and yield empty score_map.
         parsed = _safe_parse_json(raw)
         scores: list[dict] | None = parsed if isinstance(parsed, list) else None
         if scores is None:
-            logger.warning("Fact scoring returned non-list — retrying with json_mode. Raw: %.200s", raw)
+            logger.warning(
+                "Fact scoring returned non-list — retrying with json_mode envelope. Raw: %.200s",
+                raw,
+            )
+            # Use the envelope schema {"scores": [...]} on the retry — see the
+            # comment on _FACT_SCORING_SYSTEM_ENVELOPE for why bare-array prompts
+            # are incompatible with Groq's json_object response_format.
             raw = await _ollama_chat(
-                system=_FACT_SCORING_SYSTEM, messages=msgs, temperature=0.05, json_mode=True,
+                system=_FACT_SCORING_SYSTEM_ENVELOPE,
+                messages=msgs,
+                temperature=0.05,
+                max_tokens=scoring_max_tokens,
+                json_mode=True,
             )
             parsed = _safe_parse_json(raw)
-            scores = parsed if isinstance(parsed, list) else None
+            if isinstance(parsed, dict):
+                # Honor the envelope first ("scores"), then accept common aliases
+                # Groq's Llama has been seen to use ("scored_facts", "results").
+                for key in ("scores", "scored_facts", "results"):
+                    candidate = parsed.get(key)
+                    if isinstance(candidate, list):
+                        scores = candidate
+                        break
+            elif isinstance(parsed, list):
+                # Some models ignore the envelope instruction and return a bare
+                # list anyway — accept that too rather than discard valid data.
+                scores = parsed
         if scores is None:
             logger.warning(
                 "Fact scoring retry failed — assigning 0.5 to all. Raw: %.200s", raw
@@ -374,13 +555,18 @@ class SemanticMatcher:
             return s.get("id") or s.get("fact_id") or s.get("ID") or s.get("Id")
 
         score_map = {_entry_id(s): s for s in scores if isinstance(s, dict) and _entry_id(s)}
-        # If the LLM dropped/mangled most IDs (>50% of facts unmatched), the
-        # data is unreliable — log loudly so a regression is visible in
-        # production rather than silently degrading to 50% across the board.
+        # Any unmatched ids mean those facts default to 0.5, which out-sorts
+        # real low LLM scores in the project top-3 mean rollup and caps the
+        # displayed project match at 50%. Warn on ANY mismatch — even one
+        # missing fact can shift the visible ranking — so partial-response
+        # truncation or ID mangling is visible in logs rather than silent.
         unmatched = sum(1 for iid in ids if iid not in score_map)
-        if ids and unmatched > len(ids) // 2:
-            logger.warning(
-                "Fact scoring: %d/%d ids unmatched in LLM response — scores will default. Raw: %.200s",
+        if ids and unmatched > 0:
+            level = logging.WARNING if unmatched > len(ids) // 4 else logging.INFO
+            logger.log(
+                level,
+                "Fact scoring: %d/%d ids unmatched — those facts default to 0.5 "
+                "(may cap project score at 50%%). Raw: %.300s",
                 unmatched, len(ids), raw,
             )
         result = [
@@ -810,14 +996,73 @@ def _strip_json_fences(text: str) -> str:
     return text.strip()
 
 
+def _extract_first_json_value(text: str) -> str | None:
+    """Return the first balanced JSON object or array embedded in text.
+
+    Walks the string from the first `[` or `{`, tracking bracket depth while
+    respecting string literals (and their backslash escapes). Returns the
+    slice spanning the matched value, or None if no balanced value is found.
+
+    Defends against Groq's Llama 3.3 closing a valid JSON array and then
+    appending trailing prose like "Hope this helps!" — json.loads raises
+    "Extra data" on those, even though the array itself is valid.
+    """
+    start = -1
+    opener = ""
+    for i, c in enumerate(text):
+        if c == "[" or c == "{":
+            start = i
+            opener = c
+            break
+    if start < 0:
+        return None
+    closer = "]" if opener == "[" else "}"
+    depth = 0
+    in_str = False
+    escape = False
+    for i in range(start, len(text)):
+        c = text[i]
+        if in_str:
+            if escape:
+                escape = False
+            elif c == "\\":
+                escape = True
+            elif c == '"':
+                in_str = False
+        else:
+            if c == '"':
+                in_str = True
+            elif c == opener:
+                depth += 1
+            elif c == closer:
+                depth -= 1
+                if depth == 0:
+                    return text[start:i + 1]
+    return None
+
+
 def _safe_parse_json(text: str):
     """Parse fenced LLM JSON, returning None on JSONDecodeError.
+
+    Tries the stripped text first; on failure, falls back to extracting the
+    first balanced JSON object/array embedded in the response. This is a
+    strict superset of the original behaviour — clean JSON still round-trips,
+    and responses with trailing prose ("...scores]. Hope this helps!") or
+    leading explanation now parse instead of failing.
 
     Caller decides what shape it expects (dict vs list) via isinstance — guards
     against valid-JSON-wrong-shape outputs like "null", scalars, or arrays where
     a dict was expected (P1, P2).
     """
+    stripped = _strip_json_fences(text)
     try:
-        return json.loads(_strip_json_fences(text))
+        return json.loads(stripped)
+    except json.JSONDecodeError:
+        pass
+    sliced = _extract_first_json_value(stripped)
+    if sliced is None:
+        return None
+    try:
+        return json.loads(sliced)
     except json.JSONDecodeError:
         return None
