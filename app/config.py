@@ -8,7 +8,7 @@ Zero paid API keys required.
 from __future__ import annotations
 import logging
 from functools import lru_cache
-from typing import Annotated
+from typing import Annotated, Literal
 
 from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -22,8 +22,14 @@ class Settings(BaseSettings):
         extra="ignore",   # silently ignore unknown env vars
     )
 
-    # ── Groq (preferred — fast, free tier available) ────────────────────────
-    # Set GROQ_API_KEY to enable Groq; leave blank to fall back to Ollama.
+    # ── Hosted LLM provider selector ────────────────────────────────────────
+    # "groq" (default) or "openrouter". Picks which hosted-LLM slot the
+    # runtime reads. Empty key on the selected slot falls back to Ollama.
+    # Embeddings stay on Ollama regardless.
+    llm_provider: Literal["groq", "openrouter"] = "groq"
+
+    # ── Groq (primary hosted LLM) ───────────────────────────────────────────
+    # Set GROQ_API_KEY + LLM_PROVIDER=groq to route LLM calls through Groq.
     groq_api_key: str = ""
     groq_model: str = "llama-3.3-70b-versatile"
     groq_base_url: str = "https://api.groq.com/openai/v1"
@@ -31,6 +37,21 @@ class Settings(BaseSettings):
     # Groq free tier is 30 req/min; 15 bullets × 4 correction iterations = 62 calls (~2 min max).
     # Set higher only if you have a paid Groq plan.
     groq_max_bullets_per_request: int = 15
+    # Max seconds we'll honor the Retry-After header on a 429. Per-minute rate
+    # limits cite ≤60s; values far larger (often thousands of seconds) signal
+    # daily/monthly quota exhaustion, where blocking the request for an hour
+    # just hangs the frontend and ties up a backend slot. Above this, we raise
+    # immediately so the user sees a "quota exhausted" message instead of a
+    # generic timeout, and the slot frees up for any non-Groq fallbacks.
+    groq_max_retry_wait_seconds: int = 30
+
+    # ── OpenRouter (fallback hosted LLM, OpenAI-compatible) ─────────────────
+    # Set OPENROUTER_API_KEY + LLM_PROVIDER=openrouter to route through
+    # OpenRouter. The free Llama 3.3 70B model is the default. Get a key at
+    # https://openrouter.ai → Keys.
+    openrouter_api_key: str = ""
+    openrouter_model: str = "meta-llama/llama-3.3-70b-instruct:free"
+    openrouter_base_url: str = "https://openrouter.ai/api/v1"
 
     # ── Ollama (local fallback) ──────────────────────────────────────────────
     # Used when GROQ_API_KEY is not set, and always used for embeddings.
