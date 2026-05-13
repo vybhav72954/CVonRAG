@@ -30,6 +30,8 @@ from app.models import (
 from app.chains import (
     _clean_bullet,
     _strip_json_fences,
+    _extract_first_json_value,
+    _safe_parse_json,
     _format_facts,
     _format_exemplars,
     _pick_supporting_facts,
@@ -156,6 +158,65 @@ class TestStripJsonFences:
     def test_no_think_block_unchanged(self):
         raw = '[{"fact_id": "f-1", "relevance_score": 0.9}]'
         assert _strip_json_fences(raw) == raw
+
+
+# ── _extract_first_json_value + _safe_parse_json fallback ────────────────────
+
+class TestExtractFirstJsonValue:
+    """Robustness for Groq responses with trailing/leading prose around JSON."""
+
+    def test_returns_none_when_no_json(self):
+        assert _extract_first_json_value("just plain text, no brackets") is None
+
+    def test_extracts_bare_array(self):
+        assert _extract_first_json_value('[1, 2, 3]') == "[1, 2, 3]"
+
+    def test_extracts_bare_object(self):
+        assert _extract_first_json_value('{"k": "v"}') == '{"k": "v"}'
+
+    def test_strips_trailing_prose(self):
+        raw = '[{"id": "i0", "score": 0.9}]\n\nHope this helps!'
+        assert _extract_first_json_value(raw) == '[{"id": "i0", "score": 0.9}]'
+
+    def test_strips_leading_prose(self):
+        raw = 'Here are the scores: [{"id": "i0"}]'
+        assert _extract_first_json_value(raw) == '[{"id": "i0"}]'
+
+    def test_respects_brackets_inside_strings(self):
+        # The `]` inside the string value must not close the outer array.
+        raw = '[{"text": "scored [pre-cleaning] data"}]'
+        assert _extract_first_json_value(raw) == raw
+
+    def test_respects_escaped_quotes_inside_strings(self):
+        raw = '[{"text": "she said \\"hi\\""}]'
+        assert _extract_first_json_value(raw) == raw
+
+    def test_handles_nested_structures(self):
+        raw = '[{"a": [1, [2, 3]], "b": {"c": [4]}}]'
+        assert _extract_first_json_value(raw) == raw
+
+    def test_unbalanced_returns_none(self):
+        # Truncated mid-array — no matching close, so extraction fails.
+        assert _extract_first_json_value('[{"id": "i0"') is None
+
+
+class TestSafeParseJsonFallback:
+    """_safe_parse_json delegates to the extractor on JSONDecodeError."""
+
+    def test_parses_clean_array(self):
+        assert _safe_parse_json('[1, 2]') == [1, 2]
+
+    def test_parses_array_with_trailing_prose(self):
+        # Bug-reproducer: this is the exact failure mode from the user's log.
+        # Before the extractor fallback, json.loads raised "Extra data" and
+        # the function returned None, triggering the json_mode envelope retry.
+        result = _safe_parse_json(
+            '[{"id": "i0", "relevance_score": 0.7}]\n\nLet me know if you need more!'
+        )
+        assert result == [{"id": "i0", "relevance_score": 0.7}]
+
+    def test_returns_none_on_truly_malformed(self):
+        assert _safe_parse_json("definitely not json at all") is None
 
 
 # ── _format_facts ─────────────────────────────────────────────────────────────
@@ -419,6 +480,135 @@ class TestScoreFactsRetry:
         assert by_pid["p-A"].matched_jd_keywords == ["SARIMA"]
         assert by_pid["p-B"].matched_jd_keywords == []
 
+    @pytest.mark.anyio
+    async def test_scoring_max_tokens_scales_with_fact_count(self):
+        """The scoring call must request enough output tokens to fit all facts.
+
+        Settings default `llm_max_tokens=512` covers ~20 fact-entries; CVs with
+        50+ facts (5+ projects × 4–6 bullets each) overflowed the cap, Groq
+        truncated mid-array, and every fact past the cut-off defaulted to 0.5.
+        That defaulted-to-0.5 set out-sorted real low LLM scores in the top-3
+        mean rollup, producing the "every top project capped at 50%" symptom.
+        """
+        from app.models import ProjectData
+        # 30 facts across 3 projects (10 each) — well past the 512-token cap.
+        projects = [
+            ProjectData(
+                project_id=f"p-{i}",
+                title=f"P{i}",
+                core_facts=[
+                    CoreFact(fact_id=f"f-{i}-{j}", text=f"fact {i}-{j} text")
+                    for j in range(10)
+                ],
+            )
+            for i in range(3)
+        ]
+        good_json = "[" + ",".join(
+            f'{{"id":"i{i}","relevance_score":0.7,"matched_jd_keywords":[]}}'
+            for i in range(30)
+        ) + "]"
+        with patch(
+            "app.chains._ollama_chat", new=AsyncMock(return_value=good_json),
+        ) as mock_chat:
+            await SemanticMatcher().score_facts({}, projects)
+
+        # Inspect the kwargs passed to _ollama_chat — must include a max_tokens
+        # that covers all 30 facts (30 * 40 = 1200 minimum).
+        _, kwargs = mock_chat.call_args_list[0]
+        max_tokens = kwargs.get("max_tokens")
+        assert max_tokens is not None, "score_facts must pass max_tokens explicitly"
+        assert max_tokens >= 30 * 40, (
+            f"max_tokens={max_tokens} too low for 30 facts — Groq would truncate "
+            "the response and partial facts would default to 0.5."
+        )
+
+    @pytest.mark.anyio
+    async def test_parses_array_with_trailing_prose(self):
+        """Groq's Llama 3.3 often appends explanatory text after a closed JSON
+        array (e.g. "...]\\n\\nHope this helps!"). json.loads raises 'Extra data'
+        on that, so _safe_parse_json fell through to the json_mode retry — which
+        on Groq forces a JSON object response, breaking the array prompt and
+        sending every score to the 0.5 fallback. After the fix _safe_parse_json
+        extracts the first balanced JSON value, so this parses on the first try
+        and no retry happens.
+        """
+        from app.models import ProjectData
+        proj = ProjectData(
+            project_id="p-A",
+            title="Forecasting",
+            core_facts=[CoreFact(fact_id="f-1", text="Built SARIMA model")],
+        )
+        raw_with_prose = (
+            '[{"id": "i0", "relevance_score": 0.82, "matched_jd_keywords": ["SARIMA"]}]'
+            "\n\nHope this helps! Let me know if you need anything else."
+        )
+        with patch(
+            "app.chains._ollama_chat", new=AsyncMock(return_value=raw_with_prose),
+        ) as mock_chat:
+            result = await SemanticMatcher().score_facts({}, [proj])
+
+        assert mock_chat.call_count == 1, "Trailing prose should not trigger a retry"
+        assert result[0].relevance_score == 0.82
+        assert result[0].matched_jd_keywords == ["SARIMA"]
+
+    @pytest.mark.anyio
+    async def test_retry_unwraps_scores_envelope(self):
+        """Q-followup: Groq's json_mode forces a JSON object, so the array-shaped
+        primary prompt can't succeed under retry. The envelope retry asks for
+        {"scores": [...]} and unwraps it. Before the fix, the wrapped response
+        failed the isinstance(list) check and every fact got 0.5.
+        """
+        from app.models import ProjectData
+        proj = ProjectData(
+            project_id="p-A",
+            title="Forecasting",
+            core_facts=[CoreFact(fact_id="f-1", text="Built SARIMA model")],
+        )
+        # First call: garbage that won't parse, forcing the envelope retry.
+        bad_first = "totally not json"
+        # Retry: Groq's json_mode response wrapping the scores array.
+        wrapped = (
+            '{"scores": [{"id": "i0", "relevance_score": 0.74, '
+            '"matched_jd_keywords": ["forecasting"]}]}'
+        )
+        with patch(
+            "app.chains._ollama_chat",
+            new=AsyncMock(side_effect=[bad_first, wrapped]),
+        ) as mock_chat:
+            result = await SemanticMatcher().score_facts({}, [proj])
+
+        assert mock_chat.call_count == 2
+        # The retry must run with json_mode=True (Groq enforces object response).
+        _, second_kwargs = mock_chat.call_args_list[1]
+        assert second_kwargs.get("json_mode") is True
+        assert result[0].relevance_score == 0.74
+        assert result[0].matched_jd_keywords == ["forecasting"]
+
+    @pytest.mark.anyio
+    async def test_retry_unwraps_scored_facts_alias(self):
+        """Defence-in-depth: if Llama ignores the "scores" envelope key and
+        uses "scored_facts" (the exact key Groq emitted in the bug report log),
+        we still unwrap it instead of falling through to the 0.5 default.
+        """
+        from app.models import ProjectData
+        proj = ProjectData(
+            project_id="p-A",
+            title="Forecasting",
+            core_facts=[CoreFact(fact_id="f-1", text="Built SARIMA model")],
+        )
+        bad_first = "not json"
+        aliased = (
+            '{"scored_facts": [{"id": "i0", "relevance_score": 0.61, '
+            '"matched_jd_keywords": []}]}'
+        )
+        with patch(
+            "app.chains._ollama_chat",
+            new=AsyncMock(side_effect=[bad_first, aliased]),
+        ):
+            result = await SemanticMatcher().score_facts({}, [proj])
+
+        assert result[0].relevance_score == 0.61
+
     @pytest.mark.asyncio
     async def test_accepts_fact_id_alias_in_response(self):
         """Q4: Llama 3.3 routinely emits 'fact_id' instead of the prompted 'id',
@@ -463,6 +653,84 @@ def _make_http_status_error(status_code: int, retry_after: str | None = None) ->
     return resp, exc
 
 
+class TestHostedLLMConfig:
+    """_hosted_llm_config resolves the active hosted LLM provider.
+
+    Default (LLM_PROVIDER=groq + groq_api_key set) must return the Groq tuple
+    — guarantees zero behaviour change for the existing deployment.
+    Switching LLM_PROVIDER=openrouter with a key set must return OpenRouter's
+    tuple even if a Groq key is also present.
+    """
+
+    def test_returns_groq_tuple_by_default(self):
+        from app.chains import _hosted_llm_config, _using_groq, settings
+        with patch.object(settings, "llm_provider", "groq"), \
+             patch.object(settings, "groq_api_key", "gsk-test"), \
+             patch.object(settings, "groq_base_url", "https://api.groq.com/openai/v1"), \
+             patch.object(settings, "groq_model", "llama-3.3-70b-versatile"):
+            cfg = _hosted_llm_config()
+            assert cfg == ("gsk-test", "https://api.groq.com/openai/v1", "llama-3.3-70b-versatile")
+            assert _using_groq() is True
+
+    def test_picks_openrouter_when_selected(self):
+        from app.chains import _hosted_llm_config, settings
+        # Both keys present — selector decides. OpenRouter must win.
+        with patch.object(settings, "llm_provider", "openrouter"), \
+             patch.object(settings, "groq_api_key", "gsk-should-be-ignored"), \
+             patch.object(settings, "openrouter_api_key", "sk-or-v1-test"), \
+             patch.object(settings, "openrouter_base_url", "https://openrouter.ai/api/v1"), \
+             patch.object(settings, "openrouter_model", "meta-llama/llama-3.3-70b-instruct:free"):
+            cfg = _hosted_llm_config()
+            assert cfg == (
+                "sk-or-v1-test",
+                "https://openrouter.ai/api/v1",
+                "meta-llama/llama-3.3-70b-instruct:free",
+            )
+
+    def test_returns_none_when_selected_provider_has_no_key(self):
+        """LLM_PROVIDER=openrouter but empty OPENROUTER_API_KEY → fall back to
+        Ollama (cfg is None). Must NOT silently use Groq even if Groq has a key.
+        """
+        from app.chains import _hosted_llm_config, _using_groq, settings
+        with patch.object(settings, "llm_provider", "openrouter"), \
+             patch.object(settings, "groq_api_key", "gsk-test-but-not-selected"), \
+             patch.object(settings, "openrouter_api_key", ""):
+            assert _hosted_llm_config() is None
+            assert _using_groq() is False
+
+    @pytest.mark.anyio
+    async def test_groq_chat_uses_openrouter_base_url_when_selected(self):
+        """_groq_chat must POST to OpenRouter's URL with OpenRouter's bearer
+        token when LLM_PROVIDER=openrouter. The function name is historical;
+        the routing target follows _hosted_llm_config.
+        """
+        from app.chains import _groq_chat, settings
+        import httpx
+        good_resp = MagicMock(spec=httpx.Response)
+        good_resp.status_code = 200
+        good_resp.raise_for_status = MagicMock()
+        good_resp.json = MagicMock(return_value={
+            "choices": [{"message": {"content": "ok"}}]
+        })
+        mock_client = AsyncMock()
+        mock_client.post = AsyncMock(return_value=good_resp)
+
+        with patch("app.chains.get_http", return_value=mock_client), \
+             patch.object(settings, "llm_provider", "openrouter"), \
+             patch.object(settings, "openrouter_api_key", "sk-or-v1-abc"), \
+             patch.object(settings, "openrouter_base_url", "https://openrouter.ai/api/v1"), \
+             patch.object(settings, "openrouter_model", "or-model"):
+            await _groq_chat([{"role": "user", "content": "test"}])
+
+        # Verify the URL and bearer token came from OpenRouter, and the model
+        # in the payload is the OpenRouter model — not the Groq one.
+        assert mock_client.post.call_count == 1
+        call_args = mock_client.post.call_args
+        assert call_args.args[0] == "https://openrouter.ai/api/v1/chat/completions"
+        assert call_args.kwargs["headers"]["Authorization"] == "Bearer sk-or-v1-abc"
+        assert call_args.kwargs["json"]["model"] == "or-model"
+
+
 class TestGroqRetryWait:
     def test_reads_retry_after_header(self):
         import httpx
@@ -484,7 +752,23 @@ class TestGroqRetryWait:
 
 
 class TestGroqChatRetry:
-    """_groq_chat retries on 429 and raises after exhausting retries."""
+    """_groq_chat retries on 429 and raises after exhausting retries.
+
+    These tests exercise retry/circuit-breaker logic, not provider selection,
+    so we pin LLM_PROVIDER=groq + groq_api_key="test-key" for the whole class.
+    Without this, `_hosted_llm_config()` returns None (the autouse settings
+    isolator clears env-derived values) and _groq_chat fails before reaching
+    the retry path under test.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _pin_groq_provider(self):
+        from app.chains import settings
+        with patch.object(settings, "llm_provider", "groq"), \
+             patch.object(settings, "groq_api_key", "test-key"), \
+             patch.object(settings, "groq_base_url", "https://api.groq.com/openai/v1"), \
+             patch.object(settings, "groq_model", "test-model"):
+            yield
 
     def _good_response(self, content: str = "• bullet"):
         import httpx
@@ -543,3 +827,102 @@ class TestGroqChatRetry:
                 await _groq_chat([{"role": "user", "content": "test"}])
 
         assert mock_client.post.call_count == 1  # no retry for non-429
+
+    @pytest.mark.anyio
+    async def test_raises_quota_exhausted_when_retry_after_exceeds_cap(self):
+        """The hosted provider returns Retry-After in the thousands of seconds
+        when the daily token quota is empty. Blocking the request for an hour
+        just hangs the client and ties up the slot — fail fast with
+        HostedLLMQuotaExhausted so the endpoint can return 503 with a clear
+        message instead.
+        """
+        from app.chains import _groq_chat, HostedLLMQuotaExhausted, settings
+        # Retry-After = 4402s (the exact value from the user's bug log).
+        bad_resp, _ = _make_http_status_error(429, retry_after="4402")
+        mock_client = AsyncMock()
+        mock_client.post = AsyncMock(return_value=bad_resp)
+
+        with patch("app.chains.get_http", return_value=mock_client), \
+             patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep, \
+             patch.object(settings, "groq_max_retry_wait_seconds", 30):
+            with pytest.raises(HostedLLMQuotaExhausted) as exc_info:
+                await _groq_chat([{"role": "user", "content": "test"}])
+
+        assert exc_info.value.retry_after_seconds == 4402.0
+        assert "quota exhausted" in str(exc_info.value).lower()
+        # We must NOT have slept for the 4402-second value — that's the whole
+        # point of the cap. Single failed attempt, then immediate raise.
+        assert mock_client.post.call_count == 1
+        mock_sleep.assert_not_called()
+
+    @pytest.mark.anyio
+    async def test_circuit_breaker_fails_subsequent_calls_without_network(self):
+        """Once one call learns the quota is exhausted, subsequent calls in the
+        same process must fail fast WITHOUT making another doomed Groq
+        request. Without this, /parse fires N back-to-back 429s (one per
+        project) and burns Groq's request-quota even though the LLM never
+        runs. The exact symptom in the user's bug report: 7 doomed 429s in
+        ~300ms after the first quota-exhausted response.
+        """
+        from app.chains import _groq_chat, HostedLLMQuotaExhausted, settings
+        bad_resp, _ = _make_http_status_error(429, retry_after="1074")
+        mock_client = AsyncMock()
+        mock_client.post = AsyncMock(return_value=bad_resp)
+
+        with patch("app.chains.get_http", return_value=mock_client), \
+             patch("asyncio.sleep", new_callable=AsyncMock), \
+             patch.object(settings, "groq_max_retry_wait_seconds", 30):
+            # First call: trips the breaker.
+            with pytest.raises(HostedLLMQuotaExhausted):
+                await _groq_chat([{"role": "user", "content": "test"}])
+            calls_after_first = mock_client.post.call_count
+            # Second call: must NOT hit the network — breaker fails it instantly.
+            with pytest.raises(HostedLLMQuotaExhausted):
+                await _groq_chat([{"role": "user", "content": "test"}])
+
+        # Total post count must equal what it was after the first call.
+        # If it increased, the breaker isn't preventing the doomed roundtrip.
+        assert mock_client.post.call_count == calls_after_first, (
+            f"Circuit breaker leaked: post called {mock_client.post.call_count} times "
+            f"(expected {calls_after_first}). Subsequent calls must fail without network IO."
+        )
+
+    @pytest.mark.anyio
+    async def test_circuit_breaker_clears_after_cooldown(self):
+        """After Retry-After elapses, the breaker auto-closes and calls retry
+        Groq normally. Implemented via a monotonic deadline, not a counter.
+        """
+        from app.chains import _groq_chat, settings, _trip_quota_circuit
+        good_resp = self._good_response()
+        mock_client = AsyncMock()
+        mock_client.post = AsyncMock(return_value=good_resp)
+
+        # Manually trip the breaker with a wait already in the past so the
+        # check on entry treats it as closed.
+        _trip_quota_circuit(-1.0)
+
+        with patch("app.chains.get_http", return_value=mock_client), \
+             patch.object(settings, "groq_max_retry_wait_seconds", 30):
+            result = await _groq_chat([{"role": "user", "content": "test"}])
+
+        assert result == "• bullet"
+        assert mock_client.post.call_count == 1
+
+    @pytest.mark.anyio
+    async def test_still_retries_when_retry_after_within_cap(self):
+        """Per-minute rate limits cite ≤60s. Those should still retry normally
+        without raising — the cap is only for clearly-quota-exhausted values.
+        """
+        from app.chains import _groq_chat, settings
+        bad_resp, _ = _make_http_status_error(429, retry_after="5")
+        good_resp = self._good_response()
+        mock_client = AsyncMock()
+        mock_client.post = AsyncMock(side_effect=[bad_resp, good_resp])
+
+        with patch("app.chains.get_http", return_value=mock_client), \
+             patch("asyncio.sleep", new_callable=AsyncMock), \
+             patch.object(settings, "groq_max_retry_wait_seconds", 30):
+            result = await _groq_chat([{"role": "user", "content": "test"}])
+
+        assert result == "• bullet"
+        assert mock_client.post.call_count == 2
