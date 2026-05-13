@@ -22,7 +22,7 @@ import logging
 
 import httpx
 
-from app.chains import SemanticMatcher, _ollama_chat, _strip_json_fences
+from app.chains import HostedLLMQuotaExhausted, SemanticMatcher, _ollama_chat, _strip_json_fences
 from app.config import get_settings
 from app.models import ProjectData, ProjectRecommendation
 
@@ -96,6 +96,24 @@ async def recommend_projects(
     # ── Phase 1: analyse JD + score all facts ─────────────────────────────────
     matcher    = SemanticMatcher()
     jd_analysis = await matcher.analyze_jd(job_description)
+    # Surface the analysis content — score_facts only sees this dict, not the
+    # raw JD, so a near-empty analysis (LLM extracted nothing) silently floors
+    # every fact's relevance and reproduces the "every project at 50%" UX with
+    # a different root cause from the parser/envelope bugs.
+    required = jd_analysis.get("required_skills", []) if isinstance(jd_analysis, dict) else []
+    if not required:
+        logger.warning(
+            "JD analysis returned no required_skills — fact scoring will lack context. "
+            "Full analysis: %.300s",
+            json.dumps(jd_analysis) if jd_analysis else "{}",
+        )
+    else:
+        logger.info(
+            "JD analysis: skills=%s tone=%s seniority=%s",
+            required[:8],
+            jd_analysis.get("tone"),
+            jd_analysis.get("seniority"),
+        )
     scored      = await matcher.score_facts(jd_analysis, projects)
 
     # ── Phase 2: roll up to project level ────────────────────────────────────
@@ -155,6 +173,13 @@ async def recommend_projects(
                 reasons = json.loads(_strip_json_fences(raw))
             if not isinstance(reasons, dict):
                 reasons = {}
+        except HostedLLMQuotaExhausted:
+            # HostedLLMQuotaExhausted subclasses RuntimeError, so it would be
+            # swallowed by the broader except below and silently degrade to
+            # the skill-list fallback. Quota exhaustion is not a "soft
+            # degrade" condition — the endpoint must return 503 with a clean
+            # message so the user knows to wait or switch backends.
+            raise
         except (
             httpx.HTTPError, json.JSONDecodeError, RuntimeError,
             KeyError, IndexError, TypeError,

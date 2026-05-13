@@ -27,7 +27,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-from app.chains import CVonRAGOrchestrator, close_http
+from app.chains import (
+    CVonRAGOrchestrator,
+    HostedLLMQuotaExhausted,
+    _hosted_llm_config,
+    close_http,
+)
 from app.config import get_settings
 from app.models import (
     GeneratedBullet,
@@ -258,6 +263,11 @@ async def _sse_stream(request: OptimizationRequest) -> AsyncGenerator[str, None]
                 ))
                 return
 
+    except HostedLLMQuotaExhausted as exc:
+        # Don't log a stack trace for quota exhaustion — it's not a bug, it's
+        # a known limit being hit. Surface the clean message to the client.
+        logger.warning("Pipeline aborted — %s", exc)
+        yield _sse(StreamChunk(event_type=StreamEventType.ERROR, error_message=str(exc)))
     except Exception as exc:
         logger.exception("Pipeline error: %s", exc)
         yield _sse(StreamChunk(event_type=StreamEventType.ERROR, error_message=str(exc)))
@@ -274,11 +284,12 @@ async def root():
 
 @app.get("/health", response_model=HealthResponse, tags=["infra"])
 async def health_check():
-    """Liveness probe — checks LLM backend (Groq or Ollama) + embed model + Qdrant."""
+    """Liveness probe — checks active LLM backend (Groq/OpenRouter/Ollama) + embed model + Qdrant."""
     qdrant = await collection_info()
-    using_groq = bool(settings.groq_api_key)
+    cfg = _hosted_llm_config()
+    provider_name = settings.llm_provider if cfg is not None else "ollama"
 
-    groq_ok   = False
+    llm_ok    = False
     ollama_ok = False
     embed_ok  = False
 
@@ -290,32 +301,39 @@ async def health_check():
             embed_base = settings.ollama_embed_model.split(":")[0]
             embed_ok = any(embed_base in m for m in models)
 
-            # ── Ollama LLM model (only needed when Groq is NOT configured) ──
-            if not using_groq:
+            # ── Ollama LLM model (only needed when no hosted provider) ──
+            if cfg is None:
                 llm_base = settings.ollama_llm_model.split(":")[0]
                 ollama_ok = any(llm_base in m for m in models)
         except Exception:
             pass
 
-        # ── Groq API reachability (only when Groq IS configured) ─────────
-        if using_groq:
+        # ── Hosted-LLM reachability (Groq or OpenRouter) ─────────────────
+        if cfg is not None:
+            api_key, base_url, _ = cfg
             try:
                 r = await c.get(
-                    f"{settings.groq_base_url}/models",
-                    headers={"Authorization": f"Bearer {settings.groq_api_key}"},
+                    f"{base_url}/models",
+                    headers={"Authorization": f"Bearer {api_key}"},
                 )
-                groq_ok = r.status_code == 200
+                llm_ok = r.status_code == 200
             except Exception:
                 pass
 
     # Determine overall status
-    llm_healthy = groq_ok if using_groq else ollama_ok
+    llm_healthy = llm_ok if cfg is not None else ollama_ok
     all_ok = llm_healthy and embed_ok and qdrant["qdrant_connected"]
+
+    # groq_ok kept for back-compat: True only when active provider IS groq AND reachable.
+    groq_ok = llm_ok if provider_name == "groq" else False
+    active_model = cfg[2] if cfg is not None else settings.ollama_llm_model
 
     return HealthResponse(
         status="ok" if all_ok else "degraded",
-        llm_backend="groq" if using_groq else "ollama",
-        model=settings.groq_model if using_groq else settings.ollama_llm_model,
+        llm_backend=provider_name,
+        llm_provider=provider_name,
+        model=active_model,
+        llm_ok=llm_ok,
         groq_ok=groq_ok,
         ollama_ok=ollama_ok,
         embed_ok=embed_ok,
@@ -419,11 +437,20 @@ async def recommend(request: Request, body: RecommendRequest):
     response to pre-select the best projects and show reasoning to the user.
     """
     await _rate_check(request, "recommend", settings.rate_limit_recommend)
-    recs = await _do_recommend(
-        projects=body.projects,
-        job_description=body.job_description,
-        top_k=body.top_k,
-    )
+    try:
+        recs = await _do_recommend(
+            projects=body.projects,
+            job_description=body.job_description,
+            top_k=body.top_k,
+        )
+    except HostedLLMQuotaExhausted as exc:
+        # 503 Service Unavailable + Retry-After header so clients/browsers can
+        # show a clear quota message instead of a 30-minute-hang-then-timeout.
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=str(exc),
+            headers={"Retry-After": str(int(exc.retry_after_seconds))},
+        ) from exc
     return RecommendResponse(recommendations=recs)
 
 
@@ -450,18 +477,20 @@ async def optimize(request: Request, body: OptimizationRequest):
     | `done`     | `{data: {elapsed_seconds}}` | Stream complete |
     """
     await _rate_check(request, "optimize", settings.rate_limit_optimize)
-    # H3: guard Groq free-tier quota before starting the stream.
+    # H3: guard hosted-LLM quota before starting the stream.
     # 429 backoff is handled inside chains.py, but the best defence is not
-    # sending 200+ LLM calls in the first place.
-    if settings.groq_api_key:
+    # sending 200+ LLM calls in the first place. Applies to whichever hosted
+    # provider is active (Groq or OpenRouter); both free tiers have strict
+    # per-minute limits that this cap protects against.
+    if _hosted_llm_config() is not None:
         cap = settings.groq_max_bullets_per_request
         requested = body.total_bullets_requested or 0
         if requested > cap:
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
                 detail=(
-                    f"Groq free tier: total_bullets_requested ({requested}) exceeds the "
-                    f"server cap of {cap}. Reduce max_bullets_per_project or the number "
+                    f"Hosted-LLM quota guard: total_bullets_requested ({requested}) exceeds "
+                    f"the server cap of {cap}. Reduce max_bullets_per_project or the number "
                     f"of projects, or set GROQ_MAX_BULLETS_PER_REQUEST higher in .env."
                 ),
             )
