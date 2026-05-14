@@ -129,13 +129,24 @@ async def build_case(cv_path: Path, case_idx: int) -> dict:
     }
 
 
+def _positive_int(value: str) -> int:
+    """argparse type for "must be a positive integer" CLI flags."""
+    try:
+        n = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{value!r} is not an integer")
+    if n <= 0:
+        raise argparse.ArgumentTypeError(f"must be > 0 (got {n})")
+    return n
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Generate tests/eval_set.json from PDFs.")
     p.add_argument("--pdf-dir", type=Path, default=_PROJECT_ROOT / "docs" / "good_cvs",
                    help="Directory of CV PDFs to draw cases from.")
     p.add_argument("--output", type=Path, default=_PROJECT_ROOT / "tests" / "eval_set.json",
                    help="Where to write the eval set.")
-    p.add_argument("--count", type=int, default=15,
+    p.add_argument("--count", type=_positive_int, default=15,
                    help="How many cases to generate (will pick the first N PDFs alphabetically).")
     p.add_argument("--force", action="store_true",
                    help="Overwrite existing output file without prompting.")
@@ -145,6 +156,20 @@ def parse_args() -> argparse.Namespace:
 async def main_async(args: argparse.Namespace) -> int:
     if not args.pdf_dir.exists():
         print(f"PDF dir not found: {args.pdf_dir}", file=sys.stderr)
+        return 2
+
+    # cv_path.relative_to(_PROJECT_ROOT) inside build_case() will ValueError
+    # if the PDF lives outside the repo. Without this up-front check that
+    # raise gets caught by the per-PDF try/except and every PDF turns into a
+    # SKIP — the script writes an empty eval set and exits 0, which silently
+    # produces useless output. Fail fast with a clear message instead.
+    try:
+        args.pdf_dir.resolve().relative_to(_PROJECT_ROOT.resolve())
+    except ValueError:
+        print(
+            f"--pdf-dir must be inside repo root ({_PROJECT_ROOT}); got {args.pdf_dir}",
+            file=sys.stderr,
+        )
         return 2
 
     pdfs = sorted(args.pdf_dir.glob("*.pdf"))

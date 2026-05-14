@@ -182,19 +182,42 @@ def active_model_label() -> str:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def load_eval_set(path: Path) -> list[dict]:
-    """Load tests/eval_set.json and strip any leading comment object.
+    """Load tests/eval_set.json, strip the comment header, and validate.
 
     The stub file ships with a {"_comment": "..."} header — drop it so callers
     can treat the file as a uniform list[case].
+
+    Three validations beyond schema-presence:
+      • target_role_type must be a valid RoleType (otherwise the orchestrator
+        crashes mid-run at RoleType(case["target_role_type"]) with a less
+        helpful traceback)
+      • case_id must be unique (the run-cache is keyed on
+        f"{case_id}::{backend}", so collisions silently reuse parsed projects
+        from a different case)
+      • case_id must be non-empty (cache-key correctness)
     """
     raw = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(raw, list):
         raise ValueError(f"{path}: expected a JSON list of cases, got {type(raw).__name__}")
     cases = [c for c in raw if not (isinstance(c, dict) and c.get("_comment"))]
+
+    valid_roles    = {r.value for r in RoleType}
+    seen_case_ids: set[str] = set()
     for c in cases:
         for required in ("case_id", "cv_path", "jd_text", "target_role_type"):
             if required not in c:
                 raise ValueError(f"{path}: case {c.get('case_id', '<?>')} missing field {required!r}")
+        cid = str(c["case_id"]).strip()
+        if not cid:
+            raise ValueError(f"{path}: case has empty case_id")
+        if cid in seen_case_ids:
+            raise ValueError(f"{path}: duplicate case_id {cid!r}")
+        seen_case_ids.add(cid)
+        if c["target_role_type"] not in valid_roles:
+            raise ValueError(
+                f"{path}: case {cid} has invalid target_role_type "
+                f"{c['target_role_type']!r}; expected one of {sorted(valid_roles)}"
+            )
     return cases
 
 
