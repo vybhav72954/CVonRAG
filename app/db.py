@@ -12,11 +12,13 @@ today (UTC). This avoids a midnight cron and keeps state self-healing.
 """
 
 from __future__ import annotations
+import asyncio
 import logging
 from collections.abc import AsyncGenerator
 from datetime import date, datetime, timezone
 
 from sqlalchemy import Date, DateTime, Integer, String
+from sqlalchemy.engine.url import URL
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
     async_sessionmaker,
@@ -68,18 +70,50 @@ class Invite(Base):
 
 _engine = None
 _session_factory: async_sessionmaker[AsyncSession] | None = None
+# B9: async lock guards cold-start factory creation so concurrent first-touch
+# requests can't each build their own engine (the loser would be GC'd while
+# its connection pool was still warming).
+_factory_lock = asyncio.Lock()
 
 
-def _engine_url() -> str:
-    """Return the async sqlite URL for the current settings.sqlite_path."""
-    # Special-case in-memory; everything else is a file URL.
+def _engine_url() -> URL | str:
+    """Return the async SQLite URL for the current settings.sqlite_path.
+
+    Uses `URL.create()` so reserved URL characters in the path (`?`, `#`, `%`,
+    `&`, …) are escaped properly. The previous string-format approach would
+    have silently mis-parsed a `SQLITE_PATH` like `./cv?staging.db` because
+    SQLAlchemy would have taken `staging.db` as a query string (B4).
+    """
     path = settings.sqlite_path
     if path == ":memory:":
         return "sqlite+aiosqlite:///:memory:"
-    return f"sqlite+aiosqlite:///{path}"
+    return URL.create(drivername="sqlite+aiosqlite", database=path)
 
 
-def _ensure_factory() -> async_sessionmaker[AsyncSession]:
+async def _ensure_factory_async() -> async_sessionmaker[AsyncSession]:
+    """Async-safe lazy initializer for the engine + session factory.
+
+    Double-checked locking pattern (B9): the fast path skips the lock when
+    the factory is already built. On a cold start with truly concurrent
+    requests, only one coroutine builds the engine while the others await
+    the lock and then see the populated global.
+    """
+    global _engine, _session_factory
+    if _session_factory is not None:
+        return _session_factory
+    async with _factory_lock:
+        if _session_factory is None:
+            _engine = create_async_engine(_engine_url(), echo=False, future=True)
+            _session_factory = async_sessionmaker(
+                _engine, class_=AsyncSession, expire_on_commit=False
+            )
+    return _session_factory
+
+
+def _ensure_factory_sync() -> async_sessionmaker[AsyncSession]:
+    """Sync fallback for callers that can't await — used by init_db() during
+    lifespan startup, where the event loop is the lifespan's own and no
+    concurrent request can reach the factory yet."""
     global _engine, _session_factory
     if _session_factory is None:
         _engine = create_async_engine(_engine_url(), echo=False, future=True)
@@ -90,8 +124,13 @@ def _ensure_factory() -> async_sessionmaker[AsyncSession]:
 
 
 async def init_db() -> None:
-    """Create tables if missing. Called from the FastAPI lifespan startup hook."""
-    _ensure_factory()
+    """Create tables if missing. Called from the FastAPI lifespan startup hook.
+
+    Runs during lifespan before any request can hit the app — no race window
+    for the factory, so the sync builder is safe and avoids re-entering the
+    lock that the lifespan-event-loop already holds nothing on.
+    """
+    _ensure_factory_sync()
     assert _engine is not None
     async with _engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
@@ -99,7 +138,9 @@ async def init_db() -> None:
 
 
 async def close_db() -> None:
-    """Dispose of the engine on shutdown."""
+    """Dispose of the engine on shutdown. Lifespan teardown only runs after
+    in-flight requests have drained (ASGI guarantee), so we don't need to
+    explicitly wait on outstanding sessions."""
     global _engine, _session_factory
     if _engine is not None:
         await _engine.dispose()
@@ -109,7 +150,7 @@ async def close_db() -> None:
 
 async def get_session() -> AsyncGenerator[AsyncSession, None]:
     """FastAPI dependency yielding a fresh AsyncSession per request."""
-    factory = _ensure_factory()
+    factory = await _ensure_factory_async()
     async with factory() as session:
         yield session
 
