@@ -417,7 +417,7 @@ class TestDailyResetEdgeCases:
     def test_yesterday_today_date_triggers_reset(self, client, gate_enabled, monkeypatch):
         """If today_date is yesterday, the lazy reset must fire on the next
         request and zero out optimize_today / bullets_today."""
-        from datetime import date, datetime, timedelta, timezone
+        from datetime import datetime, timedelta, timezone
         from app.db import Invite, _ensure_factory_sync
         import asyncio
 
@@ -429,8 +429,12 @@ class TestDailyResetEdgeCases:
                 headers={"X-Invite-Code": "YESTERDAY"},
             )
 
-        # Manually rewind today_date one day to simulate UTC rollover.
-        yesterday = date.today() - timedelta(days=1)
+        # Manually rewind today_date one day to simulate UTC rollover. MUST
+        # use UTC here — production uses datetime.now(timezone.utc).date(), so
+        # using local date.today() can mismatch in non-UTC timezones (e.g.
+        # IST is +5:30 ahead, giving a ~5.5-hour window where local-yesterday
+        # equals UTC-today and the test flakes).
+        yesterday = datetime.now(timezone.utc).date() - timedelta(days=1)
 
         async def _rewind():
             from sqlalchemy import update

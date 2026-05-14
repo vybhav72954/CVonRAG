@@ -157,6 +157,24 @@ class Settings(BaseSettings):
             )
         return self
 
+    @model_validator(mode="after")
+    def _warn_production_ingest_secret(self) -> "Settings":
+        """Loud warning when INGEST_SECRET is empty in prod.
+
+        Empty-secret = open access is intentional for local dev (documented in
+        .env.example), but in production it leaves `/ingest` and `/admin/*`
+        unauthenticated. Failing closed here would break the documented dev
+        flow; warning at boot catches the real concern (misconfigured deploy)
+        without forcing every dev to juggle headers on curl calls.
+        """
+        if self.app_env == "production" and not self.ingest_secret:
+            logging.getLogger("cvonrag").warning(
+                "INGEST_SECRET is empty in production — /ingest and /admin/* "
+                "are unauthenticated. Set a long random INGEST_SECRET in .env "
+                "before exposing the API to the internet."
+            )
+        return self
+
 
 @lru_cache()
 def get_settings() -> Settings:
