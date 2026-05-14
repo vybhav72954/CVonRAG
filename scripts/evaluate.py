@@ -467,6 +467,13 @@ async def run_one_case(
 
         orchestrator = CVonRAGOrchestrator()
         bullets: list[GeneratedBullet] = []
+        # Stopwatch deliberately starts AFTER parse_cv_to_projects() above.
+        # `latency_s` measures the optimiser pipeline (orchestrator.run) so
+        # that `latency_per_bullet_s = latency_s / len(bullets)` remains a
+        # comparable per-bullet generation cost. Including the one-time PDF
+        # parse + LLM fact-extraction would mix a per-CV cost into a
+        # per-bullet metric. See module docstring (Phase 5) for the
+        # rationale and contract.
         t0 = time.perf_counter()
         partial_run = False
         try:
