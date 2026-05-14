@@ -268,3 +268,152 @@ class TestDailyBulletsCap:
         assert r1.status_code == 200
         assert r2.status_code == 429
         assert "Daily bullet cap" in r2.json()["detail"]
+
+
+class TestAtomicCapEnforcement:
+    """B2/B3: cap checks must be atomic. Two requests simultaneously at the
+    cap boundary cannot both pass. With atomic UPDATE + WHERE, SQLite
+    serializes the writes and the second one's WHERE clause fails."""
+
+    @pytest.mark.anyio
+    async def test_concurrent_optimize_at_cap_only_one_succeeds(
+        self, gate_enabled, monkeypatch
+    ):
+        """Fire two concurrent /optimize calls at optimize_today=1 with cap=2.
+        Both pass the cap (1 → 2 and 2 → 3 would have been the racy outcome
+        of the old SELECT-then-mutate; with atomic UPDATE the second one is
+        rejected). Validates B2 fix.
+        """
+        import asyncio
+        from httpx import ASGITransport, AsyncClient
+        from app.main import app
+        from app.db import init_db
+
+        # AsyncClient doesn't fire FastAPI's lifespan → init_db never runs.
+        # Do it manually here (the autouse fixture already pointed sqlite_path
+        # at a tmp tmp_path db).
+        await init_db()
+
+        monkeypatch.setattr(settings, "max_daily_optimizations", 2)
+        monkeypatch.setattr(settings, "max_daily_bullets", 1000)
+
+        with patch("app.main._sse_stream", new=lambda body: _empty_sse()):
+            transport = ASGITransport(app=app)
+            async with AsyncClient(transport=transport, base_url="http://test") as ac:
+                # Pre-create the invite (sync TestClient inside async test is
+                # awkward, so we POST via the same client).
+                r = await ac.post(
+                    "/admin/invites",
+                    json={"code": "RACECAP", "name": "Race"},
+                )
+                assert r.status_code == 200, r.text
+
+                # First call burns one of the two slots (optimize_today goes 0→1).
+                r1 = await ac.post(
+                    "/optimize",
+                    json=OPTIMIZE_BODY,
+                    headers={"X-Invite-Code": "RACECAP"},
+                )
+                assert r1.status_code == 200
+
+                # Now fire two MORE concurrent calls. Only one should slip
+                # into the second slot (1→2); the other must 429.
+                r2, r3 = await asyncio.gather(
+                    ac.post(
+                        "/optimize",
+                        json=OPTIMIZE_BODY,
+                        headers={"X-Invite-Code": "RACECAP"},
+                    ),
+                    ac.post(
+                        "/optimize",
+                        json=OPTIMIZE_BODY,
+                        headers={"X-Invite-Code": "RACECAP"},
+                    ),
+                )
+                statuses = sorted([r2.status_code, r3.status_code])
+                # Exactly one 200, exactly one 429 — never two 200s.
+                assert statuses == [200, 429], (
+                    f"Expected one success + one cap rejection, got {statuses}. "
+                    "If both are 200, B2's atomic UPDATE regressed."
+                )
+
+    @pytest.mark.anyio
+    async def test_concurrent_bullet_reservation_respects_cap(
+        self, gate_enabled, monkeypatch
+    ):
+        """B3 analogue: with bullet cap=2 and each request asking for 2
+        bullets, two concurrent requests cannot both reserve (which would
+        leave bullets_today=4)."""
+        import asyncio
+        from httpx import ASGITransport, AsyncClient
+        from app.main import app
+        from app.db import init_db
+
+        await init_db()  # AsyncClient skips lifespan; init manually
+
+        monkeypatch.setattr(settings, "max_daily_optimizations", 1000)
+        monkeypatch.setattr(settings, "max_daily_bullets", 2)
+
+        # Use a body that requests 2 bullets.
+        body = {**OPTIMIZE_BODY, "total_bullets_requested": 2}
+
+        with patch("app.main._sse_stream", new=lambda body: _empty_sse()):
+            transport = ASGITransport(app=app)
+            async with AsyncClient(transport=transport, base_url="http://test") as ac:
+                r = await ac.post(
+                    "/admin/invites",
+                    json={"code": "BULLETRACE", "name": "BR"},
+                )
+                assert r.status_code == 200, r.text
+
+                r1, r2 = await asyncio.gather(
+                    ac.post(
+                        "/optimize",
+                        json=body,
+                        headers={"X-Invite-Code": "BULLETRACE"},
+                    ),
+                    ac.post(
+                        "/optimize",
+                        json=body,
+                        headers={"X-Invite-Code": "BULLETRACE"},
+                    ),
+                )
+                statuses = sorted([r1.status_code, r2.status_code])
+                assert statuses == [200, 429], (
+                    f"Expected one success + one bullet-cap rejection, got {statuses}. "
+                    "If both are 200, B3's atomic UPDATE regressed."
+                )
+
+
+class TestUsagePagination:
+    """B8: /admin/usage supports ?limit and ?offset."""
+
+    def test_default_returns_up_to_100(self, client):
+        for i in range(5):
+            _create_invite(client, f"BATCH-{i:03d}")
+        resp = client.get("/admin/usage")
+        assert resp.status_code == 200
+        assert len(resp.json()["invites"]) == 5
+
+    def test_limit_clips_results(self, client):
+        for i in range(5):
+            _create_invite(client, f"PAGE-{i:03d}")
+        resp = client.get("/admin/usage?limit=2")
+        assert resp.status_code == 200
+        codes = [i["code"] for i in resp.json()["invites"]]
+        assert codes == ["PAGE-000", "PAGE-001"]
+
+    def test_offset_skips_results(self, client):
+        for i in range(5):
+            _create_invite(client, f"SKIP-{i:03d}")
+        resp = client.get("/admin/usage?limit=2&offset=2")
+        codes = [i["code"] for i in resp.json()["invites"]]
+        assert codes == ["SKIP-002", "SKIP-003"]
+
+    def test_rejects_limit_over_max(self, client):
+        resp = client.get("/admin/usage?limit=1000")
+        assert resp.status_code == 422
+
+    def test_rejects_negative_offset(self, client):
+        resp = client.get("/admin/usage?offset=-1")
+        assert resp.status_code == 422
