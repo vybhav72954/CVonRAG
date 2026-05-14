@@ -213,7 +213,13 @@ def load_eval_set(path: Path) -> list[dict]:
         raise ValueError(f"{path}: invalid JSON ({exc})") from exc
     if not isinstance(raw, list):
         raise ValueError(f"{path}: expected a JSON list of cases, got {type(raw).__name__}")
-    cases = [c for c in raw if not (isinstance(c, dict) and c.get("_comment"))]
+    # Drop only pure header-comment objects ({"_comment": "..."}) — a real
+    # case that happens to carry a "_comment" annotation alongside its data
+    # should be kept, not silently filtered out.
+    cases = [
+        c for c in raw
+        if not (isinstance(c, dict) and set(c.keys()) == {"_comment"})
+    ]
 
     valid_roles    = {r.value for r in RoleType}
     seen_case_ids: set[str] = set()

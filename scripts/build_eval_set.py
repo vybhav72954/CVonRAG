@@ -174,7 +174,14 @@ async def main_async(args: argparse.Namespace) -> int:
         )
         return 2
 
-    pdfs = sorted(args.pdf_dir.glob("*.pdf"))
+    # Case-insensitive .pdf match — Path.glob is case-sensitive on
+    # Linux/Mac (case-insensitive on Windows NTFS by accident), so a
+    # "resume.PDF" would silently be skipped on a non-Windows host. Filter
+    # via suffix.lower() so any-case extensions are picked up.
+    pdfs = sorted(
+        p for p in args.pdf_dir.iterdir()
+        if p.is_file() and p.suffix.lower() == ".pdf"
+    )
     if not pdfs:
         print(f"No PDFs in {args.pdf_dir}", file=sys.stderr)
         return 2
