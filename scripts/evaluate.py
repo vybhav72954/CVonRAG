@@ -624,6 +624,34 @@ async def run_backend(
     return results, aggregate(results, phases)
 
 
+def _persist_results(
+    aggregates: dict[str, dict[str, Any]],
+    all_raw: dict[str, list[dict]],
+    meta: dict[str, Any],
+    output_dir: Path,
+) -> None:
+    """Write the markdown report + raw JSON to disk.
+
+    Called once per completed backend (not just at the end) so a Ctrl+C or
+    failure during --backend both leaves the prior backend's results
+    durable on disk — without this, killing the run mid-Ollama would have
+    nuked an already-completed Groq leg.
+    """
+    report = format_report(aggregates, meta)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    (output_dir / "docs").mkdir(parents=True, exist_ok=True)
+    (output_dir / "docs" / "EVAL_REPORT.md").write_text(
+        "```\n" + report + "\n```\n", encoding="utf-8",
+    )
+    (output_dir / "eval_results.json").write_text(
+        json.dumps(
+            {"meta": {**meta, "phases": sorted(meta["phases"])}, "by_backend": all_raw, "aggregates": aggregates},
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+
 async def main_async(args: argparse.Namespace) -> int:
     # ── Resolve phases ───────────────────────────────────────────────────────
     if args.phase.strip().lower() == "all":
@@ -666,6 +694,15 @@ async def main_async(args: argparse.Namespace) -> int:
     aggregates: dict[str, dict[str, Any]] = {}
     all_raw: dict[str, list[dict]] = {}
     backend_models: dict[str, str] = {}
+    # Meta references the mutable dicts above — they fill in as backends complete.
+    meta: dict[str, Any] = {
+        "eval_set":             str(args.eval_set.relative_to(_PROJECT_ROOT) if args.eval_set.is_relative_to(_PROJECT_ROOT) else args.eval_set),
+        "cases_run":            len(cases),
+        "phases":               phases,
+        "vector_count":         vector_count,
+        "backend_models":       backend_models,
+        "data_leakage_warning": leakage and "retrieval" in phases,
+    }
 
     for backend in backends:
         with with_backend(backend):
@@ -692,33 +729,15 @@ async def main_async(args: argparse.Namespace) -> int:
                 }
                 for r in results
             ]
+            # Persist after each backend so a Ctrl+C or later-backend failure
+            # can't take the already-completed backends' results down with it.
+            _persist_results(aggregates, all_raw, meta, args.output_dir)
 
     if not aggregates:
         print("No backend produced results — see warnings above.", file=sys.stderr)
         return 1
 
-    # ── Report ───────────────────────────────────────────────────────────────
-    meta = {
-        "eval_set":             str(args.eval_set.relative_to(_PROJECT_ROOT) if args.eval_set.is_relative_to(_PROJECT_ROOT) else args.eval_set),
-        "cases_run":            len(cases),
-        "phases":               phases,
-        "vector_count":         vector_count,
-        "backend_models":       backend_models,
-        "data_leakage_warning": leakage and "retrieval" in phases,
-    }
-    report = format_report(aggregates, meta)
-    print("\n" + report)
-
-    # ── Persist ──────────────────────────────────────────────────────────────
-    args.output_dir.mkdir(parents=True, exist_ok=True)
-    (args.output_dir / "docs").mkdir(parents=True, exist_ok=True)
-    (args.output_dir / "docs" / "EVAL_REPORT.md").write_text(
-        "```\n" + report + "\n```\n", encoding="utf-8",
-    )
-    (args.output_dir / "eval_results.json").write_text(
-        json.dumps({"meta": {**meta, "phases": sorted(phases)}, "by_backend": all_raw, "aggregates": aggregates}, indent=2),
-        encoding="utf-8",
-    )
+    print("\n" + format_report(aggregates, meta))
     print(f"\nWrote {args.output_dir / 'docs' / 'EVAL_REPORT.md'}")
     print(f"Wrote {args.output_dir / 'eval_results.json'}")
     return 0
