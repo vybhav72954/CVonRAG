@@ -217,21 +217,56 @@ def load_eval_set(path: Path) -> list[dict]:
 
     valid_roles    = {r.value for r in RoleType}
     seen_case_ids: set[str] = set()
-    for c in cases:
+    for idx, c in enumerate(cases):
+        # Confirm the case object is a dict before any .get() — a raw list
+        # like ["oops", ...] would otherwise crash with AttributeError on
+        # the .get() below with a confusing traceback.
+        if not isinstance(c, dict):
+            raise ValueError(
+                f"{path}: case at index {idx} is not an object "
+                f"(got {type(c).__name__})"
+            )
         for required in ("case_id", "cv_path", "jd_text", "target_role_type"):
             if required not in c:
                 raise ValueError(f"{path}: case {c.get('case_id', '<?>')} missing field {required!r}")
-        cid = str(c["case_id"]).strip()
+
+        # Type-check the required fields. Numeric / null values for these
+        # would crash downstream (Path joining for cv_path, .split() for
+        # jd_text, RoleType(...) for target_role_type) with less helpful
+        # tracebacks. Catch them here.
+        case_id_raw = c["case_id"]
+        if not isinstance(case_id_raw, str):
+            raise ValueError(
+                f"{path}: case at index {idx} case_id must be a string "
+                f"(got {type(case_id_raw).__name__})"
+            )
+        cid = case_id_raw.strip()
         if not cid:
-            raise ValueError(f"{path}: case has empty case_id")
+            raise ValueError(f"{path}: case at index {idx} has empty case_id")
         if cid in seen_case_ids:
             raise ValueError(f"{path}: duplicate case_id {cid!r}")
         seen_case_ids.add(cid)
-        if c["target_role_type"] not in valid_roles:
+
+        for field_name in ("cv_path", "jd_text"):
+            value = c[field_name]
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(
+                    f"{path}: case {cid} {field_name} must be a non-empty "
+                    f"string (got {type(value).__name__})"
+                )
+
+        rt = c["target_role_type"]
+        if not isinstance(rt, str):
+            raise ValueError(
+                f"{path}: case {cid} target_role_type must be a string "
+                f"(got {type(rt).__name__})"
+            )
+        if rt not in valid_roles:
             raise ValueError(
                 f"{path}: case {cid} has invalid target_role_type "
-                f"{c['target_role_type']!r}; expected one of {sorted(valid_roles)}"
+                f"{rt!r}; expected one of {sorted(valid_roles)}"
             )
+
         # correct_projects entries drive Hit@2 via substring match. An empty
         # string would match every recommended title (`"" in t` is True), so
         # an accidental `["", "X"]` would silently report 100% hit-rate.
@@ -260,7 +295,19 @@ async def parse_cv_to_projects(cv_path: Path) -> list[ProjectData]:
 
     out: list[ProjectData] = []
     for i, rp in enumerate(raw_projects):
-        facts = await extract_facts(rp)
+        # extract_facts has its own internal fallback for non-quota
+        # failures, but wrap it defensively so a future refactor that
+        # changes its error contract can't silently fail the whole case.
+        # Quota exhaustion is process-global and must propagate (the
+        # breaker is latched and every subsequent call would also fail).
+        try:
+            facts = await extract_facts(rp)
+        except HostedLLMQuotaExhausted:
+            raise
+        except Exception as exc:
+            logger.warning("extract_facts failed for '%s' in %s: %s",
+                           rp.title, cv_path.name, exc)
+            continue
         if not facts:
             continue
         # Same slug strategy as parser.parse_and_stream, just inline.
@@ -693,6 +740,19 @@ def format_report(
 ALL_PHASES = {"char", "facts", "retrieval", "recommender", "latency"}
 
 
+def _positive_int(value: str) -> int:
+    """argparse type for 'must be > 0' CLI flags. Avoids surprises like
+    --limit 0 (falsy, skips slice, runs everything) and --limit -1
+    (cases[:-1] drops the last case)."""
+    try:
+        n = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{value!r} is not an integer")
+    if n <= 0:
+        raise argparse.ArgumentTypeError(f"must be > 0 (got {n})")
+    return n
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="CVonRAG pipeline benchmark.")
     p.add_argument("--eval-set", type=Path, default=_PROJECT_ROOT / "tests" / "eval_set.json",
@@ -702,8 +762,8 @@ def parse_args() -> argparse.Namespace:
                    help="Which LLM backend(s) to benchmark. 'both' = groq then ollama.")
     p.add_argument("--phase", default="all",
                    help="Comma-separated phases to run: char,facts,retrieval,recommender,latency,all")
-    p.add_argument("--limit", type=int, default=None,
-                   help="Only run the first N cases (smoke testing).")
+    p.add_argument("--limit", type=_positive_int, default=None,
+                   help="Only run the first N cases (smoke testing). Must be > 0.")
     p.add_argument("--char-target", type=int, default=130,
                    help="Bullet character target for phase 1.")
     p.add_argument("--inter-case-sleep", type=float, default=1.5,
