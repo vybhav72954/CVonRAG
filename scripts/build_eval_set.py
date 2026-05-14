@@ -110,6 +110,8 @@ async def build_case(cv_path: Path, case_idx: int) -> dict:
             facts = await extract_facts(rp)
             if facts:
                 titles.append(rp.title)
+        except HostedLLMQuotaExhausted:
+            raise
         except Exception as exc:
             logger.warning("extract_facts failed for '%s' in %s: %s", rp.title, cv_path.name, exc)
 
