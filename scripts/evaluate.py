@@ -88,10 +88,13 @@ settings = get_settings()
 # Numeric extraction — Phase 2 (fact preservation)
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Matches: 0.250, 92.3%, 14B, 1.2M, 87, 0.944
-# Allows internal `.` or `,` and optional unit suffix [%BMKx].
-# Multiple groups of digits joined by . or , are kept whole (handles "1.2.3").
-_NUMERIC_RE = re.compile(r"(?<!\w)\d+(?:[.,]\d+)*[%BMKx]?(?!\w)")
+# Matches: 0.250, 92.3%, 14B, 1.2M, 87, 0.944, 10k, 25b, 3x
+# Allows internal `.` or `,` and an optional magnitude/percent suffix.
+# Lowercase b/m/k included alongside uppercase B/M/K so that "10k users" or
+# "25b rows" survive the integrity check. Trailing word-boundary lookahead
+# keeps "10kg" from matching (the `g` would be a word char, blocking the
+# match) so we don't pick up arbitrary suffixed identifiers.
+_NUMERIC_RE = re.compile(r"(?<!\w)\d+(?:[.,]\d+)*[%BMKbmkx]?(?!\w)")
 
 
 def extract_numerics(text: str) -> list[str]:
@@ -382,8 +385,15 @@ async def run_one_case(
                 #               not a bug. Reported for completeness.
                 fabricated          = output_nums - source_nums
                 preserved_in_output = output_nums & source_nums
+                # If the bullet has zero output numerics, per-bullet integrity
+                # is undefined — there's nothing to score. Report None instead
+                # of 1.0 so a reader scanning the JSON doesn't misread an
+                # "everything-was-dropped" bullet as a perfect preservation.
+                # The aggregate is unaffected: bullets with no output numerics
+                # contribute 0 to both numerator (fabrications) and denominator
+                # (total output numerics) in the totals.
                 integrity_rate = (
-                    1.0 if not output_nums
+                    None if not output_nums
                     else len(preserved_in_output) / len(output_nums)
                 )
                 coverage_rate = (
@@ -485,26 +495,43 @@ def aggregate(results: list[CaseResult], phases: set[str]) -> dict[str, Any]:
             if r.latency_per_bullet_s is not None
         )
         per_case = sorted(r.latency_s for r in results if r.latency_s is not None)
-        if per_bullet:
+        # Emit the section whenever either dimension has data, so a run that
+        # records case-level wall-clock but produces zero bullets across every
+        # case (rare — most orchestrator failures early-return before
+        # latency_s is set, but possible) still surfaces the per-case numbers
+        # instead of vanishing from the report.
+        if per_bullet or per_case:
+            section["latency"] = {
+                "bullets":          sum(r.bullets_generated for r in results),
+                "cases":            len(per_case),
+                "p50_per_bullet":   None,
+                "p95_per_bullet":   None,
+                "min_per_bullet":   None,
+                "max_per_bullet":   None,
+                "p50_per_case":     None,
+                "p95_per_case":     None,
+                "min_per_case":     None,
+                "max_per_case":     None,
+            }
             # Nearest-rank percentile, 0-indexed. For N<20 this lands on max
             # regardless (mathematically correct — small samples can't resolve
             # P95 below max), but the ceil form is right for N≥20 too.
-            p95_idx = max(0, min(len(per_bullet) - 1, math.ceil(0.95 * len(per_bullet)) - 1))
-            case_p95_idx = max(0, min(len(per_case) - 1, math.ceil(0.95 * len(per_case)) - 1))
-            section["latency"] = {
-                # Headline — per-bullet amortised cost (resume-citable)
-                "bullets":           sum(r.bullets_generated for r in results),
-                "p50_per_bullet":    statistics.median(per_bullet),
-                "p95_per_bullet":    per_bullet[p95_idx],
-                "min_per_bullet":    min(per_bullet),
-                "max_per_bullet":    max(per_bullet),
-                # Context — per-case end-to-end cost
-                "cases":             len(per_case),
-                "p50_per_case":      statistics.median(per_case),
-                "p95_per_case":      per_case[case_p95_idx],
-                "min_per_case":      min(per_case),
-                "max_per_case":      max(per_case),
-            }
+            if per_bullet:
+                p95_idx = max(0, min(len(per_bullet) - 1, math.ceil(0.95 * len(per_bullet)) - 1))
+                section["latency"].update({
+                    "p50_per_bullet": statistics.median(per_bullet),
+                    "p95_per_bullet": per_bullet[p95_idx],
+                    "min_per_bullet": min(per_bullet),
+                    "max_per_bullet": max(per_bullet),
+                })
+            if per_case:
+                case_p95_idx = max(0, min(len(per_case) - 1, math.ceil(0.95 * len(per_case)) - 1))
+                section["latency"].update({
+                    "p50_per_case": statistics.median(per_case),
+                    "p95_per_case": per_case[case_p95_idx],
+                    "min_per_case": min(per_case),
+                    "max_per_case": max(per_case),
+                })
 
     return section
 
@@ -582,15 +609,17 @@ def format_report(
 
         if "latency" in agg:
             l = agg["latency"]
+            def _s(v: float | None) -> str:
+                return f"{v:.2f}s" if v is not None else "n/a"
             lines.append(f"[Latency — {meta['backend_models'].get(backend, backend)}]")
             lines.append(f"  Per bullet (amortised, {l['bullets']} bullets) — resume-citable")
-            lines.append(f"    P50:                {l['p50_per_bullet']:.2f}s")
-            lines.append(f"    P95:                {l['p95_per_bullet']:.2f}s")
-            lines.append(f"    Range:              {l['min_per_bullet']:.2f}s – {l['max_per_bullet']:.2f}s")
+            lines.append(f"    P50:                {_s(l['p50_per_bullet'])}")
+            lines.append(f"    P95:                {_s(l['p95_per_bullet'])}")
+            lines.append(f"    Range:              {_s(l['min_per_bullet'])} – {_s(l['max_per_bullet'])}")
             lines.append(f"  Per case ({l['cases']} cases, full orchestrator including JD analysis + scoring + retrieval)")
-            lines.append(f"    P50:                {l['p50_per_case']:.2f}s")
-            lines.append(f"    P95:                {l['p95_per_case']:.2f}s")
-            lines.append(f"    Range:              {l['min_per_case']:.2f}s – {l['max_per_case']:.2f}s")
+            lines.append(f"    P50:                {_s(l['p50_per_case'])}")
+            lines.append(f"    P95:                {_s(l['p95_per_case'])}")
+            lines.append(f"    Range:              {_s(l['min_per_case'])} – {_s(l['max_per_case'])}")
             lines.append("")
 
     return "\n".join(lines)
