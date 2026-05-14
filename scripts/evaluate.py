@@ -203,7 +203,14 @@ def load_eval_set(path: Path) -> list[dict]:
         from a different case)
       • case_id must be non-empty (cache-key correctness)
     """
-    raw = json.loads(path.read_text(encoding="utf-8"))
+    # Convert JSONDecodeError to ValueError-with-context so all eval-set
+    # load failures (parse errors AND validation errors below) surface
+    # through the single ValueError catch in main_async, instead of a raw
+    # JSONDecodeError traceback for malformed JSON only.
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"{path}: invalid JSON ({exc})") from exc
     if not isinstance(raw, list):
         raise ValueError(f"{path}: expected a JSON list of cases, got {type(raw).__name__}")
     cases = [c for c in raw if not (isinstance(c, dict) and c.get("_comment"))]
@@ -789,7 +796,14 @@ async def main_async(args: argparse.Namespace) -> int:
         print(f"Eval set not found: {args.eval_set}", file=sys.stderr)
         print("Hint: run `python scripts/build_eval_set.py` first to generate it.", file=sys.stderr)
         return 2
-    cases = load_eval_set(args.eval_set)
+    # ValueError covers malformed JSON (re-raised from JSONDecodeError) and
+    # all the validation rules in load_eval_set (missing fields, bad
+    # role_type, duplicate case_id, bad correct_projects entries).
+    try:
+        cases = load_eval_set(args.eval_set)
+    except ValueError as exc:
+        print(f"Error loading eval set: {exc}", file=sys.stderr)
+        return 2
     if args.limit:
         cases = cases[:args.limit]
     if not cases:

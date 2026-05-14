@@ -206,6 +206,17 @@ async def main_async(args: argparse.Namespace) -> int:
             print(f"SKIP ({exc})")
             continue
 
+    # cases always contains the header dict, so a truly empty run still has
+    # length 1. Don't silently overwrite the output file with a header-only
+    # eval set — that's a failure, not a successful zero-case run.
+    if len(cases) <= 1:
+        print(
+            f"\nERROR: every PDF in {args.pdf_dir} was skipped — no cases "
+            f"generated. {args.output} left unchanged.",
+            file=sys.stderr,
+        )
+        return 1
+
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(cases, indent=2), encoding="utf-8")
     print(f"\nWrote {args.output} with {len(cases) - 1} cases.")
