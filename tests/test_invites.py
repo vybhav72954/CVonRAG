@@ -118,6 +118,18 @@ class TestInviteAuth:
             )
         assert resp.status_code == 200
 
+    def test_header_with_stray_whitespace_still_matches(self, client, gate_enabled):
+        """B1 defense in depth: copy-paste often appends a trailing space.
+        The header lookup strips before comparing so the user isn't 401'd
+        for an invisible character."""
+        _create_invite(client, "TRIMTEST")
+        with patch("app.main._do_recommend", new=AsyncMock(return_value=[])):
+            resp = client.post(
+                "/recommend", json=RECOMMEND_BODY,
+                headers={"X-Invite-Code": " TRIMTEST "},
+            )
+        assert resp.status_code == 200
+
 
 # ── Admin endpoints ───────────────────────────────────────────────────────────
 
@@ -145,6 +157,19 @@ class TestAdminInvites:
         _create_invite(client, "DUP")
         resp = client.post("/admin/invites", json={"code": "DUP", "name": "x"})
         assert resp.status_code == 409
+
+    def test_create_invite_rejects_whitespace_in_code(self, client):
+        """B1: trailing whitespace in code would silently 401 the user later."""
+        resp = client.post("/admin/invites", json={"code": "BAD CODE", "name": "x"})
+        assert resp.status_code == 422
+        resp = client.post("/admin/invites", json={"code": "TRAIL ", "name": "x"})
+        assert resp.status_code == 422
+
+    def test_create_invite_rejects_control_chars_in_code(self, client):
+        """B1: code regex `^[A-Za-z0-9_-]+$` should reject anything weird."""
+        for bad in ["AB<C", "AB;C", "AB\nC", "AB/C", "AB.C"]:
+            resp = client.post("/admin/invites", json={"code": bad, "name": "x"})
+            assert resp.status_code == 422, f"{bad!r} should be rejected"
 
     def test_list_usage_returns_all_invites(self, client):
         _create_invite(client, "ALI", "Alice")

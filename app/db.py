@@ -55,6 +55,12 @@ class Invite(Base):
     bullets_today: Mapped[int] = mapped_column(Integer, default=0)
     today_date: Mapped[date | None] = mapped_column(Date, nullable=True)
 
+    def __repr__(self) -> str:  # B5 — readable debug output
+        return (
+            f"Invite(code={self.code!r}, optimize_today={self.optimize_today}, "
+            f"optimize_count={self.optimize_count})"
+        )
+
 
 # ── Engine + session factory ──────────────────────────────────────────────────
 # Built lazily on first call so tests that monkeypatch settings.sqlite_path
