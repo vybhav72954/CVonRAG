@@ -336,11 +336,15 @@ async def parse_cv_to_projects(cv_path: Path) -> list[ProjectData]:
             continue
         if not facts:
             continue
-        # Same slug strategy as parser.parse_and_stream, just inline.
-        from app.parser import _make_slug
+        # project_id is internal to one orchestrator run (used as a dict
+        # key in CVonRAGOrchestrator's project_fact_map). The enumerate
+        # index makes it unique within a request, and the cache is keyed
+        # on cv_path::backend, so we don't need the stable slug-with-SHA1
+        # form parser.parse_and_stream uses. Pure indexed id keeps this
+        # script free of any dependency on app.parser internals.
         try:
             out.append(ProjectData(
-                project_id=f"p-{i:03d}-{_make_slug(rp.title)}",
+                project_id=f"p-{i:03d}",
                 title=rp.title,
                 core_facts=facts,
             ))
