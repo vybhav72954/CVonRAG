@@ -134,7 +134,9 @@ def _positive_int(value: str) -> int:
     try:
         n = int(value)
     except ValueError:
-        raise argparse.ArgumentTypeError(f"{value!r} is not an integer")
+        # `from None` suppresses chaining — argparse already produces a
+        # clean user-facing error from ArgumentTypeError.
+        raise argparse.ArgumentTypeError(f"{value!r} is not an integer") from None
     if n <= 0:
         raise argparse.ArgumentTypeError(f"must be > 0 (got {n})")
     return n

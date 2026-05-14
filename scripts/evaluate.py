@@ -728,18 +728,18 @@ def format_report(
             lines.append("")
 
         if "latency" in agg:
-            l = agg["latency"]
+            latency = agg["latency"]
             def _s(v: float | None) -> str:
                 return f"{v:.2f}s" if v is not None else "n/a"
             lines.append(f"[Latency — {meta['backend_models'].get(backend, backend)}]")
-            lines.append(f"  Per bullet (amortised, {l['bullets']} bullets) — resume-citable")
-            lines.append(f"    P50:                {_s(l['p50_per_bullet'])}")
-            lines.append(f"    P95:                {_s(l['p95_per_bullet'])}")
-            lines.append(f"    Range:              {_s(l['min_per_bullet'])} – {_s(l['max_per_bullet'])}")
-            lines.append(f"  Per case ({l['cases']} cases, full orchestrator including JD analysis + scoring + retrieval)")
-            lines.append(f"    P50:                {_s(l['p50_per_case'])}")
-            lines.append(f"    P95:                {_s(l['p95_per_case'])}")
-            lines.append(f"    Range:              {_s(l['min_per_case'])} – {_s(l['max_per_case'])}")
+            lines.append(f"  Per bullet (amortised, {latency['bullets']} bullets) — resume-citable")
+            lines.append(f"    P50:                {_s(latency['p50_per_bullet'])}")
+            lines.append(f"    P95:                {_s(latency['p95_per_bullet'])}")
+            lines.append(f"    Range:              {_s(latency['min_per_bullet'])} – {_s(latency['max_per_bullet'])}")
+            lines.append(f"  Per case ({latency['cases']} cases, full orchestrator including JD analysis + scoring + retrieval)")
+            lines.append(f"    P50:                {_s(latency['p50_per_case'])}")
+            lines.append(f"    P95:                {_s(latency['p95_per_case'])}")
+            lines.append(f"    Range:              {_s(latency['min_per_case'])} – {_s(latency['max_per_case'])}")
             lines.append("")
 
     return "\n".join(lines)
@@ -759,7 +759,9 @@ def _positive_int(value: str) -> int:
     try:
         n = int(value)
     except ValueError:
-        raise argparse.ArgumentTypeError(f"{value!r} is not an integer")
+        # `from None` suppresses exception chaining — argparse converts
+        # ArgumentTypeError to a clean usage error, no traceback noise.
+        raise argparse.ArgumentTypeError(f"{value!r} is not an integer") from None
     if n <= 0:
         raise argparse.ArgumentTypeError(f"must be > 0 (got {n})")
     return n
