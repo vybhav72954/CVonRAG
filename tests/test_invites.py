@@ -389,55 +389,59 @@ class TestAtomicCapEnforcement:
         import asyncio
         from httpx import ASGITransport, AsyncClient
         from app.main import app
-        from app.db import init_db
+        from app.db import close_db, init_db
 
         # AsyncClient doesn't fire FastAPI's lifespan → init_db never runs.
         # Do it manually here (the autouse fixture already pointed sqlite_path
-        # at a tmp tmp_path db).
+        # at a tmp tmp_path db). Wrap in try/finally so the per-test SQLite
+        # engine is always torn down — otherwise the file handle can linger
+        # on Windows and block pytest's tmp_path cleanup.
         await init_db()
+        try:
+            monkeypatch.setattr(settings, "max_daily_optimizations", 2)
+            monkeypatch.setattr(settings, "max_daily_bullets", 1000)
 
-        monkeypatch.setattr(settings, "max_daily_optimizations", 2)
-        monkeypatch.setattr(settings, "max_daily_bullets", 1000)
+            with patch("app.main._sse_stream", new=lambda body: _empty_sse()):
+                transport = ASGITransport(app=app)
+                async with AsyncClient(transport=transport, base_url="http://test") as ac:
+                    # Pre-create the invite (sync TestClient inside async test is
+                    # awkward, so we POST via the same client).
+                    r = await ac.post(
+                        "/admin/invites",
+                        json={"code": "RACECAP", "name": "Race"},
+                    )
+                    assert r.status_code == 200, r.text
 
-        with patch("app.main._sse_stream", new=lambda body: _empty_sse()):
-            transport = ASGITransport(app=app)
-            async with AsyncClient(transport=transport, base_url="http://test") as ac:
-                # Pre-create the invite (sync TestClient inside async test is
-                # awkward, so we POST via the same client).
-                r = await ac.post(
-                    "/admin/invites",
-                    json={"code": "RACECAP", "name": "Race"},
-                )
-                assert r.status_code == 200, r.text
-
-                # First call burns one of the two slots (optimize_today goes 0→1).
-                r1 = await ac.post(
-                    "/optimize",
-                    json=OPTIMIZE_BODY,
-                    headers={"X-Invite-Code": "RACECAP"},
-                )
-                assert r1.status_code == 200
-
-                # Now fire two MORE concurrent calls. Only one should slip
-                # into the second slot (1→2); the other must 429.
-                r2, r3 = await asyncio.gather(
-                    ac.post(
+                    # First call burns one of the two slots (optimize_today goes 0→1).
+                    r1 = await ac.post(
                         "/optimize",
                         json=OPTIMIZE_BODY,
                         headers={"X-Invite-Code": "RACECAP"},
-                    ),
-                    ac.post(
-                        "/optimize",
-                        json=OPTIMIZE_BODY,
-                        headers={"X-Invite-Code": "RACECAP"},
-                    ),
-                )
-                statuses = sorted([r2.status_code, r3.status_code])
-                # Exactly one 200, exactly one 429 — never two 200s.
-                assert statuses == [200, 429], (
-                    f"Expected one success + one cap rejection, got {statuses}. "
-                    "If both are 200, B2's atomic UPDATE regressed."
-                )
+                    )
+                    assert r1.status_code == 200
+
+                    # Now fire two MORE concurrent calls. Only one should slip
+                    # into the second slot (1→2); the other must 429.
+                    r2, r3 = await asyncio.gather(
+                        ac.post(
+                            "/optimize",
+                            json=OPTIMIZE_BODY,
+                            headers={"X-Invite-Code": "RACECAP"},
+                        ),
+                        ac.post(
+                            "/optimize",
+                            json=OPTIMIZE_BODY,
+                            headers={"X-Invite-Code": "RACECAP"},
+                        ),
+                    )
+                    statuses = sorted([r2.status_code, r3.status_code])
+                    # Exactly one 200, exactly one 429 — never two 200s.
+                    assert statuses == [200, 429], (
+                        f"Expected one success + one cap rejection, got {statuses}. "
+                        "If both are 200, B2's atomic UPDATE regressed."
+                    )
+        finally:
+            await close_db()
 
     @pytest.mark.anyio
     async def test_concurrent_bullet_reservation_respects_cap(
@@ -449,42 +453,44 @@ class TestAtomicCapEnforcement:
         import asyncio
         from httpx import ASGITransport, AsyncClient
         from app.main import app
-        from app.db import init_db
+        from app.db import close_db, init_db
 
         await init_db()  # AsyncClient skips lifespan; init manually
+        try:
+            monkeypatch.setattr(settings, "max_daily_optimizations", 1000)
+            monkeypatch.setattr(settings, "max_daily_bullets", 2)
 
-        monkeypatch.setattr(settings, "max_daily_optimizations", 1000)
-        monkeypatch.setattr(settings, "max_daily_bullets", 2)
+            # Use a body that requests 2 bullets.
+            body = {**OPTIMIZE_BODY, "total_bullets_requested": 2}
 
-        # Use a body that requests 2 bullets.
-        body = {**OPTIMIZE_BODY, "total_bullets_requested": 2}
+            with patch("app.main._sse_stream", new=lambda body: _empty_sse()):
+                transport = ASGITransport(app=app)
+                async with AsyncClient(transport=transport, base_url="http://test") as ac:
+                    r = await ac.post(
+                        "/admin/invites",
+                        json={"code": "BULLETRACE", "name": "BR"},
+                    )
+                    assert r.status_code == 200, r.text
 
-        with patch("app.main._sse_stream", new=lambda body: _empty_sse()):
-            transport = ASGITransport(app=app)
-            async with AsyncClient(transport=transport, base_url="http://test") as ac:
-                r = await ac.post(
-                    "/admin/invites",
-                    json={"code": "BULLETRACE", "name": "BR"},
-                )
-                assert r.status_code == 200, r.text
-
-                r1, r2 = await asyncio.gather(
-                    ac.post(
-                        "/optimize",
-                        json=body,
-                        headers={"X-Invite-Code": "BULLETRACE"},
-                    ),
-                    ac.post(
-                        "/optimize",
-                        json=body,
-                        headers={"X-Invite-Code": "BULLETRACE"},
-                    ),
-                )
-                statuses = sorted([r1.status_code, r2.status_code])
-                assert statuses == [200, 429], (
-                    f"Expected one success + one bullet-cap rejection, got {statuses}. "
-                    "If both are 200, B3's atomic UPDATE regressed."
-                )
+                    r1, r2 = await asyncio.gather(
+                        ac.post(
+                            "/optimize",
+                            json=body,
+                            headers={"X-Invite-Code": "BULLETRACE"},
+                        ),
+                        ac.post(
+                            "/optimize",
+                            json=body,
+                            headers={"X-Invite-Code": "BULLETRACE"},
+                        ),
+                    )
+                    statuses = sorted([r1.status_code, r2.status_code])
+                    assert statuses == [200, 429], (
+                        f"Expected one success + one bullet-cap rejection, got {statuses}. "
+                        "If both are 200, B3's atomic UPDATE regressed."
+                    )
+        finally:
+            await close_db()
 
 
 class TestDailyResetEdgeCases:

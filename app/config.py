@@ -148,6 +148,16 @@ class Settings(BaseSettings):
     # for local dev; deployments should mount this to a persistent volume.
     sqlite_path: str = "./cvonrag.db"
 
+    def _is_production_env(self) -> bool:
+        """`app_env == "production"` after normalization.
+
+        Pydantic doesn't auto-trim/lowercase string env vars, so values like
+        `APP_ENV=Production` or `APP_ENV=" production"` would silently skip
+        both prod warnings below. Comparing a normalized copy makes the check
+        robust to common casing/whitespace mistakes in the .env file.
+        """
+        return (self.app_env or "").strip().lower() == "production"
+
     @model_validator(mode="after")
     def _warn_production_cors(self) -> "Settings":
         """
@@ -159,7 +169,7 @@ class Settings(BaseSettings):
             Settings: The same Settings instance.
         """
         if (
-            self.app_env == "production"
+            self._is_production_env()
             and self.cors_origins == ["http://localhost:5173"]
         ):
             logging.getLogger("cvonrag").warning(
@@ -178,7 +188,7 @@ class Settings(BaseSettings):
         Returns:
             Settings: The same `Settings` instance (`self`).
         """
-        if self.app_env == "production" and not self.ingest_secret:
+        if self._is_production_env() and not self.ingest_secret:
             logging.getLogger("cvonrag").warning(
                 "INGEST_SECRET is empty in production — /ingest and /admin/* "
                 "are unauthenticated. Set a long random INGEST_SECRET in .env "

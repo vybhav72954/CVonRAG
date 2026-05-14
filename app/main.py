@@ -202,15 +202,16 @@ async def lifespan(_: FastAPI):
         logger.info("Qdrant ready.")
     except Exception as exc:
         logger.warning("Qdrant startup check failed (will retry on first request): %s", exc)
-    # SQLite invite DB — create the table file/schema if missing. Failure here
-    # is fatal in production (no invites = nobody can call gated endpoints)
-    # but the dev override INVITE_CODES_REQUIRED=false makes the table moot.
+    # SQLite invite DB — create the table file/schema if missing. Any failure
+    # here aborts startup: even when INVITE_CODES_REQUIRED=false, the admin
+    # endpoints (`/admin/invites`, `/admin/usage`) still depend on the session
+    # factory; letting the app start in a broken state would surface as 500s
+    # on those calls rather than a clean boot failure (B13).
     try:
         await init_db()
-    except Exception as exc:
-        logger.exception("Invite DB init failed: %s", exc)
-        if settings.invite_codes_required:
-            raise
+    except Exception:
+        logger.exception("Invite DB init failed; aborting startup")
+        raise
     yield
     # ── Shutdown: close singleton clients ──────────────────────────────
     logger.info("CVonRAG shutting down — closing connections …")
