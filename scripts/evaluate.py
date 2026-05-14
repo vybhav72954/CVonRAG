@@ -10,7 +10,9 @@ five guarantees the architecture claims:
   3. Retrieval quality    — Qdrant cosine-similarity stats on style exemplars
   4. Recommender hit-rate — % of cases where a labelled correct project is
                             in the top-2 recommended projects
-  5. End-to-end latency   — P50 / P95 wall-clock for one bullet generation
+  5. End-to-end latency   — P50 / P95 per-bullet (amortised: total per-case
+                            time ÷ bullets generated; setup overhead spread
+                            across bullets) + per-case context
 
 Input:   tests/eval_set.json  (list of CV+JD cases with labelled correct_projects)
 Output:  stdout report + docs/EVAL_REPORT.md + eval_results.json (raw per-case data)
@@ -41,6 +43,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import math
 import re
 import statistics
 import sys
@@ -116,8 +119,14 @@ class CaseResult:
     recommended_titles: list[str] = field(default_factory=list)
     correct_titles: list[str] = field(default_factory=list)
     hit_at_2: bool | None = None
-    # Phase 5
-    latency_s: float | None = None
+    # Phase 5 — both are recorded so the report can show per-bullet (headline)
+    # AND per-case (context). Per-case includes one-time JD analysis + scoring
+    # + retrieval setup amortised across the case's bullets; per-bullet divides
+    # that total by the bullet count, giving the comparable "what does it cost
+    # to produce one optimised bullet" number.
+    latency_s: float | None = None              # whole orchestrator run (per case)
+    latency_per_bullet_s: float | None = None   # latency_s / len(bullets)
+    bullets_generated: int = 0
     # Error capture
     error: str | None = None
 
@@ -286,13 +295,16 @@ async def run_one_case(
     # ── Phases 1, 2, 5: drive the orchestrator end-to-end ────────────────────
     needs_optimize = phases & {"char", "facts", "latency"}
     if needs_optimize:
-        # Cap bullets per case to keep the run bounded; one project × 2 bullets
-        # is enough for char/fact stats without burning quota.
+        # Per-case `target_char_limit` overrides the CLI default — lets the
+        # eval set carry mixed targets (e.g. 110-char bullets for one role,
+        # 140 for another) so Phase 1 always measures against the correct
+        # target instead of the global flag.
+        case_char_target = int(case.get("target_char_limit", char_target))
         req = OptimizationRequest(
             job_description=case["jd_text"],
             projects=projects[:3],  # top 3 projects max per case
             constraints=FormattingConstraints(
-                target_char_limit=char_target,
+                target_char_limit=case_char_target,
                 tolerance=settings.char_tolerance,
                 max_bullets_per_project=2,
             ),
@@ -305,8 +317,7 @@ async def run_one_case(
         t0 = time.perf_counter()
         try:
             async for event_type, payload in orchestrator.run(req):
-                if event_type == "bullet":
-                    assert isinstance(payload, GeneratedBullet)
+                if event_type == "bullet" and isinstance(payload, GeneratedBullet):
                     bullets.append(payload)
         except HostedLLMQuotaExhausted as exc:
             result.error = f"quota_exhausted: {exc}"
@@ -316,6 +327,14 @@ async def run_one_case(
             result.error = f"optimize_failed: {exc}"
             return result
         result.latency_s = time.perf_counter() - t0
+        result.bullets_generated = len(bullets)
+        # Per-bullet amortised cost — includes JD analysis + scoring +
+        # retrieval setup spread across the bullets generated. This is the
+        # apples-to-apples number to cite for "how long to produce one
+        # bullet"; raw latency_s is reported alongside as case-level context.
+        result.latency_per_bullet_s = (
+            result.latency_s / len(bullets) if bullets else None
+        )
 
         # Phase 1: char accuracy per bullet
         if "char" in phases:
@@ -461,15 +480,30 @@ def aggregate(results: list[CaseResult], phases: set[str]) -> dict[str, Any]:
             }
 
     if "latency" in phases:
-        lats = sorted(r.latency_s for r in results if r.latency_s is not None)
-        if lats:
-            p95_idx = max(0, min(len(lats) - 1, int(0.95 * len(lats))))
+        per_bullet = sorted(
+            r.latency_per_bullet_s for r in results
+            if r.latency_per_bullet_s is not None
+        )
+        per_case = sorted(r.latency_s for r in results if r.latency_s is not None)
+        if per_bullet:
+            # Nearest-rank percentile, 0-indexed. For N<20 this lands on max
+            # regardless (mathematically correct — small samples can't resolve
+            # P95 below max), but the ceil form is right for N≥20 too.
+            p95_idx = max(0, min(len(per_bullet) - 1, math.ceil(0.95 * len(per_bullet)) - 1))
+            case_p95_idx = max(0, min(len(per_case) - 1, math.ceil(0.95 * len(per_case)) - 1))
             section["latency"] = {
-                "samples": len(lats),
-                "p50":     statistics.median(lats),
-                "p95":     lats[p95_idx],
-                "min":     min(lats),
-                "max":     max(lats),
+                # Headline — per-bullet amortised cost (resume-citable)
+                "bullets":           sum(r.bullets_generated for r in results),
+                "p50_per_bullet":    statistics.median(per_bullet),
+                "p95_per_bullet":    per_bullet[p95_idx],
+                "min_per_bullet":    min(per_bullet),
+                "max_per_bullet":    max(per_bullet),
+                # Context — per-case end-to-end cost
+                "cases":             len(per_case),
+                "p50_per_case":      statistics.median(per_case),
+                "p95_per_case":      per_case[case_p95_idx],
+                "min_per_case":      min(per_case),
+                "max_per_case":      max(per_case),
             }
 
     return section
@@ -549,10 +583,14 @@ def format_report(
         if "latency" in agg:
             l = agg["latency"]
             lines.append(f"[Latency — {meta['backend_models'].get(backend, backend)}]")
-            lines.append(f"  Samples:              {l['samples']}")
-            lines.append(f"  P50:                  {l['p50']:.2f}s")
-            lines.append(f"  P95:                  {l['p95']:.2f}s")
-            lines.append(f"  Range:                {l['min']:.2f}s – {l['max']:.2f}s")
+            lines.append(f"  Per bullet (amortised, {l['bullets']} bullets) — resume-citable")
+            lines.append(f"    P50:                {l['p50_per_bullet']:.2f}s")
+            lines.append(f"    P95:                {l['p95_per_bullet']:.2f}s")
+            lines.append(f"    Range:              {l['min_per_bullet']:.2f}s – {l['max_per_bullet']:.2f}s")
+            lines.append(f"  Per case ({l['cases']} cases, full orchestrator including JD analysis + scoring + retrieval)")
+            lines.append(f"    P50:                {l['p50_per_case']:.2f}s")
+            lines.append(f"    P95:                {l['p95_per_case']:.2f}s")
+            lines.append(f"    Range:              {l['min_per_case']:.2f}s – {l['max_per_case']:.2f}s")
             lines.append("")
 
     return "\n".join(lines)
@@ -724,8 +762,10 @@ async def main_async(args: argparse.Namespace) -> int:
                     "recommended_titles": r.recommended_titles,
                     "correct_titles":     r.correct_titles,
                     "hit_at_2":           r.hit_at_2,
-                    "latency_s":          r.latency_s,
-                    "error":              r.error,
+                    "latency_s":            r.latency_s,
+                    "latency_per_bullet_s": r.latency_per_bullet_s,
+                    "bullets_generated":    r.bullets_generated,
+                    "error":                r.error,
                 }
                 for r in results
             ]
