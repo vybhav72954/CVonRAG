@@ -156,8 +156,11 @@ def parse_args() -> argparse.Namespace:
 
 
 async def main_async(args: argparse.Namespace) -> int:
-    if not args.pdf_dir.exists():
-        print(f"PDF dir not found: {args.pdf_dir}", file=sys.stderr)
+    # is_dir() instead of exists() so a regular file passed as --pdf-dir
+    # produces the friendly error instead of NotADirectoryError from the
+    # iterdir() call below.
+    if not args.pdf_dir.is_dir():
+        print(f"PDF dir not found or not a directory: {args.pdf_dir}", file=sys.stderr)
         return 2
 
     # cv_path.relative_to(_PROJECT_ROOT) inside build_case() will ValueError

@@ -17,9 +17,14 @@ five guarantees the architecture claims:
   3. Retrieval quality    — Qdrant cosine-similarity stats on style exemplars
   4. Recommender hit-rate — % of cases where a labelled correct project is
                             in the top-2 recommended projects
-  5. End-to-end latency   — P50 / P95 per-bullet (amortised: total per-case
-                            time ÷ bullets generated; setup overhead spread
-                            across bullets) + per-case context
+  5. Latency              — P50 / P95 per-bullet for the optimiser pipeline
+                            only — orchestrator.run() = JD analysis +
+                            scoring + retrieval + bullet generation. The
+                            one-time PDF parse + LLM fact extraction is
+                            NOT included; those amortise across many JDs
+                            for the same CV and aren't comparable to the
+                            per-bullet generation cost the resume claim
+                            refers to. Per-case context shown alongside.
 
 Input:   tests/eval_set.json  (list of CV+JD cases with labelled correct_projects)
 Output:  stdout report + docs/EVAL_REPORT.md + eval_results.json (raw per-case data)
@@ -261,6 +266,21 @@ def load_eval_set(path: Path) -> list[dict]:
                     f"string (got {type(value).__name__})"
                 )
 
+        # cv_path must resolve to a location inside the repo. Absolute
+        # paths (e.g. "C:\Users\..." on Windows) and "../" traversal would
+        # otherwise let an eval set read arbitrary local files when run by
+        # someone other than the author — and the join semantics for
+        # absolute paths are surprising (Path("Z:/repo") / "C:/x" yields
+        # "C:/x", silently dropping the repo prefix).
+        cv_resolved = (_PROJECT_ROOT / c["cv_path"]).resolve()
+        try:
+            cv_resolved.relative_to(_PROJECT_ROOT.resolve())
+        except ValueError:
+            raise ValueError(
+                f"{path}: case {cid} cv_path must resolve inside repo root "
+                f"({_PROJECT_ROOT}); got {c['cv_path']!r}"
+            ) from None
+
         rt = c["target_role_type"]
         if not isinstance(rt, str):
             raise ValueError(
@@ -347,27 +367,39 @@ async def run_one_case(
     cid = case["case_id"]
     result = CaseResult(case_id=cid, backend=backend, correct_titles=case.get("correct_projects", []))
 
-    cv_path = (_PROJECT_ROOT / case["cv_path"]).resolve()
-    if not cv_path.exists():
-        result.error = f"CV not found: {cv_path}"
-        return result
+    # Parse is only needed by phases that consume the parsed CoreFacts.
+    # Retrieval queries Qdrant with the JD text alone, so a retrieval-only
+    # run shouldn't fail when the CV is missing / unparseable / outside
+    # the scope of this case's actual concern.
+    needs_parse = bool(phases & {"char", "facts", "latency", "recommender"})
 
-    # ── Parse CV (shared across phases for the same case+backend) ────────────
-    cache_key = f"{cid}::{backend}"
-    if cache_key in fact_lookup_cache:
-        projects = fact_lookup_cache[cache_key]
-    else:
-        try:
-            projects = await parse_cv_to_projects(cv_path)
-        except HostedLLMQuotaExhausted as exc:
-            result.error = f"quota_exhausted: {exc}"
+    projects: list[ProjectData] = []
+    fact_by_id: dict[str, Any] = {}
+    if needs_parse:
+        cv_path = (_PROJECT_ROOT / case["cv_path"]).resolve()
+        if not cv_path.exists():
+            result.error = f"CV not found: {cv_path}"
             return result
-        except Exception as exc:
-            result.error = f"parse_failed: {exc}"
-            return result
-        fact_lookup_cache[cache_key] = projects
 
-    fact_by_id = {f.fact_id: f for p in projects for f in p.core_facts}
+        # ── Parse CV (shared across phases for the same case+backend) ──
+        # Cache by resolved cv_path so two cases referencing the same CV
+        # (e.g. same resume against different JDs) parse once, not twice.
+        # The previous case_id-based key forced re-parsing every time.
+        cache_key = f"{cv_path}::{backend}"
+        if cache_key in fact_lookup_cache:
+            projects = fact_lookup_cache[cache_key]
+        else:
+            try:
+                projects = await parse_cv_to_projects(cv_path)
+            except HostedLLMQuotaExhausted as exc:
+                result.error = f"quota_exhausted: {exc}"
+                return result
+            except Exception as exc:
+                result.error = f"parse_failed: {exc}"
+                return result
+            fact_lookup_cache[cache_key] = projects
+
+        fact_by_id = {f.fact_id: f for p in projects for f in p.core_facts}
 
     # ── Phase 3: Retrieval quality (cheap — one embedding call) ──────────────
     if "retrieval" in phases:
