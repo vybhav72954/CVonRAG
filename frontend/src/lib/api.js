@@ -2,8 +2,23 @@
  * CVonRAG — api.js
  * Set VITE_API_URL in frontend/.env (defaults to http://localhost:8000)
  */
+import { get } from 'svelte/store';
+import { inviteCode } from '$lib/stores';
 
 const BASE = import.meta.env.VITE_API_URL ?? 'http://localhost:8000';
+
+// ── Auth header helper ──────────────────────────────────────────────────────
+// Per-batchmate invite code is held in the inviteCode store (persistent to
+// sessionStorage). When the backend has INVITE_CODES_REQUIRED=true, every
+// gated request (parse/recommend/optimize) needs this header or returns 401.
+// When the code is empty (user hasn't entered one yet), we omit the header
+// entirely — the backend will reject with a 401 whose message is surfaced
+// via formatErrorDetail like any other error, prompting the user to enter
+// a code.
+function authHeaders() {
+  const code = get(inviteCode);
+  return code ? { 'X-Invite-Code': code } : {};
+}
 
 // F8: production deploys that forget to set VITE_API_URL silently fall back to
 // localhost and surface as "Cannot reach backend" with no clue why. Catch the
@@ -149,7 +164,10 @@ export async function parseCV(file, { onProgress, onProject, onDone, onError } =
 
   let resp;
   try {
-    resp = await fetch(`${BASE}/parse`, { method: 'POST', body: form, signal: controller.signal });
+    resp = await fetch(`${BASE}/parse`, {
+      method: 'POST', body: form, signal: controller.signal,
+      headers: authHeaders(),
+    });
   } catch (err) {
     clearTimeout(timer);
     if (!isCurrent('parse', controller)) return;  // superseded → silent (F1)
@@ -199,7 +217,7 @@ export async function recommendProjects(payload, { onDone, onError } = {}) {
   try {
     const resp = await fetch(`${BASE}/recommend`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', ...authHeaders() },
       body: JSON.stringify(payload),
       signal: controller.signal,
     });
@@ -241,7 +259,7 @@ export async function optimizeResume(payload, { onToken, onBullet, onDone, onErr
   try {
     resp = await fetch(`${BASE}/optimize`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', ...authHeaders() },
       body: JSON.stringify(payload),
       signal: controller.signal,
     });
