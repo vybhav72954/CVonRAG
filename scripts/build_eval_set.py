@@ -250,6 +250,16 @@ async def main_async(args: argparse.Namespace) -> int:
     # length 1. Don't silently overwrite the output file with a header-only
     # eval set — that's a failure, not a successful zero-case run.
     if len(cases) <= 1:
+        # Distinguish quota-on-first-PDF (exit 3, transient — retry later)
+        # from "every PDF actually parsed but failed" (exit 1, real bug in
+        # the corpus). Both leave the output file unchanged.
+        if quota_hit:
+            print(
+                f"\nERROR: quota exhausted before any case was built. "
+                f"{args.output} left unchanged. Retry after the quota window resets.",
+                file=sys.stderr,
+            )
+            return 3
         print(
             f"\nERROR: every PDF in {pdf_dir} was skipped — no cases "
             f"generated. {args.output} left unchanged.",
