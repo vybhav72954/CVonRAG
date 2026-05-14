@@ -226,6 +226,18 @@ class InviteCreate(BaseModel):
     def _no_surrounding_whitespace(cls, v: str) -> str:
         # Pydantic's `pattern` already rejects spaces inside the string,
         # but this gives a clearer error than "string did not match pattern".
+        """
+        Ensure a code string does not have leading or trailing whitespace.
+        
+        Parameters:
+            v (str): The code value to validate.
+        
+        Returns:
+            str: The validated input string `v`.
+        
+        Raises:
+            ValueError: If `v` contains leading or trailing whitespace.
+        """
         if v != v.strip():
             raise ValueError("code must not contain leading or trailing whitespace")
         return v

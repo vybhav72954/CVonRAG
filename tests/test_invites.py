@@ -60,14 +60,27 @@ _VALID_PDF_FILE = ("cv.pdf", _PDF_MAGIC + b"x" * 200, "application/pdf")
 
 
 async def _mock_parse_stream(file_bytes, filename):
-    """Stand-in for app.parser.parse_and_stream — yields a single done event so
-    /parse returns 200 quickly without invoking the real parser."""
+    """
+    Yield a single `'done'` parse event for tests.
+    
+    Parameters:
+        file_bytes (bytes): Input bytes passed by the caller (ignored).
+        filename (str): Filename passed by the caller (ignored).
+    
+    Returns:
+        Async generator that yields a single tuple: `("done", {"total_projects": 0, "total_facts": 0})`.
+    """
     yield ("done", {"total_projects": 0, "total_facts": 0})
 
 
 @pytest.fixture
 def client():
-    """Fresh TestClient (and lifespan) per test so the SQLite DB is rebuilt."""
+    """
+    Provide a fresh FastAPI TestClient with application lifespan for each test, ensuring the SQLite database is rebuilt.
+    
+    Returns:
+        c (TestClient): A TestClient instance (context-managed) configured with raise_server_exceptions=True, yielded for use in the test.
+    """
     with TestClient(app, raise_server_exceptions=True) as c:
         yield c
 
@@ -79,8 +92,19 @@ def gate_enabled(monkeypatch):
 
 
 def _create_invite(client: TestClient, code: str, name: str = "Test") -> dict:
-    """Create an invite via POST /admin/invites. ingest_secret is "" by
-    default (autouse fixture), so no header is needed."""
+    """
+    Create an invite by POSTing to /admin/invites and return the created invite record.
+    
+    This helper asserts the HTTP response status is 200.
+    
+    Parameters:
+        client (TestClient): Test client used to send the request.
+        code (str): Invite code to create.
+        name (str): Human-readable name for the invite; defaults to "Test".
+    
+    Returns:
+        dict: The JSON-decoded response body representing the created invite.
+    """
     resp = client.post("/admin/invites", json={"code": code, "name": name})
     assert resp.status_code == 200, resp.text
     return resp.json()
@@ -169,6 +193,11 @@ class TestInviteAuth:
         assert "text/event-stream" in resp.headers["content-type"]
 
     def test_parse_header_with_stray_whitespace_still_matches(self, client, gate_enabled):
+        """
+        Verifies that POST /parse accepts an invite code header with leading or trailing whitespace.
+        
+        Creates an invite "PTRIM", stubs the parser stream, sends a /parse request with header value " PTRIM ", and asserts the request succeeds (HTTP 200).
+        """
         _create_invite(client, "PTRIM")
         with patch("app.main.parse_and_stream", side_effect=_mock_parse_stream):
             resp = client.post(
@@ -206,7 +235,11 @@ class TestAdminInvites:
         assert resp.status_code == 409
 
     def test_create_invite_rejects_whitespace_in_code(self, client):
-        """B1: trailing whitespace in code would silently 401 the user later."""
+        """
+        Ensure invite creation rejects codes containing whitespace.
+        
+        Asserts that POST /admin/invites with a code containing spaces (internal or trailing) returns HTTP 422.
+        """
         resp = client.post("/admin/invites", json={"code": "BAD CODE", "name": "x"})
         assert resp.status_code == 422
         resp = client.post("/admin/invites", json={"code": "TRAIL ", "name": "x"})
@@ -505,6 +538,11 @@ class TestDailyResetEdgeCases:
         yesterday = datetime.now(timezone.utc).date() - timedelta(days=1)
 
         async def _rewind():
+            """
+            Set the "YESTERDAY" invite row's daily state to a prior date and preset daily counters.
+            
+            Updates the invite with code "YESTERDAY" so that `today_date` is set to `yesterday`, `optimize_today` is set to 5, and `bullets_today` is set to 20; used in tests to simulate an invite whose daily counters belong to the previous UTC day.
+            """
             from sqlalchemy import update
             factory = _ensure_factory_sync()
             async with factory() as s:

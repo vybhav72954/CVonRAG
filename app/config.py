@@ -150,6 +150,14 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def _warn_production_cors(self) -> "Settings":
+        """
+        Log a warning when running in production while CORS origins are still the development default.
+        
+        This validator emits a startup warning if `app_env` is "production" and `cors_origins` equals ["http://localhost:5173"], advising to set `CORS_ORIGINS` to the production frontend origin.
+        
+        Returns:
+            Settings: The same Settings instance.
+        """
         if (
             self.app_env == "production"
             and self.cors_origins == ["http://localhost:5173"]
@@ -162,13 +170,13 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def _warn_production_ingest_secret(self) -> "Settings":
-        """Loud warning when INGEST_SECRET is empty in prod.
-
-        Empty-secret = open access is intentional for local dev (documented in
-        .env.example), but in production it leaves `/ingest` and `/admin/*`
-        unauthenticated. Failing closed here would break the documented dev
-        flow; warning at boot catches the real concern (misconfigured deploy)
-        without forcing every dev to juggle headers on curl calls.
+        """
+        Log a boot-time warning if running in production with an empty ingest secret.
+        
+        If `app_env` equals "production" and `ingest_secret` is empty, logs a warning that `/ingest` and `/admin/*` will be unauthenticated so deployments are not accidentally exposed. This validator returns the settings unchanged.
+        
+        Returns:
+            Settings: The same `Settings` instance (`self`).
         """
         if self.app_env == "production" and not self.ingest_secret:
             logging.getLogger("cvonrag").warning(
@@ -181,4 +189,10 @@ class Settings(BaseSettings):
 
 @lru_cache()
 def get_settings() -> Settings:
+    """
+    Return the application's configuration settings.
+    
+    Returns:
+        settings (Settings): A Settings instance populated from environment variables and the optional .env file.
+    """
     return Settings()

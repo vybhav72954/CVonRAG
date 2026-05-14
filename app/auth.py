@@ -54,8 +54,12 @@ EndpointName = Literal["parse", "recommend", "optimize"]
 
 
 def _seconds_until_midnight_utc() -> int:
-    """Return integer seconds until the next 00:00 UTC. Used as Retry-After
-    when an invite hits its daily cap — the cap resets at UTC midnight."""
+    """
+    Compute the number of whole seconds until the next 00:00 UTC.
+    
+    Returns:
+        seconds (int): Seconds until the next UTC midnight, rounded up to the next integer and at least 1.
+    """
     now = datetime.now(timezone.utc)
     tomorrow = (now + timedelta(days=1)).replace(
         hour=0, minute=0, second=0, microsecond=0
@@ -64,19 +68,10 @@ def _seconds_until_midnight_utc() -> int:
 
 
 async def _lazy_reset_daily(session: AsyncSession, code: str, today: date) -> None:
-    """Zero out daily counters when today's date has rolled over.
-
-    Idempotent under concurrency: the WHERE clause makes this a no-op on every
-    call after the first one each UTC day. Runs in its own statement so two
-    racing requests crossing midnight UTC don't both write the reset (the
-    second one's WHERE clause fails after the first one commits).
-
-    B10: must explicitly cover `today_date IS NULL` (a fresh invite that has
-    never had a request). In SQL, `NULL != today` evaluates to NULL (not
-    TRUE), so a plain `!=` excludes those rows and the reset never fires —
-    daily counters accumulate forever across UTC days. The previous Python
-    implementation worked because `None != date(...)` is True in Python,
-    but moving the comparison into SQL changes the semantic.
+    """
+    Reset an invite's per-day counters when the stored UTC date has rolled over.
+    
+    If the invite's stored `today_date` is missing or not equal to `today`, this updates `today_date` to `today` and sets `optimize_today` and `bullets_today` to 0. The operation is idempotent and safe under concurrent requests so multiple callers crossing UTC midnight will not cause duplicate resets.
     """
     await session.execute(
         update(Invite)
@@ -89,24 +84,55 @@ async def _lazy_reset_daily(session: AsyncSession, code: str, today: date) -> No
 
 
 async def _invite_exists(session: AsyncSession, code: str) -> bool:
+    """
+    Check whether an invite with the given code exists.
+    
+    Parameters:
+        code (str): The invite code to look up.
+    
+    Returns:
+        bool: True if an invite row with the code exists, False otherwise.
+    """
     return (
         await session.scalar(select(Invite.code).where(Invite.code == code))
     ) is not None
 
 
 def require_invite(endpoint: EndpointName):
-    """FastAPI dependency factory: validate X-Invite-Code, bump the
-    per-endpoint counter atomically, and enforce the daily-optimize cap.
-
-    Returns the post-update `Invite` row so the route handler can chain into
-    `check_and_reserve_bullets` for the bullet-level cap. Returns None when
-    the gate is disabled (dev / tests).
+    """
+    Create a FastAPI dependency that enforces invite-code authentication and atomically updates per-endpoint usage counters.
+    
+    This factory returns a dependency callable which:
+    - Validates the `X-Invite-Code` header (raises 401 if missing or unknown when invite codes are required).
+    - Performs an idempotent UTC-midnight rollover of daily counters before updating.
+    - Atomically increments the appropriate per-endpoint counter and `last_seen`; for `endpoint == "optimize"` the update enforces the daily optimize cap and raises 429 with a `Retry-After` header when the cap is reached.
+    - Returns the updated `Invite` row for downstream handlers, or `None` when invite-code checks are disabled by configuration.
+    
+    Parameters:
+        endpoint (EndpointName): Which endpoint the dependency will protect; one of `"parse"`, `"recommend"`, or `"optimize"`.
+    
+    Returns:
+        A FastAPI dependency callable that yields the updated `Invite` row when invite checks are active, or `None` when the invite gate is disabled.
     """
 
     async def _dep(
         x_invite_code: str | None = Header(default=None),
         session: AsyncSession = Depends(get_session),
     ) -> Invite | None:
+        """
+        Validate and atomically record per-invite usage for the specified endpoint and return the updated Invite row.
+        
+        Parameters:
+            x_invite_code (str | None): Raw value of the `X-Invite-Code` header; leading/trailing whitespace is tolerated and will be stripped.
+            session (AsyncSession): Database session used for atomic updates and reads.
+        
+        Returns:
+            Invite | None: The updated Invite row after the increment, or `None` when invite enforcement is disabled via configuration.
+        
+        Raises:
+            HTTPException: 401 Unauthorized if the header is missing/empty or the invite code does not exist.
+            HTTPException: 429 Too Many Requests if the optimize endpoint has reached its per-code daily cap; response includes a `Retry-After` header indicating seconds until UTC midnight.
+        """
         if not settings.invite_codes_required:
             return None
 
@@ -197,12 +223,18 @@ async def check_and_reserve_bullets(
     requested: int,
     session: AsyncSession,
 ) -> None:
-    """Pre-reserve `requested` bullets against the per-code daily bullet cap.
-
-    Single atomic UPDATE — the WHERE clause guarantees that no two concurrent
-    callers can both reserve when the cap would be exceeded together (B3).
-    Called from /optimize after Pydantic body parsing, since `requested`
-    isn't known until the request body is validated.
+    """
+    Reserve a number of bullets from an invite's per-day quota, raising HTTP errors if the request cannot be satisfied.
+    
+    Performs an idempotent UTC-day rollover for the invite's daily counters, then atomically increments the invite's `bullets_today` by `requested` only if doing so does not exceed `settings.max_daily_bullets`. Commits the reservation on success; does nothing if `invite` is None or `requested` is less than or equal to 0.
+    
+    Parameters:
+        invite (Invite | None): The invite row to charge bullets against; when `None` the function is a no-op.
+        requested (int): Number of bullets to reserve for this request.
+    
+    Raises:
+        HTTPException 401: If the invite was removed between checks ("Invite revoked mid-request.").
+        HTTPException 429: If the requested bullets would exceed the invite's remaining daily bullets. The response includes a `Retry-After` header with seconds until 00:00 UTC and a detail message stating the daily cap and remaining bullets.
     """
     if invite is None or requested <= 0:
         return

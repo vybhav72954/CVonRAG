@@ -142,7 +142,17 @@ _limiter = _RateLimiter()
 
 
 async def _rate_check(request: Request, key: str, max_calls: int) -> None:
-    """Raise HTTP 429 if the caller has exceeded their per-minute quota."""
+    """
+    Enforce the configured rate limit for the caller and raise HTTP 429 when the limit is exceeded.
+    
+    Parameters:
+        request (Request): The incoming request used to identify the caller (IP).
+        key (str): Namespace/key for the rate-limiting bucket (e.g., "optimize", "parse").
+        max_calls (int): Maximum allowed calls within the configured rate-limit window.
+    
+    Raises:
+        HTTPException: 429 Too Many Requests with `Retry-After` header set to the number of seconds to wait.
+    """
     ip   = request.client.host if request.client else "unknown"
     wait = await _limiter.check(ip, key, max_calls, settings.rate_limit_window)
     if wait is not None:
@@ -156,9 +166,16 @@ async def _rate_check(request: Request, key: str, max_calls: int) -> None:
 # ── Admin secret helper ───────────────────────────────────────────────────────
 
 def _check_admin_secret(provided: str | None) -> None:
-    """Constant-time check of the X-Ingest-Secret header. Used by /ingest and
-    all /admin/* endpoints. When `settings.ingest_secret` is empty the gate is
-    open (dev only — the model_validator in config.py warns on prod defaults).
+    """
+    Validate the X-Ingest-Secret header using a constant-time comparison.
+    
+    If `settings.ingest_secret` is empty, the check is skipped (gate open). This function raises an HTTP 403 when a non-empty configured secret exists and the provided header is missing or does not match.
+    
+    Parameters:
+        provided (str | None): Value of the `X-Ingest-Secret` header from the request.
+    
+    Raises:
+        HTTPException: 403 Forbidden when the provided secret is invalid or missing while a configured secret is required.
     """
     if not settings.ingest_secret:
         return
@@ -174,6 +191,11 @@ def _check_admin_secret(provided: str | None) -> None:
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    """
+    Initialize application resources on startup and clean them up on shutdown.
+    
+    On startup this function checks that the Qdrant collection exists (logs a warning on failure but does not abort startup) and initializes the SQLite invite database (logs and re-raises the exception if invite codes are required by configuration). On shutdown it closes the shared HTTP client used by LLM chains, the vector/Qdrant clients, and the SQLite engine.
+    """
     logger.info("CVonRAG starting — checking Qdrant collection …")
     try:
         await ensure_collection_exists()
@@ -390,18 +412,16 @@ async def parse_cv(
     _invite: Invite | None = Depends(require_invite("parse")),
 ):
     """
-    **Document parsing endpoint.**
-
-    Upload a `.docx` biodata or `.pdf` CV.
-    Returns a `text/event-stream` SSE response showing extraction progress.
-    All events are wrapped in a `StreamChunk` envelope (same as `/optimize`).
-
-    | Event type | `data` field | Description |
-    |---|---|---|
-    | `progress` | `{message, current, total}` | Extraction progress update |
-    | `project`  | `{project: ProjectData, index, total}` | One project completed |
-    | `done`     | `{total_projects, total_facts}` | All done |
-    | `error`    | `null` (see `error_message`) | Parse error |
+    Stream extraction progress and parsed project data from an uploaded .docx or .pdf CV as Server-Sent Events.
+    
+    Streams SSE `StreamChunk` envelopes describing parsing progress, discovered projects, completion, or errors:
+    - `progress`: `{"message", "current", "total"}` — extraction progress update
+    - `project`: `{"project": ProjectData, "index", "total"}` — a completed project
+    - `done`: `{"total_projects", "total_facts"}` — parsing finished
+    - `error`: `null` (see `error_message`) — parse failure
+    
+    Returns:
+        StreamingResponse: A `text/event-stream` response that emits SSE-formatted `StreamChunk` objects for each event.
     """
     await _rate_check(request, "parse", settings.rate_limit_parse)
     if not file.filename:
@@ -470,14 +490,12 @@ async def recommend(
     _invite: Invite | None = Depends(require_invite("recommend")),
 ):
     """
-    **Project recommendation endpoint.**
-
-    Given all projects parsed from a CV + a job description, returns every
-    project scored (0–1) against the JD, with the top `top_k` marked as
-    recommended and a one-sentence reason explaining why.
-
-    Call this after `/parse` and before `/optimize`. The frontend uses the
-    response to pre-select the best projects and show reasoning to the user.
+    Score candidate projects against a job description and return the top recommendations.
+    
+    Given parsed projects and a job description, computes a relevance score (0–1) for each project, marks the top `top_k` projects as recommended, and provides a one-sentence reason for each recommendation. The response is used to pre-select projects for downstream optimization.
+    
+    Returns:
+        RecommendResponse: Contains `recommendations` — a list of scored projects with `recommended` flags and one-line reasoning for each.
     """
     await _rate_check(request, "recommend", settings.rate_limit_recommend)
     try:
@@ -512,17 +530,19 @@ async def optimize(
     session: AsyncSession = Depends(get_session),
 ):
     """
-    **Main generation endpoint.**
-
-    Accepts an `OptimizationRequest` JSON body.
-    Returns a `text/event-stream` SSE response.
-
-    | Event type | Payload | Description |
-    |---|---|---|
-    | `token`    | `{data: string}` | Raw LLM token (typewriter) |
-    | `bullet`   | `{data: GeneratedBullet}` | Final validated bullet (includes `.metadata`) |
-    | `error`    | `{error_message: string}` | Pipeline error |
-    | `done`     | `{data: {elapsed_seconds}}` | Stream complete |
+    Stream optimized resume bullet generation as Server-Sent Events.
+    
+    Streams Server-Sent Events (SSE) representing the optimization run for the provided OptimizationRequest.
+    
+    Parameters:
+        body (OptimizationRequest): Parameters controlling generation (projects, per-project caps, etc.).
+    
+    Returns:
+        StreamingResponse: An SSE stream that emits events until completion. Emitted event types:
+          - `token`: raw LLM token fragments as `{ "data": "<string>" }`.
+          - `bullet`: a finalized, validated bullet as `{ "data": <GeneratedBullet> }` (includes `metadata`).
+          - `error`: a pipeline error as `{ "error_message": "<string>" }`.
+          - `done`: completion notice as `{ "data": { "elapsed_seconds": <number> } }`.
     """
     await _rate_check(request, "optimize", settings.rate_limit_optimize)
     # H3: guard hosted-LLM quota before starting the stream.
@@ -588,10 +608,20 @@ async def ingest(
     x_ingest_secret: str | None = Header(default=None),
 ):
     """
-    **Admin endpoint** — seed Qdrant with Gold Standard CV bullets.
-
-    When `INGEST_SECRET` is set in `.env`, callers must send
-    `X-Ingest-Secret: <secret>` in the request header.
+    Seed the gold-standard bullets dataset into the vector store (admin only).
+    
+    Requires the `X-Ingest-Secret` header when `INGEST_SECRET` is configured; otherwise the endpoint is open.
+    
+    Parameters:
+        body (IngestRequest): Payload containing the list of bullets to ingest.
+        x_ingest_secret (str | None): Value of the `X-Ingest-Secret` header when provided.
+    
+    Returns:
+        IngestResponse: Contains `upserted` (number of bullets written) and a human-readable `message`.
+    
+    Raises:
+        HTTPException(403): If an ingest secret is configured and the provided header is missing or invalid.
+        HTTPException(500): On unexpected failures during ingestion.
     """
     _check_admin_secret(x_ingest_secret)
     try:
@@ -620,12 +650,14 @@ async def create_invite(
     x_ingest_secret: str | None = Header(default=None),
     session: AsyncSession = Depends(get_session),
 ):
-    """Create a new invite code. Gated by X-Ingest-Secret (same secret as /ingest).
-
-    B11: rely on the PRIMARY KEY UNIQUE constraint rather than a pre-check.
-    Two concurrent calls with the same code would both pass a TOCTOU pre-check
-    and the second commit would surface as `IntegrityError` → 500. Catching
-    the constraint violation gives a clean 409 and is race-safe by definition.
+    """
+    Create a new invite code; endpoint is protected by the `X-Ingest-Secret` header.
+    
+    Parameters:
+        body (InviteCreate): Invite data including the invite `code` and optional `name`.
+    
+    Returns:
+        InviteUsage: A validated representation of the newly created invite.
     """
     _check_admin_secret(x_ingest_secret)
     invite = Invite(code=body.code, name=body.name)
@@ -652,12 +684,20 @@ async def list_usage(
     limit: int = 100,
     offset: int = 0,
 ):
-    """List invite codes + their cumulative + today's counters. Gated by X-Ingest-Secret.
-
-    Paginated via `?limit=N&offset=M` (B8). Default page size 100 covers the
-    target audience (~60 batchmates) in one request; `_USAGE_MAX_LIMIT=500`
-    caps a malicious or buggy caller from scanning millions of rows in one
-    shot if the DB ever grows beyond expectations.
+    """
+    Return a paginated list of invite codes with their cumulative and today's usage counters; access is gated by the X-Ingest-Secret header.
+    
+    Parameters:
+        x_ingest_secret (str | None): Admin secret from the `X-Ingest-Secret` header (required unless server secret is unset).
+        session (AsyncSession): Database session (injected).
+        limit (int): Maximum number of invites to return; must be between 1 and _USAGE_MAX_LIMIT (default 100).
+        offset (int): Number of invites to skip before returning results (default 0).
+    
+    Returns:
+        UsageResponse: Object containing a list of `InviteUsage` entries ordered by invite code.
+    
+    Raises:
+        HTTPException: 403 if the admin secret is invalid; 422 if `limit` or `offset` are out of allowed ranges.
     """
     _check_admin_secret(x_ingest_secret)
     if limit < 1 or limit > _USAGE_MAX_LIMIT:

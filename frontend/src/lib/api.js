@@ -14,7 +14,10 @@ const BASE = import.meta.env.VITE_API_URL ?? 'http://localhost:8000';
 // When the code is empty (user hasn't entered one yet), we omit the header
 // entirely — the backend will reject with a 401 whose message is surfaced
 // via formatErrorDetail like any other error, prompting the user to enter
-// a code.
+/**
+ * Produce HTTP headers that include the current invite code when available.
+ * @returns {Object} An object containing `{'X-Invite-Code': <code>}` if an invite code is set, otherwise an empty object.
+ */
 function authHeaders() {
   const code = get(inviteCode);
   return code ? { 'X-Invite-Code': code } : {};
@@ -149,9 +152,16 @@ async function readSSEStream(resp, onEvent, onError) {
 // ── POST /parse — upload CV → SSE project stream ──────────────────────────────
 
 /**
- * Upload a .docx or .pdf and stream back parsed projects.
- * @param {File} file
- * @param {{ onProgress?: (data: any) => void, onProject?: (data: any) => void, onDone?: (data: any) => void, onError?: (msg: string) => void }} [callbacks]
+ * Upload a .docx or .pdf and stream parsed project events to the provided callbacks.
+ *
+ * Streams Server-Sent Events (SSE) from the /parse endpoint and invokes the matching callback for each event.
+ *
+ * @param {File} file - The resume file to upload (expected .docx or .pdf).
+ * @param {{ onProgress?: (data: any) => void, onProject?: (data: any) => void, onDone?: (data: any) => void, onError?: (msg: string) => void }} [callbacks] - Handlers for streamed events:
+ *   - onProgress: called with incremental progress updates.
+ *   - onProject: called for each parsed project object.
+ *   - onDone: called when parsing completes with final data.
+ *   - onError: called with a human-readable error message when an error occurs.
  */
 export async function parseCV(file, { onProgress, onProject, onDone, onError } = {}) {
   const form = new FormData();
@@ -204,11 +214,13 @@ export async function parseCV(file, { onProgress, onProject, onDone, onError } =
 // ── POST /recommend — score all projects against JD ───────────────────────────
 
 /**
- * Ask the AI which projects are most relevant to this JD.
- * Times out after REQUEST_TIMEOUT_MS to prevent infinite hangs.
- * Uses the same callback contract as parseCV / optimizeResume.
- * @param {{ projects: Array, job_description: string, top_k: number }} payload
- * @param {{ onDone?: (data: any) => void, onError?: (msg: string) => void }} [callbacks]
+ * Request project recommendations for a job description and invoke callbacks with the result.
+ *
+ * Sends the job description and candidate projects to the backend; if the request succeeds,
+ * `onDone` is called with the parsed JSON response, otherwise `onError` is called with a human-readable message.
+ *
+ * @param {{ projects: Array, job_description: string, top_k: number }} payload - Request payload: `projects` is the list of candidate projects, `job_description` is the JD text to match against, and `top_k` is the number of recommendations to return.
+ * @param {{ onDone?: (data: any) => void, onError?: (msg: string) => void }} [callbacks] - Optional callbacks: `onDone` receives the backend JSON response on success; `onError` receives an error message on failure or timeout.
  */
 export async function recommendProjects(payload, { onDone, onError } = {}) {
   const controller = takeOver('recommend');
@@ -247,9 +259,17 @@ export async function recommendProjects(payload, { onDone, onError } = {}) {
 // ── POST /optimize — JSON → SSE bullet stream ─────────────────────────────────
 
 /**
- * Stream optimised resume bullets.
- * @param {Object} payload - OptimizationRequest
- * @param {{ onToken?: (data: any) => void, onBullet?: (data: any) => void, onDone?: (data: any) => void, onError?: (msg: string) => void }} [callbacks]
+ * Stream optimized resume bullets and dispatch events to the provided callbacks.
+ *
+ * Sends the optimization request to the backend and forwards SSE events:
+ * `token` → `onToken`, `bullet` → `onBullet`, `done` → `onDone`, `error` → `onError`.
+ *
+ * @param {Object} payload - Optimization request payload sent to the `/optimize` endpoint.
+ * @param {{ onToken?: (data: any) => void, onBullet?: (data: any) => void, onDone?: (data: any) => void, onError?: (msg: string) => void }} [callbacks] - Optional callbacks for streamed events.
+ * @param {(data: any) => void} [callbacks.onToken] - Called with incremental token data.
+ * @param {(data: any) => void} [callbacks.onBullet] - Called with each optimized bullet.
+ * @param {(data: any) => void} [callbacks.onDone] - Called when streaming completes with final data.
+ * @param {(msg: string) => void} [callbacks.onError] - Called with an error message on failure.
  */
 export async function optimizeResume(payload, { onToken, onBullet, onDone, onError } = {}) {
   const controller = takeOver('optimize');

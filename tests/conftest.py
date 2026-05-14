@@ -8,18 +8,10 @@ import pytest
 
 @pytest.fixture(autouse=True)
 def _isolate_settings_from_local_env(monkeypatch, tmp_path):
-    """Reset environment-sensitive settings to known defaults for every test.
-
-    Why: settings are loaded once via @lru_cache on first import. If the
-    developer's local .env has INGEST_SECRET set, /ingest tests that don't
-    send the matching X-Ingest-Secret header silently fail with 403.
-    Rate limiting is disabled so repeated endpoint calls in a test suite
-    don't trigger 429s. The invite gate is disabled so existing tests
-    that don't send X-Invite-Code keep passing — invite tests opt back in
-    via patch.object. SQLite is pointed at a per-test tmp_path file so
-    no test pollutes the dev DB.
-    Tests that exercise auth, rate-limiting, or the invite gate explicitly
-    re-enable the relevant setting via patch.object.
+    """
+    Ensure tests run with standardized, non-environment-dependent application settings.
+    
+    Patches cached settings to clear ingest secrets, disable rate limiting and invite-code checks, point SQLite to a per-test file under `tmp_path`, reset the DB engine/session factory, clear in-memory rate-limiter state, and reset the Groq quota circuit breaker.
     """
     from app.main import settings as main_settings, _limiter
     from app.chains import settings as chains_settings, _reset_quota_circuit

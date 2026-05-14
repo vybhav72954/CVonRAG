@@ -59,6 +59,12 @@ class Invite(Base):
     today_date: Mapped[date | None] = mapped_column(Date, nullable=True)
 
     def __repr__(self) -> str:  # B5 — readable debug output
+        """
+        Produce a debug-friendly string for the Invite showing its `code` and optimization counters.
+        
+        Returns:
+            str: A representation of the form "Invite(code='...', optimize_today=<int>, optimize_count=<int>)".
+        """
         return (
             f"Invite(code={self.code!r}, optimize_today={self.optimize_today}, "
             f"optimize_count={self.optimize_count})"
@@ -78,12 +84,13 @@ _factory_lock = asyncio.Lock()
 
 
 def _engine_url() -> URL | str:
-    """Return the async SQLite URL for the current settings.sqlite_path.
-
-    Uses `URL.create()` so reserved URL characters in the path (`?`, `#`, `%`,
-    `&`, …) are escaped properly. The previous string-format approach would
-    have silently mis-parsed a `SQLITE_PATH` like `./cv?staging.db` because
-    SQLAlchemy would have taken `staging.db` as a query string (B4).
+    """
+    Build the SQLAlchemy async SQLite connection target for the configured sqlite path.
+    
+    Uses URL.create(...) to ensure characters in the filesystem path that are reserved in URLs (for example ?, #, %, &) are escaped correctly. Special-cases the literal ":memory:" to return the in-memory connection string expected by aiosqlite.
+    
+    Returns:
+        URL | str: A SQLAlchemy URL object or connection string suitable for create_async_engine.
     """
     path = settings.sqlite_path
     if path == ":memory:":
@@ -92,12 +99,13 @@ def _engine_url() -> URL | str:
 
 
 async def _ensure_factory_async() -> async_sessionmaker[AsyncSession]:
-    """Async-safe lazy initializer for the engine + session factory.
-
-    Double-checked locking pattern (B9): the fast path skips the lock when
-    the factory is already built. On a cold start with truly concurrent
-    requests, only one coroutine builds the engine while the others await
-    the lock and then see the populated global.
+    """
+    Lazily initializes and returns the module-level async SQLAlchemy session factory.
+    
+    This function is safe to call concurrently from multiple coroutines; on the first call it creates the engine and an `async_sessionmaker`, and subsequent calls return the cached factory.
+    
+    Returns:
+        async_sessionmaker[AsyncSession]: The session factory used to create `AsyncSession` instances.
     """
     global _engine, _session_factory
     if _session_factory is not None:
@@ -112,9 +120,14 @@ async def _ensure_factory_async() -> async_sessionmaker[AsyncSession]:
 
 
 def _ensure_factory_sync() -> async_sessionmaker[AsyncSession]:
-    """Sync fallback for callers that can't await — used by init_db() during
-    lifespan startup, where the event loop is the lifespan's own and no
-    concurrent request can reach the factory yet."""
+    """
+    Ensure the module-level SQLAlchemy async session factory exists.
+    
+    Creates the async engine and session factory if they are not already initialized and returns the cached factory. Intended for use during application startup (e.g., init_db) before concurrent request access begins.
+    
+    Returns:
+        The module-level `async_sessionmaker[AsyncSession]` used to produce async sessions.
+    """
     global _engine, _session_factory
     if _session_factory is None:
         _engine = create_async_engine(_engine_url(), echo=False, future=True)
@@ -125,17 +138,13 @@ def _ensure_factory_sync() -> async_sessionmaker[AsyncSession]:
 
 
 async def init_db() -> None:
-    """Create tables if missing. Called from the FastAPI lifespan startup hook.
-
-    Runs during lifespan before any request can hit the app — no race window
-    for the factory, so the sync builder is safe and avoids re-entering the
-    lock that the lifespan-event-loop already holds nothing on.
-
-    B12: SQLite will silently create the DB file but NOT its parent
-    directories. A misconfigured deploy with `SQLITE_PATH=/var/data/app/cv.db`
-    where `/var/data/app/` doesn't exist would fail with an opaque
-    `OperationalError: unable to open database file`. Pre-create the parent
-    so the error (if any) actually names what's missing.
+    """
+    Initialize the invite database and create any missing tables for application startup.
+    
+    Creates the parent directory for a file-backed SQLite database when needed, ensures the module-level engine and session factory are initialized, and applies the ORM metadata to create tables. Intended to be called during the application's startup (lifespan) before serving requests.
+    
+    Raises:
+        RuntimeError: If the engine was not initialized by the factory initialization step.
     """
     if settings.sqlite_path != ":memory:":
         parent = Path(settings.sqlite_path).expanduser().parent
@@ -154,9 +163,11 @@ async def init_db() -> None:
 
 
 async def close_db() -> None:
-    """Dispose of the engine on shutdown. Lifespan teardown only runs after
-    in-flight requests have drained (ASGI guarantee), so we don't need to
-    explicitly wait on outstanding sessions."""
+    """
+    Dispose the SQLAlchemy engine and clear the module's cached session factory.
+    
+    If an engine exists it will be disposed, and the module-level `_engine` and `_session_factory` globals are set to `None`. Intended for application shutdown/cleanup.
+    """
     global _engine, _session_factory
     if _engine is not None:
         await _engine.dispose()
@@ -165,7 +176,14 @@ async def close_db() -> None:
 
 
 async def get_session() -> AsyncGenerator[AsyncSession, None]:
-    """FastAPI dependency yielding a fresh AsyncSession per request."""
+    """
+    Provide a fresh database session scoped to a single request.
+    
+    Intended for use as a FastAPI dependency; the yielded session is closed when the request scope ends.
+    
+    Returns:
+        An AsyncSession scoped to the current request.
+    """
     factory = await _ensure_factory_async()
     async with factory() as session:
         yield session
