@@ -402,18 +402,30 @@ async def run_one_case(
         # eval set carry mixed targets (e.g. 110-char bullets for one role,
         # 140 for another) so Phase 1 always measures against the correct
         # target instead of the global flag.
-        case_char_target = int(case.get("target_char_limit", char_target))
-        req = OptimizationRequest(
-            job_description=case["jd_text"],
-            projects=projects[:3],  # top 3 projects max per case
-            constraints=FormattingConstraints(
-                target_char_limit=case_char_target,
-                tolerance=settings.char_tolerance,
-                max_bullets_per_project=2,
-            ),
-            target_role_type=RoleType(case.get("target_role_type", "general")),
-            total_bullets_requested=case.get("max_bullets", 4),
-        )
+        #
+        # Wrap the int casts + OptimizationRequest construction together: a
+        # null/non-numeric value in target_char_limit or max_bullets crashes
+        # the int(...) call, and out-of-range values crash Pydantic
+        # validation. Either would bubble up through run_backend without
+        # being caught, skipping _persist_results and losing every case's
+        # results in this backend run. Mark just this case failed instead.
+        try:
+            case_char_target = int(case.get("target_char_limit", char_target))
+            case_max_bullets = int(case.get("max_bullets", 4))
+            req = OptimizationRequest(
+                job_description=case["jd_text"],
+                projects=projects[:3],  # top 3 projects max per case
+                constraints=FormattingConstraints(
+                    target_char_limit=case_char_target,
+                    tolerance=settings.char_tolerance,
+                    max_bullets_per_project=2,
+                ),
+                target_role_type=RoleType(case.get("target_role_type", "general")),
+                total_bullets_requested=case_max_bullets,
+            )
+        except (TypeError, ValueError) as exc:
+            result.error = f"invalid_case_field: {exc}"
+            return result
 
         orchestrator = CVonRAGOrchestrator()
         bullets: list[GeneratedBullet] = []
