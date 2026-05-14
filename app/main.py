@@ -634,14 +634,39 @@ async def create_invite(
     return InviteUsage.model_validate(invite, from_attributes=True)
 
 
+_USAGE_MAX_LIMIT = 500
+
+
 @app.get("/admin/usage", response_model=UsageResponse, tags=["admin"])
 async def list_usage(
     x_ingest_secret: str | None = Header(default=None),
     session: AsyncSession = Depends(get_session),
+    limit: int = 100,
+    offset: int = 0,
 ):
-    """List all invite codes + their cumulative + today's counters. Gated by X-Ingest-Secret."""
+    """List invite codes + their cumulative + today's counters. Gated by X-Ingest-Secret.
+
+    Paginated via `?limit=N&offset=M` (B8). Default page size 100 covers the
+    target audience (~60 batchmates) in one request; `_USAGE_MAX_LIMIT=500`
+    caps a malicious or buggy caller from scanning millions of rows in one
+    shot if the DB ever grows beyond expectations.
+    """
     _check_admin_secret(x_ingest_secret)
-    rows = (await session.scalars(select(Invite).order_by(Invite.code))).all()
+    if limit < 1 or limit > _USAGE_MAX_LIMIT:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"limit must be between 1 and {_USAGE_MAX_LIMIT}",
+        )
+    if offset < 0:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="offset must be >= 0",
+        )
+    rows = (
+        await session.scalars(
+            select(Invite).order_by(Invite.code).offset(offset).limit(limit)
+        )
+    ).all()
     return UsageResponse(
         invites=[InviteUsage.model_validate(r, from_attributes=True) for r in rows],
     )

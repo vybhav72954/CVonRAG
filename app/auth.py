@@ -4,21 +4,34 @@ Invite-code auth + per-code usage tracking.
 
 One invite code per batchmate. The code IS the identity (no OAuth — see plan).
 The X-Invite-Code request header is required on /parse, /recommend, /optimize.
-Each gated request:
 
-  1. Looks up the code in the SQLite `invites` table.
-  2. Updates last_seen.
-  3. Resets the daily counters if a new UTC day has begun.
-  4. For /optimize: checks the daily-optimize cap (429 if exceeded).
-  5. Increments the per-endpoint counter (and optimize_today if applicable).
+CONCURRENCY MODEL (B2/B3 fix)
+─────────────────────────────
+All counter updates use atomic conditional UPDATE statements rather than
+SELECT-then-mutate. SQLite serializes write transactions, so two concurrent
+/optimize calls at `optimize_today = 19` cannot both bump to 20:
 
-Why pre-increment rather than post: pre-incrementing means a failing request
-still counts toward the quota, so an abusive caller cannot trigger many
-failures without spending quota. A daily cap is approximate by design.
+    UPDATE invites
+       SET optimize_today = optimize_today + 1, ...
+     WHERE code = ?
+       AND optimize_today < 20
 
-Bullet-level cap (max_daily_bullets) is checked AFTER body parsing in the
-/optimize route, because the bullet count isn't known until Pydantic
-validates the request — see `app/main.py` /optimize route for that path.
+The second request reads 20 inside its own transaction, the WHERE clause is
+false, `rowcount == 0`, and we surface a 429. The naive read-mutate-commit
+pattern had a real race here because two readers could both see 19 before
+either committed; this implementation closes that window.
+
+PRE-INCREMENT (still)
+─────────────────────
+A failing /optimize still counts toward the daily quota. Otherwise an abusive
+caller could trigger many failures without exhausting their daily budget,
+which is exactly the behavior the cap is meant to prevent.
+
+BULLET RESERVATION
+──────────────────
+`check_and_reserve_bullets` runs AFTER body parsing in /optimize (so the
+caller knows `total_bullets_requested`). Same atomic-UPDATE pattern: a single
+conditional statement either commits the reservation or rejects on cap.
 """
 
 from __future__ import annotations
@@ -28,7 +41,7 @@ from math import ceil
 from typing import Literal
 
 from fastapi import Depends, Header, HTTPException, status
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
@@ -50,35 +63,46 @@ def _seconds_until_midnight_utc() -> int:
     return max(int(ceil((tomorrow - now).total_seconds())), 1)
 
 
-def _maybe_reset_daily(invite: Invite, today: date) -> None:
-    """Zero out optimize_today/bullets_today if today_date != today.
-    Mutates the invite row in place — caller is responsible for commit."""
-    if invite.today_date != today:
-        invite.today_date = today
-        invite.optimize_today = 0
-        invite.bullets_today = 0
+async def _lazy_reset_daily(session: AsyncSession, code: str, today: date) -> None:
+    """Zero out daily counters when today's date has rolled over.
+
+    Idempotent under concurrency: the WHERE clause makes this a no-op on every
+    call after the first one each UTC day. Runs in its own statement so two
+    racing requests crossing midnight UTC don't both write the reset (the
+    second one's WHERE clause fails after the first one commits).
+    """
+    await session.execute(
+        update(Invite)
+        .where(Invite.code == code, Invite.today_date != today)
+        .values(today_date=today, optimize_today=0, bullets_today=0)
+    )
+
+
+async def _invite_exists(session: AsyncSession, code: str) -> bool:
+    return (
+        await session.scalar(select(Invite.code).where(Invite.code == code))
+    ) is not None
 
 
 def require_invite(endpoint: EndpointName):
-    """Return a FastAPI dependency that validates the X-Invite-Code header,
-    bumps counters for `endpoint`, and enforces the daily-optimize cap.
+    """FastAPI dependency factory: validate X-Invite-Code, bump the
+    per-endpoint counter atomically, and enforce the daily-optimize cap.
 
-    The dependency yields the Invite row (or None when invite_codes_required
-    is False) so the route handler can read remaining bullet quota.
+    Returns the post-update `Invite` row so the route handler can chain into
+    `check_and_reserve_bullets` for the bullet-level cap. Returns None when
+    the gate is disabled (dev / tests).
     """
 
     async def _dep(
         x_invite_code: str | None = Header(default=None),
         session: AsyncSession = Depends(get_session),
     ) -> Invite | None:
-        # Bypass entirely when the feature is disabled (tests + local dev).
         if not settings.invite_codes_required:
             return None
 
-        # Strip whitespace defensively (B1) — `InviteCreate.code` rejects
-        # whitespace at creation time, so a stored code never contains it.
-        # Stripping the header value here means a stray leading/trailing
-        # space from copy-paste doesn't silently 401 the user.
+        # Strip whitespace defensively (B1) — InviteCreate.code rejects
+        # whitespace at creation, so a stored code never contains it. The
+        # strip here just absorbs copy-paste artifacts on the user side.
         code = (x_invite_code or "").strip()
         if not code:
             raise HTTPException(
@@ -86,46 +110,73 @@ def require_invite(endpoint: EndpointName):
                 detail="Missing X-Invite-Code header.",
             )
 
-        invite = await session.scalar(
-            select(Invite).where(Invite.code == code)
-        )
-        if invite is None:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Unknown invite code.",
+        now = datetime.now(timezone.utc)
+        today = now.date()
+
+        # 1) Reset daily counters if the UTC date rolled over. Idempotent.
+        await _lazy_reset_daily(session, code, today)
+
+        # 2) Atomic counter increment, with cap check for /optimize.
+        if endpoint == "optimize":
+            stmt = (
+                update(Invite)
+                .where(
+                    Invite.code == code,
+                    Invite.optimize_today < settings.max_daily_optimizations,
+                )
+                .values(
+                    optimize_today=Invite.optimize_today + 1,
+                    optimize_count=Invite.optimize_count + 1,
+                    last_seen=now,
+                )
+            )
+        elif endpoint == "parse":
+            stmt = (
+                update(Invite)
+                .where(Invite.code == code)
+                .values(
+                    parse_count=Invite.parse_count + 1,
+                    last_seen=now,
+                )
+            )
+        else:  # recommend
+            stmt = (
+                update(Invite)
+                .where(Invite.code == code)
+                .values(
+                    recommend_count=Invite.recommend_count + 1,
+                    last_seen=now,
+                )
             )
 
-        now = datetime.now(timezone.utc)
-        invite.last_seen = now
-        _maybe_reset_daily(invite, now.date())
-
-        # Daily-optimize cap fires BEFORE incrementing so the 21st call is
-        # rejected, not allowed-then-counted.
-        if endpoint == "optimize":
-            if invite.optimize_today >= settings.max_daily_optimizations:
-                retry_after = _seconds_until_midnight_utc()
-                # Persist the lazy reset bookkeeping even on rejection so the
-                # row reflects today's date (commit before raising).
-                await session.commit()
-                raise HTTPException(
-                    status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-                    detail=(
-                        f"Daily optimize cap reached "
-                        f"({settings.max_daily_optimizations}/day). "
-                        f"Resets at 00:00 UTC."
-                    ),
-                    headers={"Retry-After": str(retry_after)},
-                )
-            invite.optimize_today += 1
-            invite.optimize_count += 1
-        elif endpoint == "parse":
-            invite.parse_count += 1
-        elif endpoint == "recommend":
-            invite.recommend_count += 1
-
+        result = await session.execute(stmt)
         await session.commit()
-        # Refresh so subsequent reads in the same request see the committed
-        # row (FastAPI handlers don't share the session with the dep).
+
+        if result.rowcount == 0:
+            # Two possible reasons: code doesn't exist, OR (optimize-only) the
+            # cap was already at the limit. Disambiguate with one extra read.
+            # This read only fires on the rejection path; the happy path is
+            # still one round-trip.
+            if not await _invite_exists(session, code):
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail="Unknown invite code.",
+                )
+            # Code exists → must have been the cap check (only fires for optimize).
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail=(
+                    f"Daily optimize cap reached "
+                    f"({settings.max_daily_optimizations}/day). "
+                    f"Resets at 00:00 UTC."
+                ),
+                headers={"Retry-After": str(_seconds_until_midnight_utc())},
+            )
+
+        # Fetch the updated row for the handler. check_and_reserve_bullets
+        # only reads `invite.code`, but returning the full row keeps the API
+        # surface honest with the type annotation.
+        invite = await session.scalar(select(Invite).where(Invite.code == code))
         return invite
 
     return _dep
@@ -136,31 +187,44 @@ async def check_and_reserve_bullets(
     requested: int,
     session: AsyncSession,
 ) -> None:
-    """Called from the /optimize route after Pydantic body parsing.
+    """Pre-reserve `requested` bullets against the per-code daily bullet cap.
 
-    Pre-reserves `requested` bullets against the per-code daily bullet cap.
-    Raises 429 if reservation would exceed the cap. No-op when the gate is
-    disabled (invite is None) or when requested <= 0.
+    Single atomic UPDATE — the WHERE clause guarantees that no two concurrent
+    callers can both reserve when the cap would be exceeded together (B3).
+    Called from /optimize after Pydantic body parsing, since `requested`
+    isn't known until the request body is validated.
     """
     if invite is None or requested <= 0:
         return
 
-    # The dep already reset daily counters today; re-read fresh row in this
-    # session because the dep's session has been closed.
-    fresh = await session.scalar(select(Invite).where(Invite.code == invite.code))
-    if fresh is None:
-        # Vanishingly unlikely — the row was just touched by the dep. Treat as
-        # auth failure rather than silently allowing.
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invite revoked mid-request.",
+    code = invite.code
+    today = datetime.now(timezone.utc).date()
+
+    # Idempotent daily reset — same pattern as the dep.
+    await _lazy_reset_daily(session, code, today)
+
+    # Atomic reservation: only commits if bullets_today + requested fits.
+    stmt = (
+        update(Invite)
+        .where(
+            Invite.code == code,
+            Invite.bullets_today + requested <= settings.max_daily_bullets,
         )
+        .values(bullets_today=Invite.bullets_today + requested)
+    )
+    result = await session.execute(stmt)
+    await session.commit()
 
-    _maybe_reset_daily(fresh, datetime.now(timezone.utc).date())
-
-    if fresh.bullets_today + requested > settings.max_daily_bullets:
-        await session.commit()
-        retry_after = _seconds_until_midnight_utc()
+    if result.rowcount == 0:
+        # Cap would be exceeded (or — vanishingly unlikely — the invite was
+        # revoked between the dep and now). Re-read to compute remaining for
+        # the error message.
+        fresh = await session.scalar(select(Invite).where(Invite.code == code))
+        if fresh is None:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invite revoked mid-request.",
+            )
         remaining = max(settings.max_daily_bullets - fresh.bullets_today, 0)
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
@@ -169,8 +233,5 @@ async def check_and_reserve_bullets(
                 f"({settings.max_daily_bullets}/day; {remaining} remaining). "
                 f"Resets at 00:00 UTC."
             ),
-            headers={"Retry-After": str(retry_after)},
+            headers={"Retry-After": str(_seconds_until_midnight_utc())},
         )
-
-    fresh.bullets_today += requested
-    await session.commit()
