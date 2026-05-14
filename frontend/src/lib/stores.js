@@ -66,6 +66,14 @@ const setHelpers = {
   deserialize: (a) => new Set(Array.isArray(a) ? a : []),
 };
 
+// ── Invite code (per-batchmate identity) ─────────────────────────────────────
+// Admin issues one code per batchmate via POST /admin/invites; the code is
+// sent in the X-Invite-Code header by api.js on every gated request. Persisted
+// to sessionStorage so a tab refresh keeps the user "signed in" for the
+// lifetime of the tab. Empty string = no code entered yet (the page shows
+// the invite-entry card in that state).
+export const inviteCode = persistent('inviteCode', '');
+
 // ── Wizard step ───────────────────────────────────────────────────────────────
 /** @type {import('svelte/store').Writable<1|2|3>} */
 export const step = persistent('step', 1);

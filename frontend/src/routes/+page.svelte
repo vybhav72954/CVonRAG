@@ -4,12 +4,59 @@
   import { parseCV, recommendProjects, optimizeResume, checkHealth, abortInFlight } from '$lib/api';
   import {
     step,
+    inviteCode,
     parsedProjects, parseStatus, parseProgress, parseError, parseWarnings, resetParse,
     jdText, roleType, charLimit, maxBullets, topK,
     recommendations, recommendStatus, recommendError, selectedIds, resetRecommend,
     genStatus, tokenBuffer, bullets, genError, elapsed, resetGeneration,
     isUploading, isRecommending, isGenerating,
   } from '$lib/stores';
+
+  // ── Invite-code entry ────────────────────────────────────────────────────
+  // Admin issues one code per batchmate. Until the user enters one, all
+  // backend calls would 401 — so step 1 hides its upload UI behind the
+  // entry card below. The code is sessionStorage-persisted via the store.
+  let inviteInput = '';
+
+  // Mirror the backend's InviteCreate.code pattern so the user gets instant,
+  // actionable feedback instead of a confusing 401 "Unknown invite code".
+  const INVITE_CODE_PATTERN = /^[A-Za-z0-9_-]{3,64}$/;
+
+  function saveInviteCode() {
+    const v = inviteInput.trim();
+    if (INVITE_CODE_PATTERN.test(v)) {
+      inviteCode.set(v);
+      inviteInput = '';
+    }
+  }
+
+  function changeInviteCode() {
+    // Abort any in-flight gated requests first — otherwise an /optimize
+    // stream started under the old code keeps burning the old code's quota
+    // and mutates stores after the user is effectively signed out.
+    abortInFlight('parse');
+    abortInFlight('recommend');
+    abortInFlight('optimize');
+    // Reset the transient status flags. abortInFlight cancels the fetch
+    // silently, so no onDone/onError fires and stores like genStatus stay
+    // stuck at "streaming". Without this the UI would still show
+    // "Generating…" or a stale error banner after the user enters a new code.
+    // Persisted state (parsedProjects, bullets, jdText, …) deliberately
+    // survives — if the user re-enters a valid code they can keep working.
+    parseStatus.set('idle');
+    parseProgress.set('');
+    parseError.set('');
+    parseWarnings.set([]);
+    recommendStatus.set('idle');
+    recommendError.set('');
+    genStatus.set('idle');
+    tokenBuffer.set('');
+    genError.set('');
+    // Wipe the code and bounce the user back to step 1 — the gate will then
+    // show the entry card again.
+    inviteCode.set('');
+    step.set(1);
+  }
 
   // ── Backend health check (F6) — also re-runs on focus/visibility ────────
   let backendDown = false;
@@ -238,6 +285,67 @@
   <span>Backend unreachable: {backendMsg}. Make sure the API server is running.</span>
 </div>
 {/if}
+
+<!-- ── Invite-code chip (visible on every step once a code is set) ────────── -->
+{#if $inviteCode}
+<div class="invite-chip" aria-label="Active invite code">
+  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+    <path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"/>
+  </svg>
+  <span class="mono">Code: <strong>{$inviteCode}</strong></span>
+  <button class="invite-change" type="button" on:click={changeInviteCode}>change</button>
+</div>
+{/if}
+
+<!-- ═══════════════════════════════════════════════════════════════════════════
+     INVITE GATE: shown when no code is set. Hides the rest of the wizard
+     until the user enters their batchmate-specific code.
+     ═══════════════════════════════════════════════════════════════════════ -->
+{#if !$inviteCode}
+<div class="fade-in step-container">
+  <div class="hero-section">
+    <div class="hero-badge">
+      <div class="badge-dot"></div>
+      <span>Sign in</span>
+    </div>
+    <h1 class="hero-title">Enter your <span class="gradient-text">invite code</span></h1>
+    <p class="hero-subtitle">
+      CVonRAG is invite-only for the PGDBA batch. Vybhav has shared a unique
+      code with you — paste it below to access the optimizer. Your code tracks
+      your daily quota so one batchmate can't accidentally burn through the
+      shared LLM budget.
+    </p>
+  </div>
+
+  <div class="invite-card">
+    <label for="invite-input" class="field-label" style="font-size:0.8125rem;font-weight:600">Invite code</label>
+    <input
+      id="invite-input"
+      type="text"
+      bind:value={inviteInput}
+      placeholder="e.g. AMAN-2K24"
+      class="field mono"
+      autocomplete="off"
+      spellcheck="false"
+      on:keydown={e => { if (e.key === 'Enter') saveInviteCode(); }}
+    />
+    <button
+      class="btn-primary"
+      style="width:100%;padding:0.875rem;margin-top:0.875rem"
+      disabled={!INVITE_CODE_PATTERN.test(inviteInput.trim())}
+      on:click={saveInviteCode}
+    >
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+        <path d="M5 12h14M12 5l7 7-7 7"/>
+      </svg>
+      Continue
+    </button>
+    <p class="mono" style="font-size:0.7rem;color:var(--muted);margin-top:0.75rem;text-align:center">
+      Don't have one? Ping <strong>Vybhav</strong> on the PGDBA WhatsApp group.
+    </p>
+  </div>
+</div>
+{:else}
 
 <!-- ═══════════════════════════════════════════════════════════════════════════
      STEP 1: Upload BioData
@@ -486,12 +594,13 @@
       id="jd-input"
       bind:value={$jdText}
       rows="8"
+      maxlength="10000"
       placeholder={"Paste the full job description here…\n\nWe are looking for a Senior ML Engineer with expertise in Python, SARIMA forecasting, and production MLOps pipelines…"}
       class="field jd-textarea"
     ></textarea>
     <div style="display:flex;justify-content:flex-end;margin-top:0.375rem">
-      <span class="mono" style="font-size:0.7rem;color:{$jdText.length < 50 ? 'var(--red)' : 'var(--muted)'}">
-        {$jdText.length} chars {$jdText.length < 50 ? '· min 50' : ''}
+      <span class="mono" style="font-size:0.7rem;color:{$jdText.length < 50 ? 'var(--red)' : ($jdText.length > 9500 ? 'var(--amber)' : 'var(--muted)')}">
+        {$jdText.length} / 10000 chars {$jdText.length < 50 ? '· min 50' : ''}
       </span>
     </div>
   </div>
@@ -737,7 +846,48 @@
 </div>
 {/if}
 
+{/if}  <!-- close invite-gate {:else} from the top of the wizard -->
+
 <style>
+  /* ── Invite chip + card ─────────────────────────────────────────────── */
+  .invite-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.45rem;
+    font-size: 0.7rem;
+    color: var(--muted);
+    background: var(--accent-dim);
+    border: 1px solid rgba(124,58,237,0.15);
+    padding: 0.3rem 0.7rem;
+    border-radius: 999px;
+    margin-bottom: 1.25rem;
+    width: fit-content;
+  }
+  .invite-chip strong {
+    color: var(--accent-light);
+    font-family: 'JetBrains Mono', monospace;
+  }
+  .invite-change {
+    background: transparent;
+    border: none;
+    color: var(--muted);
+    cursor: pointer;
+    font-size: 0.65rem;
+    text-decoration: underline;
+    padding: 0;
+    margin-left: 0.25rem;
+  }
+  .invite-change:hover { color: var(--accent-light); }
+
+  .invite-card {
+    max-width: 420px;
+    margin: 0 auto;
+    padding: 1.75rem;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 14px;
+  }
+
   /* ── Layout ─────────────────────────────────────────────────────────── */
   .step-container {
     display: flex;

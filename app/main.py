@@ -11,22 +11,27 @@ Endpoints:
 """
 
 from __future__ import annotations
+
 import asyncio
-import json
 import logging
 import secrets
 import time
 from collections import deque
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime
 from math import ceil
 
 import httpx
-from fastapi import FastAPI, File, Header, HTTPException, Request, UploadFile, status
+from fastapi import Depends, FastAPI, File, Header, HTTPException, Request, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
+from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.auth import check_and_reserve_bullets, require_invite
 from app.chains import (
     CVonRAGOrchestrator,
     HostedLLMQuotaExhausted,
@@ -34,15 +39,19 @@ from app.chains import (
     close_http,
 )
 from app.config import get_settings
+from app.db import Invite, close_db, get_session, init_db
 from app.models import (
     GeneratedBullet,
     HealthResponse,
+    InviteCreate,
+    InviteUsage,
     OptimizationRequest,
     RecommendRequest,
     RecommendResponse,
     RoleType,
     StreamChunk,
     StreamEventType,
+    UsageResponse,
 )
 from app.parser import parse_and_stream
 from app.recommender import recommend_projects as _do_recommend
@@ -134,7 +143,17 @@ _limiter = _RateLimiter()
 
 
 async def _rate_check(request: Request, key: str, max_calls: int) -> None:
-    """Raise HTTP 429 if the caller has exceeded their per-minute quota."""
+    """
+    Enforce per-IP rate limits for an incoming request and raise an HTTP 429 when the caller is over the limit.
+    
+    Parameters:
+    	request (Request): Incoming request used to identify the caller's IP.
+    	key (str): Namespace or bucket name for rate limiting (e.g., "optimize", "parse").
+    	max_calls (int): Maximum allowed calls within the configured rate-limit window.
+    
+    Raises:
+    	HTTPException: 429 Too Many Requests with a `Retry-After` header indicating how many seconds to wait.
+    """
     ip   = request.client.host if request.client else "unknown"
     wait = await _limiter.check(ip, key, max_calls, settings.rate_limit_window)
     if wait is not None:
@@ -145,21 +164,61 @@ async def _rate_check(request: Request, key: str, max_calls: int) -> None:
         )
 
 
+# ── Admin secret helper ───────────────────────────────────────────────────────
+
+def _check_admin_secret(provided: str | None) -> None:
+    """
+    Validate the X-Ingest-Secret header using a constant-time comparison.
+    
+    If `settings.ingest_secret` is empty, the check is skipped (gate open). This function raises an HTTP 403 when a non-empty configured secret exists and the provided header is missing or does not match.
+    
+    Parameters:
+        provided (str | None): Value of the `X-Ingest-Secret` header from the request.
+    
+    Raises:
+        HTTPException: 403 Forbidden when the provided secret is invalid or missing while a configured secret is required.
+    """
+    if not settings.ingest_secret:
+        return
+    # P3: constant-time comparison to avoid leaking secret prefix via timing.
+    if not secrets.compare_digest(provided or "", settings.ingest_secret):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Invalid or missing X-Ingest-Secret header.",
+        )
+
+
 # ── Lifespan ──────────────────────────────────────────────────────────────────
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    """
+    Initialize application resources on startup and clean them up on shutdown.
+    
+    On startup this function checks that the Qdrant collection exists (logs a warning on failure but does not abort startup) and initializes the SQLite invite database (logs and re-raises the exception if invite codes are required by configuration). On shutdown it closes the shared HTTP client used by LLM chains, the vector/Qdrant clients, and the SQLite engine.
+    """
     logger.info("CVonRAG starting — checking Qdrant collection …")
     try:
         await ensure_collection_exists()
         logger.info("Qdrant ready.")
     except Exception as exc:
         logger.warning("Qdrant startup check failed (will retry on first request): %s", exc)
+    # SQLite invite DB — create the table file/schema if missing. Any failure
+    # here aborts startup: even when INVITE_CODES_REQUIRED=false, the admin
+    # endpoints (`/admin/invites`, `/admin/usage`) still depend on the session
+    # factory; letting the app start in a broken state would surface as 500s
+    # on those calls rather than a clean boot failure (B13).
+    try:
+        await init_db()
+    except Exception:
+        logger.exception("Invite DB init failed; aborting startup")
+        raise
     yield
     # ── Shutdown: close singleton clients ──────────────────────────────
     logger.info("CVonRAG shutting down — closing connections …")
     await close_http()          # chains.py HTTP client
     await close_clients()       # vector_store.py HTTP + Qdrant clients
+    await close_db()            # SQLite engine
     logger.info("All connections closed.")
 
 
@@ -349,20 +408,22 @@ async def health_check():
     summary="Parse a .docx or .pdf CV file into structured projects + facts",
     status_code=status.HTTP_200_OK,
 )
-async def parse_cv(request: Request, file: UploadFile = File(...)):
+async def parse_cv(
+    request: Request,
+    file: UploadFile = File(...),
+    _invite: Invite | None = Depends(require_invite("parse")),
+):
     """
-    **Document parsing endpoint.**
-
-    Upload a `.docx` biodata or `.pdf` CV.
-    Returns a `text/event-stream` SSE response showing extraction progress.
-    All events are wrapped in a `StreamChunk` envelope (same as `/optimize`).
-
-    | Event type | `data` field | Description |
-    |---|---|---|
-    | `progress` | `{message, current, total}` | Extraction progress update |
-    | `project`  | `{project: ProjectData, index, total}` | One project completed |
-    | `done`     | `{total_projects, total_facts}` | All done |
-    | `error`    | `null` (see `error_message`) | Parse error |
+    Stream extraction progress and parsed project data from an uploaded .docx or .pdf CV as Server-Sent Events.
+    
+    Streams SSE `StreamChunk` envelopes describing parsing progress, discovered projects, completion, or errors:
+    - `progress`: `{"message", "current", "total"}` — extraction progress update
+    - `project`: `{"project": ProjectData, "index", "total"}` — a completed project
+    - `done`: `{"total_projects", "total_facts"}` — parsing finished
+    - `error`: `null` (see `error_message`) — parse failure
+    
+    Returns:
+        StreamingResponse: A `text/event-stream` response that emits SSE-formatted `StreamChunk` objects for each event.
     """
     await _rate_check(request, "parse", settings.rate_limit_parse)
     if not file.filename:
@@ -425,16 +486,18 @@ async def parse_cv(request: Request, file: UploadFile = File(...)):
     tags=["generation"],
     summary="Score and rank all uploaded projects against a job description",
 )
-async def recommend(request: Request, body: RecommendRequest):
+async def recommend(
+    request: Request,
+    body: RecommendRequest,
+    _invite: Invite | None = Depends(require_invite("recommend")),
+):
     """
-    **Project recommendation endpoint.**
-
-    Given all projects parsed from a CV + a job description, returns every
-    project scored (0–1) against the JD, with the top `top_k` marked as
-    recommended and a one-sentence reason explaining why.
-
-    Call this after `/parse` and before `/optimize`. The frontend uses the
-    response to pre-select the best projects and show reasoning to the user.
+    Score candidate projects against a job description and return the top recommendations.
+    
+    Given parsed projects and a job description, computes a relevance score (0–1) for each project, marks the top `top_k` projects as recommended, and provides a one-sentence reason for each recommendation. The response is used to pre-select projects for downstream optimization.
+    
+    Returns:
+        RecommendResponse: Contains `recommendations` — a list of scored projects with `recommended` flags and one-line reasoning for each.
     """
     await _rate_check(request, "recommend", settings.rate_limit_recommend)
     try:
@@ -462,19 +525,24 @@ async def recommend(request: Request, body: RecommendRequest):
     summary="Stream optimised resume bullets via SSE",
     status_code=status.HTTP_200_OK,
 )
-async def optimize(request: Request, body: OptimizationRequest):
+async def optimize(
+    request: Request,
+    body: OptimizationRequest,
+    invite: Invite | None = Depends(require_invite("optimize")),
+    session: AsyncSession = Depends(get_session),
+):
     """
-    **Main generation endpoint.**
-
-    Accepts an `OptimizationRequest` JSON body.
-    Returns a `text/event-stream` SSE response.
-
-    | Event type | Payload | Description |
-    |---|---|---|
-    | `token`    | `{data: string}` | Raw LLM token (typewriter) |
-    | `bullet`   | `{data: GeneratedBullet}` | Final validated bullet (includes `.metadata`) |
-    | `error`    | `{error_message: string}` | Pipeline error |
-    | `done`     | `{data: {elapsed_seconds}}` | Stream complete |
+    Stream an optimization run as Server-Sent Events for the given OptimizationRequest.
+    
+    Parameters:
+        body (OptimizationRequest): Generation parameters (projects, per-project caps, total bullets, etc.).
+    
+    Returns:
+        StreamingResponse: An SSE stream that emits events until completion. Emitted event payloads:
+          - `token`: `{ "data": "<string>" }` — incremental LLM token fragments.
+          - `bullet`: `{ "data": <GeneratedBullet> }` — a finalized, validated bullet (includes `metadata`).
+          - `error`: `{ "error_message": "<string>" }` — pipeline or runtime error information.
+          - `done`: `{ "data": { "elapsed_seconds": <number> } }` — completion metadata.
     """
     await _rate_check(request, "optimize", settings.rate_limit_optimize)
     # H3: guard hosted-LLM quota before starting the stream.
@@ -482,9 +550,9 @@ async def optimize(request: Request, body: OptimizationRequest):
     # sending 200+ LLM calls in the first place. Applies to whichever hosted
     # provider is active (Groq or OpenRouter); both free tiers have strict
     # per-minute limits that this cap protects against.
+    requested = body.total_bullets_requested or 0
     if _hosted_llm_config() is not None:
         cap = settings.groq_max_bullets_per_request
-        requested = body.total_bullets_requested or 0
         if requested > cap:
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -494,6 +562,11 @@ async def optimize(request: Request, body: OptimizationRequest):
                     f"of projects, or set GROQ_MAX_BULLETS_PER_REQUEST higher in .env."
                 ),
             )
+    # Per-invite daily bullet cap. The require_invite dep already counted +1
+    # toward optimize_today; this reserves the requested bullets against the
+    # invite's per-day bullet budget before any LLM calls happen.
+    quota_time = invite.last_seen if invite else datetime.now(UTC)
+    await check_and_reserve_bullets(invite, requested, session, quota_time)
     return StreamingResponse(
         _sse_stream(body),
         media_type="text/event-stream",
@@ -536,21 +609,22 @@ async def ingest(
     x_ingest_secret: str | None = Header(default=None),
 ):
     """
-    **Admin endpoint** — seed Qdrant with Gold Standard CV bullets.
-
-    When `INGEST_SECRET` is set in `.env`, callers must send
-    `X-Ingest-Secret: <secret>` in the request header.
+    Insert the provided gold-standard bullets into the configured Qdrant collection (admin only).
+    
+    If an ingest secret is configured, the `X-Ingest-Secret` header must be provided and valid; when unset, ingestion is allowed without a secret.
+    
+    Parameters:
+        body (IngestRequest): Payload containing the list of bullets to ingest.
+        x_ingest_secret (str | None): Value of the `X-Ingest-Secret` header when provided.
+    
+    Returns:
+        IngestResponse: `upserted` is the number of bullets written and `message` describes the target collection.
+    
+    Raises:
+        HTTPException(403): If an ingest secret is configured and the provided header is missing or invalid.
+        HTTPException(500): On unexpected failures during ingestion.
     """
-    if settings.ingest_secret:
-        # Constant-time comparison (P3) — `!=` short-circuits on first byte
-        # mismatch, leaking secret prefix length via timing. compare_digest is
-        # bounded by max(len(a), len(b)). Coerce missing header to "" so the
-        # function never sees None.
-        if not secrets.compare_digest(x_ingest_secret or "", settings.ingest_secret):
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Invalid or missing X-Ingest-Secret header.",
-            )
+    _check_admin_secret(x_ingest_secret)
     try:
         count = await ingest_gold_standard_bullets(
             [item.model_dump() for item in body.bullets]
@@ -567,6 +641,87 @@ async def ingest(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Ingestion failed — see server logs for details.",
         )
+
+
+# ── Admin: invite management ──────────────────────────────────────────────────
+
+@app.post("/admin/invites", response_model=InviteUsage, tags=["admin"])
+async def create_invite(
+    body: InviteCreate,
+    x_ingest_secret: str | None = Header(default=None),
+    session: AsyncSession = Depends(get_session),
+):
+    """
+    Create a new invite code; endpoint is protected by the `X-Ingest-Secret` header.
+    
+    Parameters:
+        body (InviteCreate): Invite data including the invite `code` and optional `name`.
+    
+    Returns:
+        InviteUsage: A validated representation of the newly created invite.
+    """
+    _check_admin_secret(x_ingest_secret)
+    invite = Invite(code=body.code, name=body.name)
+    session.add(invite)
+    try:
+        await session.commit()
+    except IntegrityError:
+        await session.rollback()
+        # `from None` suppresses exception chaining — the IntegrityError is
+        # intentional control flow (PRIMARY KEY collision = the 409 case we
+        # explicitly want), not an unexpected error worth showing as the
+        # __cause__ in logs or the response.
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Invite code '{body.code}' already exists.",
+        ) from None
+    await session.refresh(invite)
+    return InviteUsage.model_validate(invite, from_attributes=True)
+
+
+_USAGE_MAX_LIMIT = 500
+
+
+@app.get("/admin/usage", response_model=UsageResponse, tags=["admin"])
+async def list_usage(
+    x_ingest_secret: str | None = Header(default=None),
+    session: AsyncSession = Depends(get_session),
+    limit: int = 100,
+    offset: int = 0,
+):
+    """
+    Return a paginated list of invite codes with their cumulative and today's usage counts.
+    
+    Parameters:
+        x_ingest_secret (str | None): Value of the `X-Ingest-Secret` header used to authorize admin access (required unless server secret is unset).
+        limit (int): Number of invites to return; must be between 1 and _USAGE_MAX_LIMIT (default 100).
+        offset (int): Number of invites to skip before returning results (default 0).
+    
+    Returns:
+        UsageResponse: An object containing invites ordered by invite code with their usage metrics.
+    
+    Raises:
+        HTTPException: 403 if the provided admin secret is invalid; 422 if `limit` or `offset` are outside allowed ranges.
+    """
+    _check_admin_secret(x_ingest_secret)
+    if limit < 1 or limit > _USAGE_MAX_LIMIT:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"limit must be between 1 and {_USAGE_MAX_LIMIT}",
+        )
+    if offset < 0:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="offset must be >= 0",
+        )
+    rows = (
+        await session.scalars(
+            select(Invite).order_by(Invite.code).offset(offset).limit(limit)
+        )
+    ).all()
+    return UsageResponse(
+        invites=[InviteUsage.model_validate(r, from_attributes=True) for r in rows],
+    )
 
 
 # ── Direct run ────────────────────────────────────────────────────────────────
