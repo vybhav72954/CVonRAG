@@ -9,9 +9,9 @@ import pytest
 @pytest.fixture(autouse=True)
 def _isolate_settings_from_local_env(monkeypatch, tmp_path):
     """
-    Ensure tests run with standardized, non-environment-dependent application settings.
+    Configure application settings and shared state to isolate tests from the developer's local environment.
     
-    Patches cached settings to clear ingest secrets, disable rate limiting and invite-code checks, point SQLite to a per-test file under `tmp_path`, reset the DB engine/session factory, clear in-memory rate-limiter state, and reset the Groq quota circuit breaker.
+    Clears ingest secrets, disables global rate limiting and the invite-code requirement, redirects SQLite to a per-test file under the provided tmp_path, resets the cached database engine/session factory, clears in-memory rate-limiter state, and resets the Groq quota circuit breaker so tests start from a clean, deterministic baseline.
     """
     from app.main import settings as main_settings, _limiter
     from app.chains import settings as chains_settings, _reset_quota_circuit

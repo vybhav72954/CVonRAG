@@ -61,14 +61,14 @@ _VALID_PDF_FILE = ("cv.pdf", _PDF_MAGIC + b"x" * 200, "application/pdf")
 
 async def _mock_parse_stream(file_bytes, filename):
     """
-    Yield a single `'done'` parse event for tests.
+    Yield a single 'done' parse event for tests.
     
     Parameters:
-        file_bytes (bytes): Input bytes passed by the caller (ignored).
-        filename (str): Filename passed by the caller (ignored).
+        file_bytes (bytes): Input bytes from the caller (ignored).
+        filename (str): Filename from the caller (ignored).
     
     Returns:
-        Async generator that yields a single tuple: `("done", {"total_projects": 0, "total_facts": 0})`.
+        A single tuple: `("done", {"total_projects": 0, "total_facts": 0})`, yielded once.
     """
     yield ("done", {"total_projects": 0, "total_facts": 0})
 
@@ -76,10 +76,10 @@ async def _mock_parse_stream(file_bytes, filename):
 @pytest.fixture
 def client():
     """
-    Provide a fresh FastAPI TestClient with application lifespan for each test, ensuring the SQLite database is rebuilt.
+    Provide a TestClient that runs the application's lifespan so the test database and app startup/shutdown logic are executed for each test.
     
     Returns:
-        c (TestClient): A TestClient instance (context-managed) configured with raise_server_exceptions=True, yielded for use in the test.
+        TestClient: A context-managed TestClient configured with raise_server_exceptions=True for use in tests.
     """
     with TestClient(app, raise_server_exceptions=True) as c:
         yield c
@@ -93,12 +93,11 @@ def gate_enabled(monkeypatch):
 
 def _create_invite(client: TestClient, code: str, name: str = "Test") -> dict:
     """
-    Create an invite by POSTing to /admin/invites and return the created invite record.
+    Create an invite via POST /admin/invites and return the created invite record.
     
-    This helper asserts the HTTP response status is 200.
+    Asserts the HTTP response status is 200.
     
     Parameters:
-        client (TestClient): Test client used to send the request.
         code (str): Invite code to create.
         name (str): Human-readable name for the invite; defaults to "Test".
     
@@ -154,9 +153,11 @@ class TestInviteAuth:
         assert resp.status_code == 200
 
     def test_header_with_stray_whitespace_still_matches(self, client, gate_enabled):
-        """B1 defense in depth: copy-paste often appends a trailing space.
-        The header lookup strips before comparing so the user isn't 401'd
-        for an invisible character."""
+        """
+        Ensures an invite code header value with leading or trailing whitespace still matches an existing invite.
+        
+        Verifies that a request with an X-Invite-Code value containing surrounding whitespace is accepted (results in HTTP 200).
+        """
         _create_invite(client, "TRIMTEST")
         with patch("app.main._do_recommend", new=AsyncMock(return_value=[])):
             resp = client.post(
@@ -492,10 +493,11 @@ class TestDailyResetEdgeCases:
     NULL, or daily counters accumulate across UTC days forever."""
 
     def test_fresh_invite_first_request_sets_today_date(self, client, gate_enabled):
-        """A brand-new invite has today_date=NULL. After the first gated
-        request, today_date must be set to today (proving the reset fired).
-        Without the B10 fix, today_date stays NULL and the daily counter
-        never resets on subsequent days."""
+        """
+        Ensure a newly created invite has its today_date set after the first gated request.
+        
+        Verifies that an invite whose `today_date` is initially NULL is updated to the current UTC date after a successful gated request, causing the daily counters to initialize for that invite.
+        """
         from datetime import datetime, timezone
         _create_invite(client, "FRESHX")
         with patch("app.main._do_recommend", new=AsyncMock(return_value=[])):
@@ -539,9 +541,9 @@ class TestDailyResetEdgeCases:
 
         async def _rewind():
             """
-            Set the "YESTERDAY" invite row's daily state to a prior date and preset daily counters.
+            Set the invite with code "YESTERDAY" to a previous UTC date and preset daily counters.
             
-            Updates the invite with code "YESTERDAY" so that `today_date` is set to `yesterday`, `optimize_today` is set to 5, and `bullets_today` is set to 20; used in tests to simulate an invite whose daily counters belong to the previous UTC day.
+            Updates that invite's `today_date` to the `yesterday` value and sets `optimize_today` to 5 and `bullets_today` to 20 so tests can simulate an invite whose daily counters belong to the previous UTC day.
             """
             from sqlalchemy import update
             factory = _ensure_factory_sync()

@@ -60,10 +60,10 @@ class Invite(Base):
 
     def __repr__(self) -> str:  # B5 — readable debug output
         """
-        Produce a debug-friendly string for the Invite showing its `code` and optimization counters.
+        Return a debug-friendly string identifying the invite by code and optimization counters.
         
         Returns:
-            str: A representation of the form "Invite(code='...', optimize_today=<int>, optimize_count=<int>)".
+            A string in the form "Invite(code='...', optimize_today=<int>, optimize_count=<int>)".
         """
         return (
             f"Invite(code={self.code!r}, optimize_today={self.optimize_today}, "
@@ -85,12 +85,12 @@ _factory_lock = asyncio.Lock()
 
 def _engine_url() -> URL | str:
     """
-    Build the SQLAlchemy async SQLite connection target for the configured sqlite path.
+    Return the SQLAlchemy async SQLite connection target for the configured sqlite path.
     
-    Uses URL.create(...) to ensure characters in the filesystem path that are reserved in URLs (for example ?, #, %, &) are escaped correctly. Special-cases the literal ":memory:" to return the in-memory connection string expected by aiosqlite.
+    If the configured path is the literal ":memory:", return the in-memory aiosqlite connection string. Otherwise return a SQLAlchemy `URL` created via `URL.create(...)` so filesystem characters reserved in URLs (for example ?, #, %, &) are escaped correctly.
     
     Returns:
-        URL | str: A SQLAlchemy URL object or connection string suitable for create_async_engine.
+        A `URL` for a file-backed SQLite database or the in-memory connection string `"sqlite+aiosqlite:///:memory:"`.
     """
     path = settings.sqlite_path
     if path == ":memory:":
@@ -100,9 +100,9 @@ def _engine_url() -> URL | str:
 
 async def _ensure_factory_async() -> async_sessionmaker[AsyncSession]:
     """
-    Lazily initializes and returns the module-level async SQLAlchemy session factory.
+    Ensure the module-level async SQLAlchemy session factory is initialized for use.
     
-    This function is safe to call concurrently from multiple coroutines; on the first call it creates the engine and an `async_sessionmaker`, and subsequent calls return the cached factory.
+    This function is safe to call concurrently from multiple coroutines; on the first invocation it initializes the engine and session factory and subsequent calls return the cached factory.
     
     Returns:
         async_sessionmaker[AsyncSession]: The session factory used to create `AsyncSession` instances.
@@ -121,12 +121,12 @@ async def _ensure_factory_async() -> async_sessionmaker[AsyncSession]:
 
 def _ensure_factory_sync() -> async_sessionmaker[AsyncSession]:
     """
-    Ensure the module-level SQLAlchemy async session factory exists.
+    Create and return the module-level SQLAlchemy async session factory if it does not already exist.
     
-    Creates the async engine and session factory if they are not already initialized and returns the cached factory. Intended for use during application startup (e.g., init_db) before concurrent request access begins.
+    Initializes the module-level async engine and corresponding async session factory when uninitialized; intended for use in startup code paths before concurrent access begins.
     
     Returns:
-        The module-level `async_sessionmaker[AsyncSession]` used to produce async sessions.
+        The cached `async_sessionmaker` configured to produce `AsyncSession` instances.
     """
     global _engine, _session_factory
     if _session_factory is None:
@@ -164,9 +164,9 @@ async def init_db() -> None:
 
 async def close_db() -> None:
     """
-    Dispose the SQLAlchemy engine and clear the module's cached session factory.
+    Close and clean up the module's async database resources.
     
-    If an engine exists it will be disposed, and the module-level `_engine` and `_session_factory` globals are set to `None`. Intended for application shutdown/cleanup.
+    If an async engine exists it is disposed and the cached engine and session factory are cleared so subsequent initialization can recreate them.
     """
     global _engine, _session_factory
     if _engine is not None:
@@ -177,12 +177,10 @@ async def close_db() -> None:
 
 async def get_session() -> AsyncGenerator[AsyncSession, None]:
     """
-    Provide a fresh database session scoped to a single request.
-    
-    Intended for use as a FastAPI dependency; the yielded session is closed when the request scope ends.
+    Provide a request-scoped database session for dependency injection (e.g., FastAPI).
     
     Returns:
-        An AsyncSession scoped to the current request.
+        AsyncSession: The session bound to the current request; closed automatically when the request scope ends.
     """
     factory = await _ensure_factory_async()
     async with factory() as session:

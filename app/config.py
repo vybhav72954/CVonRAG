@@ -171,9 +171,9 @@ class Settings(BaseSettings):
     @model_validator(mode="after")
     def _warn_production_ingest_secret(self) -> "Settings":
         """
-        Log a boot-time warning if running in production with an empty ingest secret.
+        Warns if running in production without an ingest secret.
         
-        If `app_env` equals "production" and `ingest_secret` is empty, logs a warning that `/ingest` and `/admin/*` will be unauthenticated so deployments are not accidentally exposed. This validator returns the settings unchanged.
+        If `app_env` is "production" and `ingest_secret` is empty, logs a warning that `/ingest` and `/admin/*` will be unauthenticated to prevent accidental exposure of the deployment. 
         
         Returns:
             Settings: The same `Settings` instance (`self`).
@@ -190,9 +190,9 @@ class Settings(BaseSettings):
 @lru_cache()
 def get_settings() -> Settings:
     """
-    Return the application's configuration settings.
+    Provide the application's Settings instance loaded from environment variables and the optional .env file.
     
     Returns:
-        settings (Settings): A Settings instance populated from environment variables and the optional .env file.
+        settings (Settings): The Settings instance populated from environment and .env configuration.
     """
     return Settings()

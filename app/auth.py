@@ -69,9 +69,9 @@ def _seconds_until_midnight_utc() -> int:
 
 async def _lazy_reset_daily(session: AsyncSession, code: str, today: date) -> None:
     """
-    Reset an invite's per-day counters when the stored UTC date has rolled over.
+    Perform an idempotent UTC-day rollover for an invite's daily counters.
     
-    If the invite's stored `today_date` is missing or not equal to `today`, this updates `today_date` to `today` and sets `optimize_today` and `bullets_today` to 0. The operation is idempotent and safe under concurrent requests so multiple callers crossing UTC midnight will not cause duplicate resets.
+    If the invite's stored `today_date` is NULL or not equal to `today`, sets `today_date` to `today` and resets `optimize_today` and `bullets_today` to 0. The update is safe to call concurrently and has no effect when the stored date already matches `today`.
     """
     await session.execute(
         update(Invite)
@@ -224,17 +224,17 @@ async def check_and_reserve_bullets(
     session: AsyncSession,
 ) -> None:
     """
-    Reserve a number of bullets from an invite's per-day quota, raising HTTP errors if the request cannot be satisfied.
+    Reserve the specified number of bullets from an invite's per-day quota, atomically updating the invite row.
     
-    Performs an idempotent UTC-day rollover for the invite's daily counters, then atomically increments the invite's `bullets_today` by `requested` only if doing so does not exceed `settings.max_daily_bullets`. Commits the reservation on success; does nothing if `invite` is None or `requested` is less than or equal to 0.
+    If `invite` is None or `requested` is less than or equal to 0, the function returns without action. The function performs a UTC-day rollover for the invite's daily counters before attempting an atomic reservation that ensures the per-day bullet cap is not exceeded.
     
     Parameters:
         invite (Invite | None): The invite row to charge bullets against; when `None` the function is a no-op.
         requested (int): Number of bullets to reserve for this request.
     
     Raises:
-        HTTPException 401: If the invite was removed between checks ("Invite revoked mid-request.").
-        HTTPException 429: If the requested bullets would exceed the invite's remaining daily bullets. The response includes a `Retry-After` header with seconds until 00:00 UTC and a detail message stating the daily cap and remaining bullets.
+        HTTPException 401: If the invite was removed between the reservation attempt and the follow-up read ("Invite revoked mid-request.").
+        HTTPException 429: If reserving `requested` bullets would exceed the invite's remaining daily bullets. The response includes a `Retry-After` header with seconds until 00:00 UTC and a detail message stating the daily cap and remaining bullets.
     """
     if invite is None or requested <= 0:
         return

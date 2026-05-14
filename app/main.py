@@ -143,15 +143,15 @@ _limiter = _RateLimiter()
 
 async def _rate_check(request: Request, key: str, max_calls: int) -> None:
     """
-    Enforce the configured rate limit for the caller and raise HTTP 429 when the limit is exceeded.
+    Enforce per-IP rate limits for an incoming request and raise an HTTP 429 when the caller is over the limit.
     
     Parameters:
-        request (Request): The incoming request used to identify the caller (IP).
-        key (str): Namespace/key for the rate-limiting bucket (e.g., "optimize", "parse").
-        max_calls (int): Maximum allowed calls within the configured rate-limit window.
+    	request (Request): Incoming request used to identify the caller's IP.
+    	key (str): Namespace or bucket name for rate limiting (e.g., "optimize", "parse").
+    	max_calls (int): Maximum allowed calls within the configured rate-limit window.
     
     Raises:
-        HTTPException: 429 Too Many Requests with `Retry-After` header set to the number of seconds to wait.
+    	HTTPException: 429 Too Many Requests with a `Retry-After` header indicating how many seconds to wait.
     """
     ip   = request.client.host if request.client else "unknown"
     wait = await _limiter.check(ip, key, max_calls, settings.rate_limit_window)
@@ -530,19 +530,17 @@ async def optimize(
     session: AsyncSession = Depends(get_session),
 ):
     """
-    Stream optimized resume bullet generation as Server-Sent Events.
-    
-    Streams Server-Sent Events (SSE) representing the optimization run for the provided OptimizationRequest.
+    Stream an optimization run as Server-Sent Events for the given OptimizationRequest.
     
     Parameters:
-        body (OptimizationRequest): Parameters controlling generation (projects, per-project caps, etc.).
+        body (OptimizationRequest): Generation parameters (projects, per-project caps, total bullets, etc.).
     
     Returns:
-        StreamingResponse: An SSE stream that emits events until completion. Emitted event types:
-          - `token`: raw LLM token fragments as `{ "data": "<string>" }`.
-          - `bullet`: a finalized, validated bullet as `{ "data": <GeneratedBullet> }` (includes `metadata`).
-          - `error`: a pipeline error as `{ "error_message": "<string>" }`.
-          - `done`: completion notice as `{ "data": { "elapsed_seconds": <number> } }`.
+        StreamingResponse: An SSE stream that emits events until completion. Emitted event payloads:
+          - `token`: `{ "data": "<string>" }` — incremental LLM token fragments.
+          - `bullet`: `{ "data": <GeneratedBullet> }` — a finalized, validated bullet (includes `metadata`).
+          - `error`: `{ "error_message": "<string>" }` — pipeline or runtime error information.
+          - `done`: `{ "data": { "elapsed_seconds": <number> } }` — completion metadata.
     """
     await _rate_check(request, "optimize", settings.rate_limit_optimize)
     # H3: guard hosted-LLM quota before starting the stream.
@@ -608,16 +606,16 @@ async def ingest(
     x_ingest_secret: str | None = Header(default=None),
 ):
     """
-    Seed the gold-standard bullets dataset into the vector store (admin only).
+    Insert the provided gold-standard bullets into the configured Qdrant collection (admin only).
     
-    Requires the `X-Ingest-Secret` header when `INGEST_SECRET` is configured; otherwise the endpoint is open.
+    If an ingest secret is configured, the `X-Ingest-Secret` header must be provided and valid; when unset, ingestion is allowed without a secret.
     
     Parameters:
         body (IngestRequest): Payload containing the list of bullets to ingest.
         x_ingest_secret (str | None): Value of the `X-Ingest-Secret` header when provided.
     
     Returns:
-        IngestResponse: Contains `upserted` (number of bullets written) and a human-readable `message`.
+        IngestResponse: `upserted` is the number of bullets written and `message` describes the target collection.
     
     Raises:
         HTTPException(403): If an ingest secret is configured and the provided header is missing or invalid.
@@ -685,19 +683,18 @@ async def list_usage(
     offset: int = 0,
 ):
     """
-    Return a paginated list of invite codes with their cumulative and today's usage counters; access is gated by the X-Ingest-Secret header.
+    Return a paginated list of invite codes with their cumulative and today's usage counts.
     
     Parameters:
-        x_ingest_secret (str | None): Admin secret from the `X-Ingest-Secret` header (required unless server secret is unset).
-        session (AsyncSession): Database session (injected).
-        limit (int): Maximum number of invites to return; must be between 1 and _USAGE_MAX_LIMIT (default 100).
+        x_ingest_secret (str | None): Value of the `X-Ingest-Secret` header used to authorize admin access (required unless server secret is unset).
+        limit (int): Number of invites to return; must be between 1 and _USAGE_MAX_LIMIT (default 100).
         offset (int): Number of invites to skip before returning results (default 0).
     
     Returns:
-        UsageResponse: Object containing a list of `InviteUsage` entries ordered by invite code.
+        UsageResponse: An object containing invites ordered by invite code with their usage metrics.
     
     Raises:
-        HTTPException: 403 if the admin secret is invalid; 422 if `limit` or `offset` are out of allowed ranges.
+        HTTPException: 403 if the provided admin secret is invalid; 422 if `limit` or `offset` are outside allowed ranges.
     """
     _check_admin_secret(x_ingest_secret)
     if limit < 1 or limit > _USAGE_MAX_LIMIT:
