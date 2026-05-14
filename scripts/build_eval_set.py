@@ -51,6 +51,7 @@ load_dotenv(_PROJECT_ROOT / ".env")
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
+from app.chains import HostedLLMQuotaExhausted
 from app.parser import extract_facts, parse_document_bytes
 
 logging.basicConfig(level=logging.WARNING, format="%(levelname)s: %(message)s")
@@ -111,6 +112,11 @@ async def build_case(cv_path: Path, case_idx: int) -> dict:
             if facts:
                 titles.append(rp.title)
         except HostedLLMQuotaExhausted:
+            # Process-global circuit breaker — every subsequent
+            # extract_facts call would also fail. Propagate so main_async
+            # can stop the run cleanly instead of producing N fake "SKIP"
+            # lines (one per remaining PDF) and a partial / fallback-only
+            # eval set.
             raise
         except Exception as exc:
             logger.warning("extract_facts failed for '%s' in %s: %s", rp.title, cv_path.name, exc)
@@ -183,12 +189,19 @@ async def main_async(args: argparse.Namespace) -> int:
     # Linux/Mac (case-insensitive on Windows NTFS by accident), so a
     # "resume.PDF" would silently be skipped on a non-Windows host. Filter
     # via suffix.lower() so any-case extensions are picked up.
+    #
+    # Resolve pdf_dir before iterdir() so the yielded paths are absolute.
+    # iterdir() inherits the relative/absolute form of its receiver — a
+    # relative --pdf-dir like "docs/good_cvs" would otherwise produce
+    # relative cv_paths that crash cv_path.relative_to(_PROJECT_ROOT) in
+    # build_case (which expects absolute paths to slice from).
+    pdf_dir = args.pdf_dir.resolve()
     pdfs = sorted(
-        p for p in args.pdf_dir.iterdir()
+        p for p in pdf_dir.iterdir()
         if p.is_file() and p.suffix.lower() == ".pdf"
     )
     if not pdfs:
-        print(f"No PDFs in {args.pdf_dir}", file=sys.stderr)
+        print(f"No PDFs in {pdf_dir}", file=sys.stderr)
         return 2
 
     pdfs = pdfs[:args.count]
@@ -210,12 +223,25 @@ async def main_async(args: argparse.Namespace) -> int:
     }
     cases.append(header)
 
+    quota_hit = False
     for i, pdf in enumerate(pdfs):
         print(f"  [{i+1}/{len(pdfs)}] {pdf.name} … ", end="", flush=True)
         try:
             case = await build_case(pdf, i)
             cases.append(case)
             print(f"{len(case['_parsed_project_titles'])} projects")
+        except HostedLLMQuotaExhausted as exc:
+            # Latched provider-global breaker — keep what we built so far
+            # and stop. Continuing would print "SKIP" for every remaining
+            # PDF and waste time hitting the same wall.
+            print(f"QUOTA EXHAUSTED ({exc})")
+            print(
+                f"\n  ↳ {len(cases) - 1} cases built before quota hit; "
+                f"remaining {len(pdfs) - i - 1} PDFs skipped.",
+                file=sys.stderr,
+            )
+            quota_hit = True
+            break
         except Exception as exc:
             print(f"SKIP ({exc})")
             continue
@@ -225,7 +251,7 @@ async def main_async(args: argparse.Namespace) -> int:
     # eval set — that's a failure, not a successful zero-case run.
     if len(cases) <= 1:
         print(
-            f"\nERROR: every PDF in {args.pdf_dir} was skipped — no cases "
+            f"\nERROR: every PDF in {pdf_dir} was skipped — no cases "
             f"generated. {args.output} left unchanged.",
             file=sys.stderr,
         )
@@ -235,7 +261,10 @@ async def main_async(args: argparse.Namespace) -> int:
     args.output.write_text(json.dumps(cases, indent=2), encoding="utf-8")
     print(f"\nWrote {args.output} with {len(cases) - 1} cases.")
     print("Next: hand-edit JDs and correct_projects, then run scripts/evaluate.py.")
-    return 0
+    # Non-zero exit if we stopped early on quota — partial set was saved,
+    # but the run didn't complete and the caller should know to re-run
+    # once the quota window resets.
+    return 3 if quota_hit else 0
 
 
 def main() -> int:
