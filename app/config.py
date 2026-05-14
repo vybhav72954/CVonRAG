@@ -120,9 +120,30 @@ class Settings(BaseSettings):
     rate_limit_optimize: int = 5      # max /optimize calls per IP per window
 
     # ── Admin auth ────────────────────────────────────────────────────────────
-    # Set INGEST_SECRET in .env to protect the /ingest endpoint.
+    # Set INGEST_SECRET in .env to protect the /ingest and /admin/* endpoints.
     # Leave blank to allow unauthenticated access (dev only).
     ingest_secret: str = ""
+
+    # ── Invite-code auth ──────────────────────────────────────────────────────
+    # Per-batchmate identity gate on /parse, /recommend, /optimize. Each
+    # batchmate gets a unique code (admin creates via POST /admin/invites).
+    # Code is sent in the X-Invite-Code request header. Per-code daily caps
+    # below stop a single batchmate from exhausting the hosted-LLM quota.
+    # Set INVITE_CODES_REQUIRED=false to disable (dev / tests).
+    invite_codes_required: bool = True
+    # Hard daily cap: after this many /optimize calls in one UTC day, the
+    # invite code returns 429 until 00:00 UTC. 20 is comfortable for normal
+    # iteration, low enough that an accidental refresh loop cannot drain a
+    # day's free-tier hosted-LLM quota.
+    max_daily_optimizations: int = 20
+    # Bullet-level cap (each /optimize may produce up to total_bullets_requested
+    # bullets, hard-capped to groq_max_bullets_per_request=15 per call).
+    # 60/day = 3 optimize × 20 bullets, or 20 optimize × 3 bullets — both
+    # reasonable for a batchmate iterating on a single resume.
+    max_daily_bullets: int = 60
+    # SQLite path for the invite table. Default keeps the DB next to the app
+    # for local dev; deployments should mount this to a persistent volume.
+    sqlite_path: str = "./cvonrag.db"
 
     @model_validator(mode="after")
     def _warn_production_cors(self) -> "Settings":

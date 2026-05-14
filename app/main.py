@@ -22,11 +22,14 @@ from contextlib import asynccontextmanager
 from math import ceil
 
 import httpx
-from fastapi import FastAPI, File, Header, HTTPException, Request, UploadFile, status
+from fastapi import Depends, FastAPI, File, Header, HTTPException, Request, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.auth import check_and_reserve_bullets, require_invite
 from app.chains import (
     CVonRAGOrchestrator,
     HostedLLMQuotaExhausted,
@@ -34,15 +37,19 @@ from app.chains import (
     close_http,
 )
 from app.config import get_settings
+from app.db import Invite, close_db, get_session, init_db
 from app.models import (
     GeneratedBullet,
     HealthResponse,
+    InviteCreate,
+    InviteUsage,
     OptimizationRequest,
     RecommendRequest,
     RecommendResponse,
     RoleType,
     StreamChunk,
     StreamEventType,
+    UsageResponse,
 )
 from app.parser import parse_and_stream
 from app.recommender import recommend_projects as _do_recommend
@@ -145,6 +152,23 @@ async def _rate_check(request: Request, key: str, max_calls: int) -> None:
         )
 
 
+# ── Admin secret helper ───────────────────────────────────────────────────────
+
+def _check_admin_secret(provided: str | None) -> None:
+    """Constant-time check of the X-Ingest-Secret header. Used by /ingest and
+    all /admin/* endpoints. When `settings.ingest_secret` is empty the gate is
+    open (dev only — the model_validator in config.py warns on prod defaults).
+    """
+    if not settings.ingest_secret:
+        return
+    # P3: constant-time comparison to avoid leaking secret prefix via timing.
+    if not secrets.compare_digest(provided or "", settings.ingest_secret):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Invalid or missing X-Ingest-Secret header.",
+        )
+
+
 # ── Lifespan ──────────────────────────────────────────────────────────────────
 
 @asynccontextmanager
@@ -155,11 +179,21 @@ async def lifespan(_: FastAPI):
         logger.info("Qdrant ready.")
     except Exception as exc:
         logger.warning("Qdrant startup check failed (will retry on first request): %s", exc)
+    # SQLite invite DB — create the table file/schema if missing. Failure here
+    # is fatal in production (no invites = nobody can call gated endpoints)
+    # but the dev override INVITE_CODES_REQUIRED=false makes the table moot.
+    try:
+        await init_db()
+    except Exception as exc:
+        logger.exception("Invite DB init failed: %s", exc)
+        if settings.invite_codes_required:
+            raise
     yield
     # ── Shutdown: close singleton clients ──────────────────────────────
     logger.info("CVonRAG shutting down — closing connections …")
     await close_http()          # chains.py HTTP client
     await close_clients()       # vector_store.py HTTP + Qdrant clients
+    await close_db()            # SQLite engine
     logger.info("All connections closed.")
 
 
@@ -349,7 +383,11 @@ async def health_check():
     summary="Parse a .docx or .pdf CV file into structured projects + facts",
     status_code=status.HTTP_200_OK,
 )
-async def parse_cv(request: Request, file: UploadFile = File(...)):
+async def parse_cv(
+    request: Request,
+    file: UploadFile = File(...),
+    _invite: Invite | None = Depends(require_invite("parse")),
+):
     """
     **Document parsing endpoint.**
 
@@ -425,7 +463,11 @@ async def parse_cv(request: Request, file: UploadFile = File(...)):
     tags=["generation"],
     summary="Score and rank all uploaded projects against a job description",
 )
-async def recommend(request: Request, body: RecommendRequest):
+async def recommend(
+    request: Request,
+    body: RecommendRequest,
+    _invite: Invite | None = Depends(require_invite("recommend")),
+):
     """
     **Project recommendation endpoint.**
 
@@ -462,7 +504,12 @@ async def recommend(request: Request, body: RecommendRequest):
     summary="Stream optimised resume bullets via SSE",
     status_code=status.HTTP_200_OK,
 )
-async def optimize(request: Request, body: OptimizationRequest):
+async def optimize(
+    request: Request,
+    body: OptimizationRequest,
+    invite: Invite | None = Depends(require_invite("optimize")),
+    session: AsyncSession = Depends(get_session),
+):
     """
     **Main generation endpoint.**
 
@@ -482,9 +529,9 @@ async def optimize(request: Request, body: OptimizationRequest):
     # sending 200+ LLM calls in the first place. Applies to whichever hosted
     # provider is active (Groq or OpenRouter); both free tiers have strict
     # per-minute limits that this cap protects against.
+    requested = body.total_bullets_requested or 0
     if _hosted_llm_config() is not None:
         cap = settings.groq_max_bullets_per_request
-        requested = body.total_bullets_requested or 0
         if requested > cap:
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -494,6 +541,10 @@ async def optimize(request: Request, body: OptimizationRequest):
                     f"of projects, or set GROQ_MAX_BULLETS_PER_REQUEST higher in .env."
                 ),
             )
+    # Per-invite daily bullet cap. The require_invite dep already counted +1
+    # toward optimize_today; this reserves the requested bullets against the
+    # invite's per-day bullet budget before any LLM calls happen.
+    await check_and_reserve_bullets(invite, requested, session)
     return StreamingResponse(
         _sse_stream(body),
         media_type="text/event-stream",
@@ -541,16 +592,7 @@ async def ingest(
     When `INGEST_SECRET` is set in `.env`, callers must send
     `X-Ingest-Secret: <secret>` in the request header.
     """
-    if settings.ingest_secret:
-        # Constant-time comparison (P3) — `!=` short-circuits on first byte
-        # mismatch, leaking secret prefix length via timing. compare_digest is
-        # bounded by max(len(a), len(b)). Coerce missing header to "" so the
-        # function never sees None.
-        if not secrets.compare_digest(x_ingest_secret or "", settings.ingest_secret):
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Invalid or missing X-Ingest-Secret header.",
-            )
+    _check_admin_secret(x_ingest_secret)
     try:
         count = await ingest_gold_standard_bullets(
             [item.model_dump() for item in body.bullets]
@@ -567,6 +609,42 @@ async def ingest(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Ingestion failed — see server logs for details.",
         )
+
+
+# ── Admin: invite management ──────────────────────────────────────────────────
+
+@app.post("/admin/invites", response_model=InviteUsage, tags=["admin"])
+async def create_invite(
+    body: InviteCreate,
+    x_ingest_secret: str | None = Header(default=None),
+    session: AsyncSession = Depends(get_session),
+):
+    """Create a new invite code. Gated by X-Ingest-Secret (same secret as /ingest)."""
+    _check_admin_secret(x_ingest_secret)
+    existing = await session.scalar(select(Invite).where(Invite.code == body.code))
+    if existing is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Invite code '{body.code}' already exists.",
+        )
+    invite = Invite(code=body.code, name=body.name)
+    session.add(invite)
+    await session.commit()
+    await session.refresh(invite)
+    return InviteUsage.model_validate(invite, from_attributes=True)
+
+
+@app.get("/admin/usage", response_model=UsageResponse, tags=["admin"])
+async def list_usage(
+    x_ingest_secret: str | None = Header(default=None),
+    session: AsyncSession = Depends(get_session),
+):
+    """List all invite codes + their cumulative + today's counters. Gated by X-Ingest-Secret."""
+    _check_admin_secret(x_ingest_secret)
+    rows = (await session.scalars(select(Invite).order_by(Invite.code))).all()
+    return UsageResponse(
+        invites=[InviteUsage.model_validate(r, from_attributes=True) for r in rows],
+    )
 
 
 # ── Direct run ────────────────────────────────────────────────────────────────

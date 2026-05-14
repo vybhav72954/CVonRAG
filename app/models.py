@@ -8,6 +8,7 @@ The Content/Style Firewall is enforced at the data layer:
 """
 
 from __future__ import annotations
+from datetime import date, datetime
 from enum import StrEnum
 from typing import Annotated, Any
 
@@ -200,3 +201,32 @@ class HealthResponse(BaseModel):
     groq_ok: bool = False              # Back-compat: True only when active provider is groq AND reachable
     ollama_ok: bool = False            # Ollama LLM model loaded (only relevant when using Ollama)
     embed_ok: bool = False             # Ollama embed model loaded (always required)
+
+
+# ── Invite-code admin ────────────────────────────────────────────────────────
+
+class InviteCreate(BaseModel):
+    """Admin payload for POST /admin/invites. The `code` IS the batchmate's
+    identity — pick something memorable (e.g. "AMAN-2K24") or random."""
+    code: Annotated[str, Field(min_length=3, max_length=64)]
+    name: Annotated[str, Field(max_length=120)] = ""
+
+
+class InviteUsage(BaseModel):
+    """One row from /admin/usage — full counter readout for an invite code."""
+    code: str
+    name: str
+    created_at: datetime
+    last_seen: datetime | None = None
+
+    parse_count: int
+    recommend_count: int
+    optimize_count: int
+
+    optimize_today: int
+    bullets_today: int
+    today_date: date | None = None
+
+
+class UsageResponse(BaseModel):
+    invites: list[InviteUsage]
