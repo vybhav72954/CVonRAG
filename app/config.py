@@ -135,12 +135,15 @@ class Settings(BaseSettings):
     # invite code returns 429 until 00:00 UTC. 20 is comfortable for normal
     # iteration, low enough that an accidental refresh loop cannot drain a
     # day's free-tier hosted-LLM quota.
-    max_daily_optimizations: int = 20
+    # ge=1 catches a misconfig (MAX_DAILY_OPTIMIZATIONS=0 would make every
+    # /optimize call hit `0 < 0` → false → 429 immediately, surfacing as a
+    # mysterious runtime issue instead of a clear boot-time failure).
+    max_daily_optimizations: Annotated[int, Field(ge=1)] = 20
     # Bullet-level cap (each /optimize may produce up to total_bullets_requested
     # bullets, hard-capped to groq_max_bullets_per_request=15 per call).
     # 60/day = 3 optimize × 20 bullets, or 20 optimize × 3 bullets — both
     # reasonable for a batchmate iterating on a single resume.
-    max_daily_bullets: int = 60
+    max_daily_bullets: Annotated[int, Field(ge=1)] = 60
     # SQLite path for the invite table. Default keeps the DB next to the app
     # for local dev; deployments should mount this to a persistent volume.
     sqlite_path: str = "./cvonrag.db"

@@ -53,6 +53,17 @@ RECOMMEND_BODY = {
     "top_k": 1,
 }
 
+# A minimal payload that passes /parse's magic-byte + 100-byte length check.
+# 200 bytes of filler keeps it well above the 100-byte floor.
+_PDF_MAGIC = b"%PDF-1.4\n"
+_VALID_PDF_FILE = ("cv.pdf", _PDF_MAGIC + b"x" * 200, "application/pdf")
+
+
+async def _mock_parse_stream(file_bytes, filename):
+    """Stand-in for app.parser.parse_and_stream — yields a single done event so
+    /parse returns 200 quickly without invoking the real parser."""
+    yield ("done", {"total_projects": 0, "total_facts": 0})
+
 
 @pytest.fixture
 def client():
@@ -130,6 +141,42 @@ class TestInviteAuth:
             )
         assert resp.status_code == 200
 
+    # ── /parse parity with /recommend ────────────────────────────────────────
+    # Mirrors the /recommend tests above so a regression in `require_invite("parse")`
+    # wiring is caught here, not at runtime.
+
+    def test_parse_missing_header_returns_401(self, client, gate_enabled):
+        resp = client.post("/parse", files={"file": _VALID_PDF_FILE})
+        assert resp.status_code == 401
+        assert "X-Invite-Code" in resp.json()["detail"]
+
+    def test_parse_unknown_code_returns_401(self, client, gate_enabled):
+        resp = client.post(
+            "/parse", files={"file": _VALID_PDF_FILE},
+            headers={"X-Invite-Code": "BOGUS-CODE"},
+        )
+        assert resp.status_code == 401
+        assert resp.json()["detail"] == "Unknown invite code."
+
+    def test_parse_valid_code_reaches_handler(self, client, gate_enabled):
+        _create_invite(client, "PARSE-OK")
+        with patch("app.main.parse_and_stream", side_effect=_mock_parse_stream):
+            resp = client.post(
+                "/parse", files={"file": _VALID_PDF_FILE},
+                headers={"X-Invite-Code": "PARSE-OK"},
+            )
+        assert resp.status_code == 200
+        assert "text/event-stream" in resp.headers["content-type"]
+
+    def test_parse_header_with_stray_whitespace_still_matches(self, client, gate_enabled):
+        _create_invite(client, "PTRIM")
+        with patch("app.main.parse_and_stream", side_effect=_mock_parse_stream):
+            resp = client.post(
+                "/parse", files={"file": _VALID_PDF_FILE},
+                headers={"X-Invite-Code": " PTRIM "},
+            )
+        assert resp.status_code == 200
+
 
 # ── Admin endpoints ───────────────────────────────────────────────────────────
 
@@ -204,6 +251,22 @@ class TestCounterIncrement:
         assert row["parse_count"] == 0
         assert row["optimize_count"] == 0
 
+    def test_parse_increments_parse_count(self, client, gate_enabled):
+        """A successful /parse must bump parse_count but not the other counters."""
+        _create_invite(client, "PCNT")
+        with patch("app.main.parse_and_stream", side_effect=_mock_parse_stream):
+            client.post(
+                "/parse", files={"file": _VALID_PDF_FILE},
+                headers={"X-Invite-Code": "PCNT"},
+            )
+        row = next(
+            i for i in client.get("/admin/usage").json()["invites"]
+            if i["code"] == "PCNT"
+        )
+        assert row["parse_count"] == 1
+        assert row["recommend_count"] == 0
+        assert row["optimize_count"] == 0
+
     def test_optimize_increments_both_total_and_today(self, client, gate_enabled):
         _create_invite(client, "OPT")
         # Mock _sse_stream so we don't actually run the LLM pipeline.
@@ -267,6 +330,11 @@ class TestDailyBulletsCap:
 
         assert r1.status_code == 200
         assert r2.status_code == 429
+        # Mirror the optimize-cap test: bullet-cap 429s must also carry a
+        # Retry-After header pointing at the next UTC midnight, so the
+        # frontend can render a useful countdown.
+        assert "Retry-After" in r2.headers
+        assert int(r2.headers["Retry-After"]) > 0
         assert "Daily bullet cap" in r2.json()["detail"]
 
 
