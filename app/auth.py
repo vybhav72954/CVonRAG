@@ -35,8 +35,9 @@ conditional statement either commits the reservation or rejects on cap.
 """
 
 from __future__ import annotations
+
 import logging
-from datetime import date, datetime, timedelta, timezone
+from datetime import UTC, date, datetime, timedelta
 from math import ceil
 from typing import Literal
 
@@ -53,17 +54,19 @@ settings = get_settings()
 EndpointName = Literal["parse", "recommend", "optimize"]
 
 
-def _seconds_until_midnight_utc() -> int:
+def _seconds_until_midnight_utc(ref_dt: datetime | None = None) -> int:
     """
     Compute the number of whole seconds until the next 00:00 UTC.
-    
+
+    Parameters:
+        ref_dt (datetime | None): Reference datetime for the calculation; defaults to the current UTC time if not provided.
+
     Returns:
         seconds (int): Seconds until the next UTC midnight, rounded up to the next integer and at least 1.
     """
-    now = datetime.now(timezone.utc)
-    tomorrow = (now + timedelta(days=1)).replace(
-        hour=0, minute=0, second=0, microsecond=0
-    )
+    now = ref_dt or datetime.now(UTC)
+    tomorrow = now + timedelta(days=1)
+    tomorrow = tomorrow.replace(hour=0, minute=0, second=0, microsecond=0)
     return max(int(ceil((tomorrow - now).total_seconds())), 1)
 
 
@@ -146,7 +149,7 @@ def require_invite(endpoint: EndpointName):
                 detail="Missing X-Invite-Code header.",
             )
 
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         today = now.date()
 
         # 1) Reset daily counters if the UTC date rolled over. Idempotent.
@@ -206,7 +209,7 @@ def require_invite(endpoint: EndpointName):
                     f"({settings.max_daily_optimizations}/day). "
                     f"Resets at 00:00 UTC."
                 ),
-                headers={"Retry-After": str(_seconds_until_midnight_utc())},
+                headers={"Retry-After": str(_seconds_until_midnight_utc(now))},
             )
 
         # Fetch the updated row for the handler. check_and_reserve_bullets
@@ -222,16 +225,19 @@ async def check_and_reserve_bullets(
     invite: Invite | None,
     requested: int,
     session: AsyncSession,
+    quota_check_time: datetime,
 ) -> None:
     """
     Reserve the specified number of bullets from an invite's per-day quota, atomically updating the invite row.
-    
+
     If `invite` is None or `requested` is less than or equal to 0, the function returns without action. The function performs a UTC-day rollover for the invite's daily counters before attempting an atomic reservation that ensures the per-day bullet cap is not exceeded.
-    
+
     Parameters:
         invite (Invite | None): The invite row to charge bullets against; when `None` the function is a no-op.
         requested (int): Number of bullets to reserve for this request.
-    
+        session (AsyncSession): Database session used for atomic updates and reads.
+        quota_check_time (datetime): The timestamp from the original quota evaluation (captured by require_invite); used to compute consistent Retry-After headers.
+
     Raises:
         HTTPException 401: If the invite was removed between the reservation attempt and the follow-up read ("Invite revoked mid-request.").
         HTTPException 429: If reserving `requested` bullets would exceed the invite's remaining daily bullets. The response includes a `Retry-After` header with seconds until 00:00 UTC and a detail message stating the daily cap and remaining bullets.
@@ -280,5 +286,5 @@ async def check_and_reserve_bullets(
                 f"({settings.max_daily_bullets}/day; {remaining} remaining). "
                 f"Resets at 00:00 UTC."
             ),
-            headers={"Retry-After": str(_seconds_until_midnight_utc())},
+            headers={"Retry-After": str(_seconds_until_midnight_utc(quota_check_time))},
         )

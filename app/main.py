@@ -11,14 +11,15 @@ Endpoints:
 """
 
 from __future__ import annotations
+
 import asyncio
-import json
 import logging
 import secrets
 import time
 from collections import deque
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime
 from math import ceil
 
 import httpx
@@ -564,7 +565,8 @@ async def optimize(
     # Per-invite daily bullet cap. The require_invite dep already counted +1
     # toward optimize_today; this reserves the requested bullets against the
     # invite's per-day bullet budget before any LLM calls happen.
-    await check_and_reserve_bullets(invite, requested, session)
+    quota_time = invite.last_seen if invite else datetime.now(UTC)
+    await check_and_reserve_bullets(invite, requested, session, quota_time)
     return StreamingResponse(
         _sse_stream(body),
         media_type="text/event-stream",
