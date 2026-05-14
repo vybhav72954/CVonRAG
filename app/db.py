@@ -16,6 +16,7 @@ import asyncio
 import logging
 from collections.abc import AsyncGenerator
 from datetime import date, datetime, timezone
+from pathlib import Path
 
 from sqlalchemy import Date, DateTime, Integer, String
 from sqlalchemy.engine.url import URL
@@ -129,9 +130,24 @@ async def init_db() -> None:
     Runs during lifespan before any request can hit the app — no race window
     for the factory, so the sync builder is safe and avoids re-entering the
     lock that the lifespan-event-loop already holds nothing on.
+
+    B12: SQLite will silently create the DB file but NOT its parent
+    directories. A misconfigured deploy with `SQLITE_PATH=/var/data/app/cv.db`
+    where `/var/data/app/` doesn't exist would fail with an opaque
+    `OperationalError: unable to open database file`. Pre-create the parent
+    so the error (if any) actually names what's missing.
     """
+    if settings.sqlite_path != ":memory:":
+        parent = Path(settings.sqlite_path).expanduser().parent
+        parent.mkdir(parents=True, exist_ok=True)
     _ensure_factory_sync()
-    assert _engine is not None
+    # Explicit check rather than `assert` — Python -O strips asserts, and
+    # a None engine here would surface as a confusing AttributeError on the
+    # next line instead of a clear error.
+    if _engine is None:
+        raise RuntimeError(
+            "init_db: _ensure_factory_sync() returned without populating _engine"
+        )
     async with _engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
     logger.info("SQLite invite DB ready at %s", settings.sqlite_path)

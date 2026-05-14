@@ -27,6 +27,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth import check_and_reserve_bullets, require_invite
@@ -619,17 +620,24 @@ async def create_invite(
     x_ingest_secret: str | None = Header(default=None),
     session: AsyncSession = Depends(get_session),
 ):
-    """Create a new invite code. Gated by X-Ingest-Secret (same secret as /ingest)."""
+    """Create a new invite code. Gated by X-Ingest-Secret (same secret as /ingest).
+
+    B11: rely on the PRIMARY KEY UNIQUE constraint rather than a pre-check.
+    Two concurrent calls with the same code would both pass a TOCTOU pre-check
+    and the second commit would surface as `IntegrityError` → 500. Catching
+    the constraint violation gives a clean 409 and is race-safe by definition.
+    """
     _check_admin_secret(x_ingest_secret)
-    existing = await session.scalar(select(Invite).where(Invite.code == body.code))
-    if existing is not None:
+    invite = Invite(code=body.code, name=body.name)
+    session.add(invite)
+    try:
+        await session.commit()
+    except IntegrityError:
+        await session.rollback()
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail=f"Invite code '{body.code}' already exists.",
         )
-    invite = Invite(code=body.code, name=body.name)
-    session.add(invite)
-    await session.commit()
     await session.refresh(invite)
     return InviteUsage.model_validate(invite, from_attributes=True)
 

@@ -41,7 +41,7 @@ from math import ceil
 from typing import Literal
 
 from fastapi import Depends, Header, HTTPException, status
-from sqlalchemy import select, update
+from sqlalchemy import or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
@@ -70,10 +70,20 @@ async def _lazy_reset_daily(session: AsyncSession, code: str, today: date) -> No
     call after the first one each UTC day. Runs in its own statement so two
     racing requests crossing midnight UTC don't both write the reset (the
     second one's WHERE clause fails after the first one commits).
+
+    B10: must explicitly cover `today_date IS NULL` (a fresh invite that has
+    never had a request). In SQL, `NULL != today` evaluates to NULL (not
+    TRUE), so a plain `!=` excludes those rows and the reset never fires —
+    daily counters accumulate forever across UTC days. The previous Python
+    implementation worked because `None != date(...)` is True in Python,
+    but moving the comparison into SQL changes the semantic.
     """
     await session.execute(
         update(Invite)
-        .where(Invite.code == code, Invite.today_date != today)
+        .where(
+            Invite.code == code,
+            or_(Invite.today_date.is_(None), Invite.today_date != today),
+        )
         .values(today_date=today, optimize_today=0, bullets_today=0)
     )
 

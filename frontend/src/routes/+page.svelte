@@ -18,15 +18,25 @@
   // entry card below. The code is sessionStorage-persisted via the store.
   let inviteInput = '';
 
+  // Mirror the backend's InviteCreate.code pattern so the user gets instant,
+  // actionable feedback instead of a confusing 401 "Unknown invite code".
+  const INVITE_CODE_PATTERN = /^[A-Za-z0-9_-]{3,64}$/;
+
   function saveInviteCode() {
     const v = inviteInput.trim();
-    if (v.length >= 3) {
+    if (INVITE_CODE_PATTERN.test(v)) {
       inviteCode.set(v);
       inviteInput = '';
     }
   }
 
   function changeInviteCode() {
+    // Abort any in-flight gated requests first — otherwise an /optimize
+    // stream started under the old code keeps burning the old code's quota
+    // and mutates stores after the user is effectively signed out.
+    abortInFlight('parse');
+    abortInFlight('recommend');
+    abortInFlight('optimize');
     // Wipe the code and bounce the user back to step 1 — the gate will then
     // show the entry card again. Don't touch parsed state; if they enter a
     // valid code they can keep working.
@@ -308,7 +318,7 @@
     <button
       class="btn-primary"
       style="width:100%;padding:0.875rem;margin-top:0.875rem"
-      disabled={inviteInput.trim().length < 3}
+      disabled={!INVITE_CODE_PATTERN.test(inviteInput.trim())}
       on:click={saveInviteCode}
     >
       <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">

@@ -385,6 +385,101 @@ class TestAtomicCapEnforcement:
                 )
 
 
+class TestDailyResetEdgeCases:
+    """B10 regression coverage: SQL `today_date != today` excludes rows where
+    today_date IS NULL (a fresh invite). The reset must explicitly handle
+    NULL, or daily counters accumulate across UTC days forever."""
+
+    def test_fresh_invite_first_request_sets_today_date(self, client, gate_enabled):
+        """A brand-new invite has today_date=NULL. After the first gated
+        request, today_date must be set to today (proving the reset fired).
+        Without the B10 fix, today_date stays NULL and the daily counter
+        never resets on subsequent days."""
+        from datetime import datetime, timezone
+        _create_invite(client, "FRESHX")
+        with patch("app.main._do_recommend", new=AsyncMock(return_value=[])):
+            resp = client.post(
+                "/recommend", json=RECOMMEND_BODY,
+                headers={"X-Invite-Code": "FRESHX"},
+            )
+        assert resp.status_code == 200
+        row = next(
+            i for i in client.get("/admin/usage").json()["invites"]
+            if i["code"] == "FRESHX"
+        )
+        today_iso = datetime.now(timezone.utc).date().isoformat()
+        assert row["today_date"] == today_iso, (
+            f"Expected today_date={today_iso} after first request, got "
+            f"{row['today_date']!r}. B10 regression: lazy_reset_daily's "
+            f"WHERE clause is excluding NULL today_date rows."
+        )
+
+    def test_yesterday_today_date_triggers_reset(self, client, gate_enabled, monkeypatch):
+        """If today_date is yesterday, the lazy reset must fire on the next
+        request and zero out optimize_today / bullets_today."""
+        from datetime import date, datetime, timedelta, timezone
+        from app.db import Invite, _ensure_factory_sync
+        import asyncio
+
+        _create_invite(client, "YESTERDAY")
+        # Burn one optimize to set today_date AND optimize_today=1.
+        with patch("app.main._sse_stream", new=lambda body: _empty_sse()):
+            client.post(
+                "/optimize", json=OPTIMIZE_BODY,
+                headers={"X-Invite-Code": "YESTERDAY"},
+            )
+
+        # Manually rewind today_date one day to simulate UTC rollover.
+        yesterday = date.today() - timedelta(days=1)
+
+        async def _rewind():
+            from sqlalchemy import update
+            factory = _ensure_factory_sync()
+            async with factory() as s:
+                await s.execute(
+                    update(Invite).where(Invite.code == "YESTERDAY").values(
+                        today_date=yesterday, optimize_today=5, bullets_today=20,
+                    )
+                )
+                await s.commit()
+        asyncio.run(_rewind())
+
+        # Next request — reset should fire and zero the daily counters.
+        with patch("app.main._sse_stream", new=lambda body: _empty_sse()):
+            resp = client.post(
+                "/optimize", json=OPTIMIZE_BODY,
+                headers={"X-Invite-Code": "YESTERDAY"},
+            )
+        assert resp.status_code == 200
+        row = next(
+            i for i in client.get("/admin/usage").json()["invites"]
+            if i["code"] == "YESTERDAY"
+        )
+        today_iso = datetime.now(timezone.utc).date().isoformat()
+        assert row["today_date"] == today_iso
+        # Reset to 0, then incremented to 1 for this request.
+        assert row["optimize_today"] == 1
+        # bullets_today resets to 0 then reserves 1 for this request (OPTIMIZE_BODY).
+        assert row["bullets_today"] == 1
+
+
+class TestAdminInviteIdempotency:
+    """B11 regression coverage: concurrent /admin/invites with same code must
+    return 409, not 500 from an unhandled IntegrityError."""
+
+    def test_duplicate_code_returns_409_not_500(self, client):
+        """Pre-existing test creates DUP via the happy path. Re-create to
+        confirm IntegrityError is still translated to 409 after dropping the
+        pre-check."""
+        _create_invite(client, "RACE-DUP")
+        resp = client.post(
+            "/admin/invites",
+            json={"code": "RACE-DUP", "name": "second"},
+        )
+        assert resp.status_code == 409
+        assert "already exists" in resp.json()["detail"]
+
+
 class TestUsagePagination:
     """B8: /admin/usage supports ?limit and ?offset."""
 
