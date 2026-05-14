@@ -908,7 +908,10 @@ async def main_async(args: argparse.Namespace) -> int:
     if args.phase.strip().lower() == "all":
         phases = set(ALL_PHASES)
     else:
-        phases = {p.strip() for p in args.phase.split(",") if p.strip()}
+        phases = {p.strip().lower() for p in args.phase.split(",") if p.strip()}
+        if not phases:
+            print(f"No valid phases provided. Choose from {ALL_PHASES}", file=sys.stderr)
+            return 2
         unknown = phases - ALL_PHASES
         if unknown:
             print(f"Unknown phase(s): {unknown}. Choose from {ALL_PHASES}", file=sys.stderr)
