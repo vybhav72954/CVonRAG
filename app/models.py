@@ -8,6 +8,7 @@ The Content/Style Firewall is enforced at the data layer:
 """
 
 from __future__ import annotations
+from datetime import date, datetime
 from enum import StrEnum
 from typing import Annotated, Any
 
@@ -200,3 +201,63 @@ class HealthResponse(BaseModel):
     groq_ok: bool = False              # Back-compat: True only when active provider is groq AND reachable
     ollama_ok: bool = False            # Ollama LLM model loaded (only relevant when using Ollama)
     embed_ok: bool = False             # Ollama embed model loaded (always required)
+
+
+# ── Invite-code admin ────────────────────────────────────────────────────────
+
+class InviteCreate(BaseModel):
+    """Admin payload for POST /admin/invites. The `code` IS the batchmate's
+    identity — pick something memorable (e.g. "AMAN-2K24") or random.
+
+    `pattern` restricts codes to a safe alphabet so trailing whitespace,
+    control chars, or HTML-injection payloads can't be stored as identities.
+    The lookup in require_invite is case-sensitive byte-for-byte; an unsafe
+    code (e.g. with a stray space) would silently 401 the user with no
+    obvious cause. Fail loud at creation instead (B1).
+    """
+    code: Annotated[
+        str,
+        Field(min_length=3, max_length=64, pattern=r"^[A-Za-z0-9_-]+$"),
+    ]
+    name: Annotated[str, Field(max_length=120)] = ""
+
+    @field_validator("code")
+    @classmethod
+    def _no_surrounding_whitespace(cls, v: str) -> str:
+        # Pydantic's `pattern` already rejects spaces inside the string,
+        # but this gives a clearer error than "string did not match pattern".
+        """
+        Ensure a code string does not have leading or trailing whitespace.
+        
+        Parameters:
+            v (str): The code value to validate.
+        
+        Returns:
+            str: The validated input string `v`.
+        
+        Raises:
+            ValueError: If `v` contains leading or trailing whitespace.
+        """
+        if v != v.strip():
+            raise ValueError("code must not contain leading or trailing whitespace")
+        return v
+
+
+class InviteUsage(BaseModel):
+    """One row from /admin/usage — full counter readout for an invite code."""
+    code: str
+    name: str
+    created_at: datetime
+    last_seen: datetime | None = None
+
+    parse_count: int
+    recommend_count: int
+    optimize_count: int
+
+    optimize_today: int
+    bullets_today: int
+    today_date: date | None = None
+
+
+class UsageResponse(BaseModel):
+    invites: list[InviteUsage]

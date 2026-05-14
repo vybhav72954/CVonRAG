@@ -120,14 +120,56 @@ class Settings(BaseSettings):
     rate_limit_optimize: int = 5      # max /optimize calls per IP per window
 
     # ── Admin auth ────────────────────────────────────────────────────────────
-    # Set INGEST_SECRET in .env to protect the /ingest endpoint.
+    # Set INGEST_SECRET in .env to protect the /ingest and /admin/* endpoints.
     # Leave blank to allow unauthenticated access (dev only).
     ingest_secret: str = ""
 
+    # ── Invite-code auth ──────────────────────────────────────────────────────
+    # Per-batchmate identity gate on /parse, /recommend, /optimize. Each
+    # batchmate gets a unique code (admin creates via POST /admin/invites).
+    # Code is sent in the X-Invite-Code request header. Per-code daily caps
+    # below stop a single batchmate from exhausting the hosted-LLM quota.
+    # Set INVITE_CODES_REQUIRED=false to disable (dev / tests).
+    invite_codes_required: bool = True
+    # Hard daily cap: after this many /optimize calls in one UTC day, the
+    # invite code returns 429 until 00:00 UTC. 20 is comfortable for normal
+    # iteration, low enough that an accidental refresh loop cannot drain a
+    # day's free-tier hosted-LLM quota.
+    # ge=1 catches a misconfig (MAX_DAILY_OPTIMIZATIONS=0 would make every
+    # /optimize call hit `0 < 0` → false → 429 immediately, surfacing as a
+    # mysterious runtime issue instead of a clear boot-time failure).
+    max_daily_optimizations: Annotated[int, Field(ge=1)] = 20
+    # Bullet-level cap (each /optimize may produce up to total_bullets_requested
+    # bullets, hard-capped to groq_max_bullets_per_request=15 per call).
+    # 60/day = 3 optimize × 20 bullets, or 20 optimize × 3 bullets — both
+    # reasonable for a batchmate iterating on a single resume.
+    max_daily_bullets: Annotated[int, Field(ge=1)] = 60
+    # SQLite path for the invite table. Default keeps the DB next to the app
+    # for local dev; deployments should mount this to a persistent volume.
+    sqlite_path: str = "./cvonrag.db"
+
+    def _is_production_env(self) -> bool:
+        """`app_env == "production"` after normalization.
+
+        Pydantic doesn't auto-trim/lowercase string env vars, so values like
+        `APP_ENV=Production` or `APP_ENV=" production"` would silently skip
+        both prod warnings below. Comparing a normalized copy makes the check
+        robust to common casing/whitespace mistakes in the .env file.
+        """
+        return (self.app_env or "").strip().lower() == "production"
+
     @model_validator(mode="after")
     def _warn_production_cors(self) -> "Settings":
+        """
+        Log a warning when running in production while CORS origins are still the development default.
+        
+        This validator emits a startup warning if `app_env` is "production" and `cors_origins` equals ["http://localhost:5173"], advising to set `CORS_ORIGINS` to the production frontend origin.
+        
+        Returns:
+            Settings: The same Settings instance.
+        """
         if (
-            self.app_env == "production"
+            self._is_production_env()
             and self.cors_origins == ["http://localhost:5173"]
         ):
             logging.getLogger("cvonrag").warning(
@@ -136,7 +178,31 @@ class Settings(BaseSettings):
             )
         return self
 
+    @model_validator(mode="after")
+    def _warn_production_ingest_secret(self) -> "Settings":
+        """
+        Warns if running in production without an ingest secret.
+        
+        If `app_env` is "production" and `ingest_secret` is empty, logs a warning that `/ingest` and `/admin/*` will be unauthenticated to prevent accidental exposure of the deployment. 
+        
+        Returns:
+            Settings: The same `Settings` instance (`self`).
+        """
+        if self._is_production_env() and not self.ingest_secret:
+            logging.getLogger("cvonrag").warning(
+                "INGEST_SECRET is empty in production — /ingest and /admin/* "
+                "are unauthenticated. Set a long random INGEST_SECRET in .env "
+                "before exposing the API to the internet."
+            )
+        return self
+
 
 @lru_cache()
 def get_settings() -> Settings:
+    """
+    Provide the application's Settings instance loaded from environment variables and the optional .env file.
+    
+    Returns:
+        settings (Settings): The Settings instance populated from environment and .env configuration.
+    """
     return Settings()

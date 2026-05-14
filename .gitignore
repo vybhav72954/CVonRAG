@@ -17,6 +17,12 @@ htmlcov/
 .env
 *.env
 
+# SQLite invite DB (per-batchmate identity + usage; never commit)
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
 # Node / Svelte
 frontend/node_modules/
 frontend/.svelte-kit/
@@ -41,3 +47,7 @@ docs/Batch10_Resume.zip
 docs/LLM_HOSTING.md
 .claude/*
 screenshots/*
+# All docs/ files are kept local by design (developer guide, audit history,
+# flow notes are personal reference, not part of the public repo). Specific
+# rules above are belt-and-braces; this blanket is the load-bearing one.
+docs/*
