@@ -665,10 +665,14 @@ async def create_invite(
         await session.commit()
     except IntegrityError:
         await session.rollback()
+        # `from None` suppresses exception chaining — the IntegrityError is
+        # intentional control flow (PRIMARY KEY collision = the 409 case we
+        # explicitly want), not an unexpected error worth showing as the
+        # __cause__ in logs or the response.
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail=f"Invite code '{body.code}' already exists.",
-        )
+        ) from None
     await session.refresh(invite)
     return InviteUsage.model_validate(invite, from_attributes=True)
 
