@@ -6,7 +6,14 @@ CVonRAG pipeline benchmark — produces resume-citable metrics across the
 five guarantees the architecture claims:
 
   1. Char accuracy        — % of bullets landing within ±tolerance of target
-  2. Fact preservation    — % of source numerics that survive into output
+  2. Numeric integrity    — % of OUTPUT numerics that match a source numeric
+                            verbatim (the architectural One Rule: never
+                            alter a user's numbers). Fabrications = output
+                            numerics with no source match; target is 0.
+                            Source coverage (% of source numerics that
+                            appear in output) is reported alongside as
+                            context only — low coverage is expected since
+                            the ~130-char budget forces selection.
   3. Retrieval quality    — Qdrant cosine-similarity stats on style exemplars
   4. Recommender hit-rate — % of cases where a labelled correct project is
                             in the top-2 recommended projects
@@ -218,6 +225,22 @@ def load_eval_set(path: Path) -> list[dict]:
                 f"{path}: case {cid} has invalid target_role_type "
                 f"{c['target_role_type']!r}; expected one of {sorted(valid_roles)}"
             )
+        # correct_projects entries drive Hit@2 via substring match. An empty
+        # string would match every recommended title (`"" in t` is True), so
+        # an accidental `["", "X"]` would silently report 100% hit-rate.
+        # Surface typo'd entries instead.
+        cp = c.get("correct_projects", [])
+        if not isinstance(cp, list):
+            raise ValueError(
+                f"{path}: case {cid} correct_projects must be a list, "
+                f"got {type(cp).__name__}"
+            )
+        for j, label in enumerate(cp):
+            if not isinstance(label, str) or not label.strip():
+                raise ValueError(
+                    f"{path}: case {cid} correct_projects[{j}] must be a "
+                    f"non-empty string (got {label!r})"
+                )
     return cases
 
 
@@ -341,26 +364,34 @@ async def run_one_case(
         orchestrator = CVonRAGOrchestrator()
         bullets: list[GeneratedBullet] = []
         t0 = time.perf_counter()
+        partial_run = False
         try:
             async for event_type, payload in orchestrator.run(req):
                 if event_type == "bullet" and isinstance(payload, GeneratedBullet):
                     bullets.append(payload)
         except HostedLLMQuotaExhausted as exc:
+            # Quota-exhausted is the one error mode where partial output is
+            # still useful — every bullet the orchestrator already emitted
+            # is a real, validated generation. Record them in char/facts but
+            # leave latency_s unset so the partial run doesn't pollute P50/P95
+            # in the aggregate (it'd be artificially low — we stopped early).
             result.error = f"quota_exhausted: {exc}"
-            return result
+            partial_run = True
         except Exception as exc:
             logger.warning("orchestrator failed for %s: %s", cid, exc)
             result.error = f"optimize_failed: {exc}"
             return result
-        result.latency_s = time.perf_counter() - t0
         result.bullets_generated = len(bullets)
-        # Per-bullet amortised cost — includes JD analysis + scoring +
-        # retrieval setup spread across the bullets generated. This is the
-        # apples-to-apples number to cite for "how long to produce one
-        # bullet"; raw latency_s is reported alongside as case-level context.
-        result.latency_per_bullet_s = (
-            result.latency_s / len(bullets) if bullets else None
-        )
+        if not partial_run:
+            result.latency_s = time.perf_counter() - t0
+            # Per-bullet amortised cost — includes JD analysis + scoring +
+            # retrieval setup spread across the bullets generated. This is
+            # the apples-to-apples number to cite for "how long to produce
+            # one bullet"; raw latency_s is reported alongside as case-level
+            # context.
+            result.latency_per_bullet_s = (
+                result.latency_s / len(bullets) if bullets else None
+            )
 
         # Phase 1: char accuracy per bullet
         if "char" in phases:
