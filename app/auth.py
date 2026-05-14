@@ -75,14 +75,19 @@ def require_invite(endpoint: EndpointName):
         if not settings.invite_codes_required:
             return None
 
-        if not x_invite_code:
+        # Strip whitespace defensively (B1) — `InviteCreate.code` rejects
+        # whitespace at creation time, so a stored code never contains it.
+        # Stripping the header value here means a stray leading/trailing
+        # space from copy-paste doesn't silently 401 the user.
+        code = (x_invite_code or "").strip()
+        if not code:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Missing X-Invite-Code header.",
             )
 
         invite = await session.scalar(
-            select(Invite).where(Invite.code == x_invite_code)
+            select(Invite).where(Invite.code == code)
         )
         if invite is None:
             raise HTTPException(
