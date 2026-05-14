@@ -95,6 +95,11 @@ def _engine_url() -> URL | str:
     path = settings.sqlite_path
     if path == ":memory:":
         return "sqlite+aiosqlite:///:memory:"
+    # Expand `~` the same way init_db() does for its mkdir step. Without
+    # this, `SQLITE_PATH=~/cvonrag.db` would mkdir at $HOME/ (correct) but
+    # the engine would try to open a literal `~/cvonrag.db` file because
+    # SQLite itself doesn't expand the tilde.
+    path = str(Path(path).expanduser())
     return URL.create(drivername="sqlite+aiosqlite", database=path)
 
 

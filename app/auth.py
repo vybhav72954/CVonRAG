@@ -240,10 +240,15 @@ async def check_and_reserve_bullets(
         return
 
     code = invite.code
-    today = datetime.now(timezone.utc).date()
 
-    # Idempotent daily reset — same pattern as the dep.
-    await _lazy_reset_daily(session, code, today)
+    # No second `_lazy_reset_daily` here. The require_invite("optimize") dep
+    # ran moments ago and already reset today_date for THIS request's UTC
+    # day. Recomputing today + resetting here would race against a UTC
+    # rollover that happens mid-request: dep at 23:59:59 increments
+    # optimize_today against day N, then this reset at 00:00:00.001 would
+    # see today=N+1 and zero everything — including the increment we just
+    # made. Trusting the dep keeps both the increment and the reservation
+    # on the same day.
 
     # Atomic reservation: only commits if bullets_today + requested fits.
     stmt = (

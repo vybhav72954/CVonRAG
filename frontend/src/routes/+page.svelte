@@ -37,9 +37,23 @@
     abortInFlight('parse');
     abortInFlight('recommend');
     abortInFlight('optimize');
+    // Reset the transient status flags. abortInFlight cancels the fetch
+    // silently, so no onDone/onError fires and stores like genStatus stay
+    // stuck at "streaming". Without this the UI would still show
+    // "Generating…" or a stale error banner after the user enters a new code.
+    // Persisted state (parsedProjects, bullets, jdText, …) deliberately
+    // survives — if the user re-enters a valid code they can keep working.
+    parseStatus.set('idle');
+    parseProgress.set('');
+    parseError.set('');
+    parseWarnings.set([]);
+    recommendStatus.set('idle');
+    recommendError.set('');
+    genStatus.set('idle');
+    tokenBuffer.set('');
+    genError.set('');
     // Wipe the code and bounce the user back to step 1 — the gate will then
-    // show the entry card again. Don't touch parsed state; if they enter a
-    // valid code they can keep working.
+    // show the entry card again.
     inviteCode.set('');
     step.set(1);
   }
