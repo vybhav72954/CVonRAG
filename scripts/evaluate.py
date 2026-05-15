@@ -659,9 +659,15 @@ def aggregate(results: list[CaseResult], phases: set[str]) -> dict[str, Any]:
             }
 
     if "latency" in phases:
+        # Bullet-weighted: a case that produced 4 bullets contributes 4 samples,
+        # a 1-bullet case contributes 1. Without this, per-bullet percentiles
+        # treat each CASE equally regardless of bullet count, so a single
+        # 1-bullet outlier skews p95 the same as a 4-bullet outlier.
         per_bullet = sorted(
-            r.latency_per_bullet_s for r in results
+            latency
+            for r in results
             if r.latency_per_bullet_s is not None
+            for latency in (r.latency_per_bullet_s,) * r.bullets_generated
         )
         per_case = sorted(r.latency_s for r in results if r.latency_s is not None)
         # Emit the section whenever either dimension has data, so a run that
@@ -943,15 +949,19 @@ async def main_async(args: argparse.Namespace) -> int:
         backends = [args.backend]
 
     # ── Sanity-check Qdrant before burning LLM time ──────────────────────────
+    # Phase 3 (retrieval) hits Qdrant directly. The orchestrator-driven phases
+    # (char/facts/latency) also hit Qdrant inside their own Phase 3 to fetch
+    # style exemplars, so Qdrant being down would fail them mid-run too.
+    # Recommender is pure LLM scoring and does not touch Qdrant.
     vector_count = 0
-    if "retrieval" in phases:
+    if phases & {"retrieval", "char", "facts", "latency"}:
         try:
             info = await collection_info()
             vector_count = info.get("vector_count", 0)
         except Exception as exc:
-            logger.warning("collection_info() failed — Qdrant unreachable (%s); retrieval scores will be unavailable.", exc)
+            logger.warning("collection_info() failed — Qdrant unreachable (%s); retrieval scores and style exemplars will be unavailable.", exc)
         if vector_count == 0:
-            print("WARN: Qdrant collection is empty — retrieval scores will be empty.", file=sys.stderr)
+            print("WARN: Qdrant collection is empty — retrieval scores and style exemplars will be unavailable.", file=sys.stderr)
 
     # ── Detect data leakage ──────────────────────────────────────────────────
     leakage = any("docs/good_cvs/" in c["cv_path"].replace("\\", "/") for c in cases)
