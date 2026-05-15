@@ -171,8 +171,21 @@ class TestPgdbaPath:
     def test_is_pgdba_template_false_without_markers(self):
         chars = [_char("B", 130, 90), _char("u", 138, 90)]
         assert _is_pgdba_template(chars) is False
-        # And the marker set itself contains exactly what we expect.
-        assert _BULLET_MARKER_CHARS == {"", "§"}
+        # And the marker set itself contains exactly what we expect:
+        #   (Wingdings, private-use), § (section sign),
+        # ▪ U+25AA (added in issue #24 to recognise Word-exported
+        # PGDBA templates that use the standard Unicode bullet rather
+        # than the private-use Wingdings glyph).
+        assert _BULLET_MARKER_CHARS == {"", "§", "▪"}
+
+    def test_is_pgdba_template_detects_unicode_black_square(self):
+        # U+25AA is the standard Unicode "Black Small Square" used by
+        # some Word-exported PGDBA templates (e.g. 24BM6JP47). Prior to
+        # issue #24 the template sniff missed these CVs and they fell
+        # through to the regex fallback which collapsed every project
+        # into "CV Bullets".
+        chars = [_char("▪", 110, 90), _char("B", 130, 90)]
+        assert _is_pgdba_template(chars) is True
 
     def test_clean_bullet_text_strips_mid_line_marker_split(self):
         # Real-world artifact: "LMs] ▪ Enhanced..." — keep the longest segment.
@@ -247,6 +260,163 @@ class TestPgdbaPath:
         assert "SARIMA" in projects[0].bullets[0]
         # The post-stop-header bullet must NOT have leaked in.
         assert all("Worked" not in b for b in projects[0].bullets)
+
+    def test_pgdba_parallel_title_layout(self):
+        """Issue #24 — titles wrap parallel to bullets, not above them.
+
+        Real PGDBA CVs use a layout where the project title spans 2–3 rows in
+        the left column *at the same Y-coordinates as the bullets* in the
+        right column. The old `left_words and not right_words` rule (which
+        only fired on stray title-only rows) collapsed every project into the
+        "CV Bullets" fallback. The Y-gap clustering replacement must detect
+        the within-vs-between project boundary from line spacing alone.
+        """
+        # Two projects, each with 3 parallel rows (title fragment + bullet).
+        # Within-project gap = 12pt, between-project gap = 16pt. Marker at
+        # x0=110, threshold ≈ 107pt.
+        words = [
+            _word("ACADEMIC",  20,  50), _word("PROJECTS", 90, 50),
+            # Project 1, row 1
+            _word("Airbnb",    20,  70), _word("Price",     50, 70),
+            _word("Predicted", 130, 70), _word("listing",  200, 70),
+            _word("prices",    260, 70), _word("for",      310, 70),
+            _word("74k+",      340, 70), _word("Airbnb",   380, 70),
+            _word("properties",430, 70),
+            # Project 1, row 2 (gap 12pt)
+            _word("Prediction", 20, 82), _word("Tackled",  130, 82),
+            _word("outliers",  180, 82), _word("via",      230, 82),
+            _word("VIF",       260, 82), _word("backward", 290, 82),
+            _word("selection", 350, 82),
+            # Project 1, row 3 (gap 12pt)
+            _word("(Regression)",20,94),_word("Built",     130, 94),
+            _word("XGBoost",   170, 94),_word("regressor", 230, 94),
+            _word("achieving", 300, 94),_word("R2=0.76",   370, 94),
+            # Project 2, row 1 (gap 16pt → boundary)
+            _word("Natural",   20, 110), _word("Gas",       60, 110),
+            _word("Forecasted",130,110), _word("monthly",  200, 110),
+            _word("gas",       260,110), _word("consumption",290,110),
+            _word("over",      380,110), _word("50",       420, 110),
+            _word("years",     440,110),
+            # Project 2, row 2 (gap 12pt)
+            _word("Consumption",20,122), _word("ADF",      130, 122),
+            _word("test",      170,122), _word("for",      210, 122),
+            _word("stationarity",240,122),_word("then",    320, 122),
+            _word("differenced",360,122),
+            # Project 2, row 3 (gap 12pt)
+            _word("(Time",     20,134), _word("Series)",   60, 134),
+            _word("SARIMA",   130,134), _word("MAPE",     180, 134),
+            _word("3.5%",     220,134), _word("Ljung-Box",260, 134),
+            _word("residual", 330,134),
+        ]
+        # Markers at every bullet row to anchor the column threshold.
+        chars = [_char("", 110, y) for y in (70, 82, 94, 110, 122, 134)]
+        pdf   = _open_pdf_with_pages([_make_pgdba_page(words, chars)])
+
+        with patch("pdfplumber.open", return_value=pdf):
+            projects = parse_pdf_bytes(b"fake")
+
+        assert len(projects) == 2
+        # Title is the concatenation of all left-column words in the cluster.
+        assert projects[0].title == "Airbnb Price Prediction (Regression)"
+        assert projects[1].title == "Natural Gas Consumption (Time Series)"
+        # Bullets stay attached to their correct project.
+        assert any("XGBoost" in b for b in projects[0].bullets)
+        assert any("SARIMA" in b for b in projects[1].bullets)
+        # No cross-contamination: SARIMA isn't in the Airbnb project, etc.
+        assert all("SARIMA" not in b for b in projects[0].bullets)
+        assert all("XGBoost" not in b for b in projects[1].bullets)
+
+    def test_pgdba_per_section_clustering(self):
+        """Issue #24 — each project section clusters against its own gap
+        distribution. A single global threshold can miss within-vs-between
+        boundaries in one section because of noise in another. Each section
+        gets 2 projects × 3 rows so per-section Y-gap detection has enough
+        signal to recover the within-vs-between split (12pt vs 16pt).
+        """
+        # Within-project rows step by 12pt; project boundary jumps by 16pt;
+        # section transition jumps by 30pt.
+        # Bullet text must exceed 30 chars to pass the length filter, so each
+        # bullet row carries enough words to comfortably clear it.
+        words = [
+            _word("ACADEMIC", 20, 50), _word("PROJECTS", 90, 50),
+            # ── ACADEMIC: Project A (3 parallel rows)
+            _word("Project",   20,  70), _word("A1",        50,  70),
+            _word("Built",    130,  70), _word("baseline", 180,  70),
+            _word("OLS",      260,  70), _word("regression",300, 70),
+            _word("model",    380,  70), _word("Adj-R2=0.78",430, 70),
+            _word("Title",     20,  82), _word("two",       50,  82),
+            _word("Handled",  130,  82), _word("VIF",      200,  82),
+            _word("outliers", 240,  82), _word("Jackknife",310, 82),
+            _word("influential",380, 82),_word("rows",     450,  82),
+            _word("(A)",       20,  94),
+            _word("Achieved", 130,  94), _word("test",     200,  94),
+            _word("R2=0.85",  250,  94),_word("with",     320,  94),
+            _word("ElasticNet",360, 94),_word("model",    430,  94),
+            # ── Project B (gap 16pt to row at y=110)
+            _word("Project",   20, 110), _word("B1",        50, 110),
+            _word("Forecasted",130, 110),_word("hourly",   210, 110),
+            _word("energy",   260, 110), _word("demand",   310, 110),
+            _word("over",     360, 110), _word("18",       400, 110),
+            _word("months",   420, 110),
+            _word("Title",     20, 122), _word("two",       50, 122),
+            _word("Stationarity",130,122),_word("via",     220, 122),
+            _word("ADF",      260, 122), _word("then",     300, 122),
+            _word("differenced",340,122),_word("series",   420, 122),
+            _word("(B)",       20, 134),
+            _word("Final",    130, 134),_word("SARIMA",   170, 134),
+            _word("MAPE",     230, 134),_word("3.5%",     280, 134),
+            _word("Ljung-Box",320, 134),_word("residual", 390, 134),
+            _word("clean",    450, 134),
+            # ── ADDITIONAL header (section transition gap ~26pt)
+            _word("ADDITIONAL",20, 160),_word("PROJECTS",  90, 160),
+            # ── Project C (3 rows in ADDITIONAL)
+            _word("Project",   20, 180), _word("C1",        50, 180),
+            _word("Built",    130, 180), _word("RAG",      180, 180),
+            _word("retrieval",220, 180), _word("with",     290, 180),
+            _word("FAISS",    330, 180), _word("vector",   380, 180),
+            _word("index",    430, 180),
+            _word("Title",     20, 192), _word("two",       50, 192),
+            _word("Chunked",  130, 192), _word("docs",     200, 192),
+            _word("via",      250, 192), _word("LangChain",290, 192),
+            _word("recursive",360, 192),_word("splitter",  430, 192),
+            _word("(C)",       20, 204),
+            _word("Retrieved",130, 204), _word("top-k",    210, 204),
+            _word("results",  260, 204), _word("with",     310, 204),
+            _word("cosine",   350, 204), _word("scores",   400, 204),
+            # ── Project D (gap 16pt to y=220)
+            _word("Project",   20, 220), _word("D1",        50, 220),
+            _word("Clustered",130, 220), _word("users",    210, 220),
+            _word("with",     270, 220), _word("DBSCAN",   320, 220),
+            _word("on",       380, 220), _word("RFM",      410, 220),
+            _word("features", 440, 220),
+            _word("Title",     20, 232), _word("two",       50, 232),
+            _word("Customer", 130, 232), _word("segments", 200, 232),
+            _word("derived",  280, 232), _word("via",      340, 232),
+            _word("PCA",      380, 232), _word("reduction",410, 232),
+            _word("(D)",       20, 244),
+            _word("Silhouette",130, 244),_word("score",    220, 244),
+            _word("0.62",     270, 244), _word("on",       310, 244),
+            _word("held-out", 340, 244),_word("data",     410, 244),
+        ]
+        chars = [_char("", 110, y) for y in
+                 (70, 82, 94, 110, 122, 134, 180, 192, 204, 220, 232, 244)]
+        pdf   = _open_pdf_with_pages([_make_pgdba_page(words, chars)])
+
+        with patch("pdfplumber.open", return_value=pdf):
+            projects = parse_pdf_bytes(b"fake")
+
+        # Two projects per section, in document order.
+        assert len(projects) == 4
+        # Titles are the concatenated left-column words of each cluster.
+        assert projects[0].title == "Project A1 Title two (A)"
+        assert projects[1].title == "Project B1 Title two (B)"
+        assert projects[2].title == "Project C1 Title two (C)"
+        assert projects[3].title == "Project D1 Title two (D)"
+        # Bullets stay attached to their correct project; no cross-section leak.
+        assert any("OLS"    in b for b in projects[0].bullets)
+        assert any("SARIMA" in b for b in projects[1].bullets)
+        assert any("FAISS"  in b for b in projects[2].bullets)
+        assert any("DBSCAN" in b for b in projects[3].bullets)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
