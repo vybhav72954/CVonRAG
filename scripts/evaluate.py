@@ -1,0 +1,1038 @@
+#!/usr/bin/env python3
+"""
+scripts/evaluate.py
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+CVonRAG pipeline benchmark — produces resume-citable metrics across the
+five guarantees the architecture claims:
+
+  1. Char accuracy        — % of bullets landing within ±tolerance of target
+  2. Numeric integrity    — % of OUTPUT numerics that match a source numeric
+                            verbatim (the architectural One Rule: never
+                            alter a user's numbers). Fabrications = output
+                            numerics with no source match; target is 0.
+                            Source coverage (% of source numerics that
+                            appear in output) is reported alongside as
+                            context only — low coverage is expected since
+                            the ~130-char budget forces selection.
+  3. Retrieval quality    — Qdrant cosine-similarity stats on style exemplars
+  4. Recommender hit-rate — % of cases where a labelled correct project is
+                            in the top-2 recommended projects
+  5. Latency              — P50 / P95 per-bullet for the optimiser pipeline
+                            only — orchestrator.run() = JD analysis +
+                            scoring + retrieval + bullet generation. The
+                            one-time PDF parse + LLM fact extraction is
+                            NOT included; those amortise across many JDs
+                            for the same CV and aren't comparable to the
+                            per-bullet generation cost the resume claim
+                            refers to. Per-case context shown alongside.
+
+Input:   tests/eval_set.json  (list of CV+JD cases with labelled correct_projects)
+Output:  stdout report + docs/EVAL_REPORT.md + eval_results.json (raw per-case data)
+
+Usage:
+  # Run all five phases on Groq + Ollama, all cases in tests/eval_set.json:
+  python scripts/evaluate.py
+
+  # Subset / smoke run:
+  python scripts/evaluate.py --backend groq --limit 3 --phase char,latency
+
+  # Different eval set:
+  python scripts/evaluate.py --eval-set tests/eval_set_v2.json
+
+Requires:  the same services /optimize needs — Ollama for embeddings, Qdrant
+           seeded with the gold_standard_cvs collection, and either a Groq /
+           OpenRouter key in .env (for --backend groq) or `ollama serve`
+           running with the model in OLLAMA_LLM_MODEL (for --backend ollama).
+
+The script imports app/ directly — no FastAPI process needed.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import contextlib
+import json
+import logging
+import math
+import re
+import statistics
+import sys
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+from dotenv import load_dotenv
+
+# Load .env from project root so GROQ_API_KEY / OPENROUTER_API_KEY pick up
+# before app.config.get_settings() caches them.
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+load_dotenv(_PROJECT_ROOT / ".env")
+
+# Make `app` importable when run as `python scripts/evaluate.py`.
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
+
+from app.chains import CVonRAGOrchestrator, HostedLLMQuotaExhausted, _hosted_llm_config
+from app.config import get_settings
+from app.models import (
+    FormattingConstraints,
+    GeneratedBullet,
+    OptimizationRequest,
+    ProjectData,
+    RoleType,
+)
+from app.parser import extract_facts, parse_document_bytes
+from app.recommender import recommend_projects
+from app.vector_store import collection_info, retrieve_style_exemplars
+
+logging.basicConfig(
+    level=logging.WARNING,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+logger   = logging.getLogger("cvonrag.evaluate")
+settings = get_settings()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Numeric extraction — Phase 2 (fact preservation)
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Matches: 0.250, 92.3%, 14B, 1.2M, 87, 0.944, 10k, 25b, 3x
+# Allows internal `.` or `,` and an optional magnitude/percent suffix.
+# Lowercase b/m/k included alongside uppercase B/M/K so that "10k users" or
+# "25b rows" survive the integrity check. Trailing word-boundary lookahead
+# keeps "10kg" from matching (the `g` would be a word char, blocking the
+# match) so we don't pick up arbitrary suffixed identifiers.
+_NUMERIC_RE = re.compile(r"(?<!\w)\d+(?:[.,]\d+)*[%BMKbmkx]?(?!\w)")
+
+
+def extract_numerics(text: str) -> list[str]:
+    """Return numeric tokens preserved verbatim — order kept for debugging."""
+    if not text:
+        return []
+    return _NUMERIC_RE.findall(text)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Result containers
+# ─────────────────────────────────────────────────────────────────────────────
+
+@dataclass
+class CaseResult:
+    case_id: str
+    backend: str
+    # Phase 1
+    bullets: list[dict] = field(default_factory=list)
+    # Phase 2 (one entry per bullet generated for this case)
+    fact_preservation: list[dict] = field(default_factory=list)
+    # Phase 3
+    retrieval_scores: list[float] = field(default_factory=list)
+    # Phase 4
+    recommended_titles: list[str] = field(default_factory=list)
+    correct_titles: list[str] = field(default_factory=list)
+    hit_at_2: bool | None = None
+    # Phase 5 — both are recorded so the report can show per-bullet (headline)
+    # AND per-case (context). Per-case includes one-time JD analysis + scoring
+    # + retrieval setup amortised across the case's bullets; per-bullet divides
+    # that total by the bullet count, giving the comparable "what does it cost
+    # to produce one optimised bullet" number.
+    latency_s: float | None = None              # whole orchestrator run (per case)
+    latency_per_bullet_s: float | None = None   # latency_s / len(bullets)
+    bullets_generated: int = 0
+    # Error capture
+    error: str | None = None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Backend switching — toggle settings live so a single process can run
+# multiple backends sequentially without subprocess spawning.
+# ─────────────────────────────────────────────────────────────────────────────
+
+@contextlib.contextmanager
+def with_backend(backend: str):
+    """Mutate settings to force the desired LLM backend, restore on exit.
+
+    backend == "groq" / "openrouter": leave hosted-LLM settings as configured
+        in .env. The script aborts in main() if neither key is present.
+    backend == "ollama": blank both hosted keys so _hosted_llm_config() returns
+        None, forcing every LLM call through the local Ollama path. The model
+        used is settings.ollama_llm_model.
+    """
+    saved = {
+        "llm_provider":       settings.llm_provider,
+        "groq_api_key":       settings.groq_api_key,
+        "openrouter_api_key": settings.openrouter_api_key,
+    }
+    try:
+        if backend == "ollama":
+            settings.groq_api_key       = ""
+            settings.openrouter_api_key = ""
+        elif backend in ("groq", "openrouter"):
+            settings.llm_provider = backend  # type: ignore[assignment]
+        else:
+            raise ValueError(f"Unknown backend: {backend!r}")
+        yield
+    finally:
+        for k, v in saved.items():
+            setattr(settings, k, v)
+
+
+def active_model_label() -> str:
+    """Human-friendly label for the report header — provider + model."""
+    cfg = _hosted_llm_config()
+    if cfg is not None:
+        _, _, model = cfg
+        return f"{settings.llm_provider}:{model}"
+    return f"ollama:{settings.ollama_llm_model}"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Eval-set loading
+# ─────────────────────────────────────────────────────────────────────────────
+
+def load_eval_set(path: Path) -> list[dict]:
+    """Load tests/eval_set.json, strip the comment header, and validate.
+
+    The stub file ships with a {"_comment": "..."} header — drop it so callers
+    can treat the file as a uniform list[case].
+
+    Three validations beyond schema-presence:
+      • target_role_type must be a valid RoleType (otherwise the orchestrator
+        crashes mid-run at RoleType(case["target_role_type"]) with a less
+        helpful traceback)
+      • case_id must be unique (the run-cache is keyed on
+        f"{case_id}::{backend}", so collisions silently reuse parsed projects
+        from a different case)
+      • case_id must be non-empty (cache-key correctness)
+    """
+    # Convert JSONDecodeError to ValueError-with-context so all eval-set
+    # load failures (parse errors AND validation errors below) surface
+    # through the single ValueError catch in main_async, instead of a raw
+    # JSONDecodeError traceback for malformed JSON only.
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"{path}: invalid JSON ({exc})") from exc
+    if not isinstance(raw, list):
+        raise ValueError(f"{path}: expected a JSON list of cases, got {type(raw).__name__}")
+    # Drop only pure header-comment objects ({"_comment": "..."}) — a real
+    # case that happens to carry a "_comment" annotation alongside its data
+    # should be kept, not silently filtered out.
+    cases = [
+        c for c in raw
+        if not (isinstance(c, dict) and set(c.keys()) == {"_comment"})
+    ]
+
+    valid_roles    = {r.value for r in RoleType}
+    seen_case_ids: set[str] = set()
+    for idx, c in enumerate(cases):
+        # Confirm the case object is a dict before any .get() — a raw list
+        # like ["oops", ...] would otherwise crash with AttributeError on
+        # the .get() below with a confusing traceback.
+        if not isinstance(c, dict):
+            raise ValueError(
+                f"{path}: case at index {idx} is not an object "
+                f"(got {type(c).__name__})"
+            )
+        for required in ("case_id", "cv_path", "jd_text", "target_role_type"):
+            if required not in c:
+                raise ValueError(f"{path}: case {c.get('case_id', '<?>')} missing field {required!r}")
+
+        # Type-check the required fields. Numeric / null values for these
+        # would crash downstream (Path joining for cv_path, .split() for
+        # jd_text, RoleType(...) for target_role_type) with less helpful
+        # tracebacks. Catch them here.
+        case_id_raw = c["case_id"]
+        if not isinstance(case_id_raw, str):
+            raise ValueError(
+                f"{path}: case at index {idx} case_id must be a string "
+                f"(got {type(case_id_raw).__name__})"
+            )
+        cid = case_id_raw.strip()
+        if not cid:
+            raise ValueError(f"{path}: case at index {idx} has empty case_id")
+        if cid in seen_case_ids:
+            raise ValueError(f"{path}: duplicate case_id {cid!r}")
+        seen_case_ids.add(cid)
+
+        for field_name in ("cv_path", "jd_text"):
+            value = c[field_name]
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(
+                    f"{path}: case {cid} {field_name} must be a non-empty "
+                    f"string (got {type(value).__name__})"
+                )
+
+        # cv_path must resolve to a location inside the repo. Absolute
+        # paths (e.g. "C:\Users\..." on Windows) and "../" traversal would
+        # otherwise let an eval set read arbitrary local files when run by
+        # someone other than the author — and the join semantics for
+        # absolute paths are surprising (Path("Z:/repo") / "C:/x" yields
+        # "C:/x", silently dropping the repo prefix).
+        cv_resolved = (_PROJECT_ROOT / c["cv_path"]).resolve()
+        try:
+            cv_resolved.relative_to(_PROJECT_ROOT.resolve())
+        except ValueError:
+            raise ValueError(
+                f"{path}: case {cid} cv_path must resolve inside repo root "
+                f"({_PROJECT_ROOT}); got {c['cv_path']!r}"
+            ) from None
+
+        rt = c["target_role_type"]
+        if not isinstance(rt, str):
+            raise ValueError(
+                f"{path}: case {cid} target_role_type must be a string "
+                f"(got {type(rt).__name__})"
+            )
+        if rt not in valid_roles:
+            raise ValueError(
+                f"{path}: case {cid} has invalid target_role_type "
+                f"{rt!r}; expected one of {sorted(valid_roles)}"
+            )
+
+        # correct_projects entries drive Hit@2 via substring match. An empty
+        # string would match every recommended title (`"" in t` is True), so
+        # an accidental `["", "X"]` would silently report 100% hit-rate.
+        # Surface typo'd entries instead.
+        cp = c.get("correct_projects", [])
+        if not isinstance(cp, list):
+            raise ValueError(
+                f"{path}: case {cid} correct_projects must be a list, "
+                f"got {type(cp).__name__}"
+            )
+        for j, label in enumerate(cp):
+            if not isinstance(label, str) or not label.strip():
+                raise ValueError(
+                    f"{path}: case {cid} correct_projects[{j}] must be a "
+                    f"non-empty string (got {label!r})"
+                )
+    return cases
+
+
+async def parse_cv_to_projects(cv_path: Path) -> list[ProjectData]:
+    """Run the full parser pipeline (extract bullets → LLM facts) on one CV."""
+    file_bytes = cv_path.read_bytes()
+    raw_projects = parse_document_bytes(file_bytes, cv_path.name)
+    if not raw_projects:
+        raise RuntimeError(f"Parser produced no projects from {cv_path.name}")
+
+    out: list[ProjectData] = []
+    for i, rp in enumerate(raw_projects):
+        # extract_facts has its own internal fallback for non-quota
+        # failures, but wrap it defensively so a future refactor that
+        # changes its error contract can't silently fail the whole case.
+        # Quota exhaustion is process-global and must propagate (the
+        # breaker is latched and every subsequent call would also fail).
+        try:
+            facts = await extract_facts(rp)
+        except HostedLLMQuotaExhausted:
+            raise
+        except Exception as exc:
+            logger.warning("extract_facts failed for '%s' in %s: %s",
+                           rp.title, cv_path.name, exc)
+            continue
+        if not facts:
+            continue
+        # project_id is internal to one orchestrator run (used as a dict
+        # key in CVonRAGOrchestrator's project_fact_map). The enumerate
+        # index makes it unique within a request, and the cache is keyed
+        # on cv_path::backend, so we don't need the stable slug-with-SHA1
+        # form parser.parse_and_stream uses. Pure indexed id keeps this
+        # script free of any dependency on app.parser internals.
+        try:
+            out.append(ProjectData(
+                project_id=f"p-{i:03d}",
+                title=rp.title,
+                core_facts=facts,
+            ))
+        except Exception as exc:
+            logger.warning("Skipping '%s' in %s: %s", rp.title, cv_path.name, exc)
+            continue
+    if not out:
+        raise RuntimeError(f"No valid projects after fact-extraction for {cv_path.name}")
+    return out
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Per-case runner
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def run_one_case(
+    case: dict,
+    phases: set[str],
+    backend: str,
+    char_target: int,
+    fact_lookup_cache: dict[str, list[ProjectData]],
+) -> CaseResult:
+    """Execute the requested phases for one case under the active backend."""
+    cid = case["case_id"]
+    result = CaseResult(case_id=cid, backend=backend, correct_titles=case.get("correct_projects", []))
+
+    # Parse is only needed by phases that consume the parsed CoreFacts.
+    # Retrieval queries Qdrant with the JD text alone, so a retrieval-only
+    # run shouldn't fail when the CV is missing / unparseable / outside
+    # the scope of this case's actual concern.
+    needs_parse = bool(phases & {"char", "facts", "latency", "recommender"})
+
+    projects: list[ProjectData] = []
+    fact_by_id: dict[str, Any] = {}
+    if needs_parse:
+        cv_path = (_PROJECT_ROOT / case["cv_path"]).resolve()
+        if not cv_path.exists():
+            result.error = f"CV not found: {cv_path}"
+            return result
+
+        # ── Parse CV (shared across phases for the same case+backend) ──
+        # Cache by resolved cv_path so two cases referencing the same CV
+        # (e.g. same resume against different JDs) parse once, not twice.
+        # The previous case_id-based key forced re-parsing every time.
+        cache_key = f"{cv_path}::{backend}"
+        if cache_key in fact_lookup_cache:
+            projects = fact_lookup_cache[cache_key]
+        else:
+            try:
+                projects = await parse_cv_to_projects(cv_path)
+            except HostedLLMQuotaExhausted as exc:
+                result.error = f"quota_exhausted: {exc}"
+                return result
+            except Exception as exc:
+                result.error = f"parse_failed: {exc}"
+                return result
+            fact_lookup_cache[cache_key] = projects
+
+        fact_by_id = {f.fact_id: f for p in projects for f in p.core_facts}
+
+    # ── Phase 3: Retrieval quality (cheap — one embedding call) ──────────────
+    if "retrieval" in phases:
+        try:
+            exemplars = await retrieve_style_exemplars(
+                query_text=case["jd_text"], top_k=settings.retrieval_top_k,
+            )
+            result.retrieval_scores = [e.similarity_score for e in exemplars]
+        except Exception as exc:
+            logger.warning("retrieval failed for %s: %s", cid, exc)
+
+    # ── Phase 4: Recommender hit-rate ────────────────────────────────────────
+    if "recommender" in phases:
+        try:
+            recs = await recommend_projects(projects, case["jd_text"], top_k=3)
+            top2 = [r.title for r in recs[:2]]
+            result.recommended_titles = top2
+            correct = case.get("correct_projects", [])
+            if correct:
+                # Case-insensitive substring match — labelling stays tolerant of
+                # how the LLM names the same project across parses.
+                norm_correct = [c.lower() for c in correct]
+                hit = any(
+                    any(nc in t.lower() or t.lower() in nc for nc in norm_correct)
+                    for t in top2
+                )
+                result.hit_at_2 = hit
+        except HostedLLMQuotaExhausted as exc:
+            result.error = f"quota_exhausted: {exc}"
+            return result
+        except Exception as exc:
+            logger.warning("recommender failed for %s: %s", cid, exc)
+
+    # ── Phases 1, 2, 5: drive the orchestrator end-to-end ────────────────────
+    needs_optimize = phases & {"char", "facts", "latency"}
+    if needs_optimize:
+        # Per-case `target_char_limit` overrides the CLI default — lets the
+        # eval set carry mixed targets (e.g. 110-char bullets for one role,
+        # 140 for another) so Phase 1 always measures against the correct
+        # target instead of the global flag.
+        #
+        # Wrap the int casts + OptimizationRequest construction together: a
+        # null/non-numeric value in target_char_limit or max_bullets crashes
+        # the int(...) call, and out-of-range values crash Pydantic
+        # validation. Either would bubble up through run_backend without
+        # being caught, skipping _persist_results and losing every case's
+        # results in this backend run. Mark just this case failed instead.
+        try:
+            case_char_target = int(case.get("target_char_limit", char_target))
+            case_max_bullets = int(case.get("max_bullets", 4))
+            req = OptimizationRequest(
+                job_description=case["jd_text"],
+                projects=projects[:3],  # top 3 projects max per case
+                constraints=FormattingConstraints(
+                    target_char_limit=case_char_target,
+                    tolerance=settings.char_tolerance,
+                    max_bullets_per_project=2,
+                ),
+                target_role_type=RoleType(case.get("target_role_type", "general")),
+                total_bullets_requested=case_max_bullets,
+            )
+        except (TypeError, ValueError) as exc:
+            result.error = f"invalid_case_field: {exc}"
+            return result
+
+        orchestrator = CVonRAGOrchestrator()
+        bullets: list[GeneratedBullet] = []
+        # Stopwatch deliberately starts AFTER parse_cv_to_projects() above.
+        # `latency_s` measures the optimiser pipeline (orchestrator.run) so
+        # that `latency_per_bullet_s = latency_s / len(bullets)` remains a
+        # comparable per-bullet generation cost. Including the one-time PDF
+        # parse + LLM fact-extraction would mix a per-CV cost into a
+        # per-bullet metric. See module docstring (Phase 5) for the
+        # rationale and contract.
+        t0 = time.perf_counter()
+        partial_run = False
+        try:
+            async for event_type, payload in orchestrator.run(req):
+                if event_type == "bullet" and isinstance(payload, GeneratedBullet):
+                    bullets.append(payload)
+        except HostedLLMQuotaExhausted as exc:
+            # Quota-exhausted is the one error mode where partial output is
+            # still useful — every bullet the orchestrator already emitted
+            # is a real, validated generation. Record them in char/facts but
+            # leave latency_s unset so the partial run doesn't pollute P50/P95
+            # in the aggregate (it'd be artificially low — we stopped early).
+            result.error = f"quota_exhausted: {exc}"
+            partial_run = True
+        except Exception as exc:
+            logger.warning("orchestrator failed for %s: %s", cid, exc)
+            result.error = f"optimize_failed: {exc}"
+            return result
+        result.bullets_generated = len(bullets)
+        if not partial_run:
+            result.latency_s = time.perf_counter() - t0
+            # Per-bullet amortised cost — includes JD analysis + scoring +
+            # retrieval setup spread across the bullets generated. This is
+            # the apples-to-apples number to cite for "how long to produce
+            # one bullet"; raw latency_s is reported alongside as case-level
+            # context.
+            result.latency_per_bullet_s = (
+                result.latency_s / len(bullets) if bullets else None
+            )
+
+        # Phase 1: char accuracy per bullet
+        if "char" in phases:
+            for b in bullets:
+                delta = abs(b.metadata.char_count - b.metadata.char_target)
+                result.bullets.append({
+                    "text":              b.text,
+                    "char_count":        b.metadata.char_count,
+                    "char_target":       b.metadata.char_target,
+                    "delta":             delta,
+                    "iterations":        b.metadata.iterations_taken,
+                    "within_tolerance":  b.metadata.within_tolerance,
+                    "first_pass":        b.metadata.iterations_taken == 1 and b.metadata.within_tolerance,
+                })
+
+        # Phase 2: fact preservation per bullet
+        if "facts" in phases:
+            for b in bullets:
+                # Source numerics: union over each source fact's text + metrics.
+                source_nums: set[str] = set()
+                for fid in b.metadata.source_fact_ids:
+                    fact = fact_by_id.get(fid)
+                    if fact is None:
+                        continue
+                    source_nums |= set(extract_numerics(fact.text))
+                    for m in fact.metrics:
+                        source_nums |= set(extract_numerics(m))
+                output_nums = set(extract_numerics(b.text))
+                # Two distinct quality measures (the architectural One Rule
+                # is the first one — the second is reported as context only):
+                #
+                #   integrity = of numerics that appear in output, how many
+                #               match a source numeric verbatim. This is
+                #               what the architectural claim guarantees:
+                #               0.250 must stay 0.250, never silently
+                #               become 0.25 or appear as a fabricated 87%.
+                #               Violations are the `fabricated` set —
+                #               output numerics with no source match. The
+                #               target is 100% integrity / 0 fabrications.
+                #
+                #   coverage  = of source numerics passed in, how many made
+                #               it into the output. The bullet has ~130
+                #               chars and must select from 3 facts × ~3
+                #               numerics each, so low coverage is normal,
+                #               not a bug. Reported for completeness.
+                fabricated          = output_nums - source_nums
+                preserved_in_output = output_nums & source_nums
+                # If the bullet has zero output numerics, per-bullet integrity
+                # is undefined — there's nothing to score. Report None instead
+                # of 1.0 so a reader scanning the JSON doesn't misread an
+                # "everything-was-dropped" bullet as a perfect preservation.
+                # The aggregate is unaffected: bullets with no output numerics
+                # contribute 0 to both numerator (fabrications) and denominator
+                # (total output numerics) in the totals.
+                integrity_rate = (
+                    None if not output_nums
+                    else len(preserved_in_output) / len(output_nums)
+                )
+                coverage_rate = (
+                    1.0 if not source_nums
+                    else len(source_nums & output_nums) / len(source_nums)
+                )
+                result.fact_preservation.append({
+                    "bullet_index":    b.metadata.bullet_index,
+                    "source_numerics": sorted(source_nums),
+                    "output_numerics": sorted(output_nums),
+                    "fabricated":      sorted(fabricated),
+                    "integrity_rate":  integrity_rate,
+                    "coverage_rate":   coverage_rate,
+                })
+
+    return result
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Aggregation — per-backend metric rollups
+# ─────────────────────────────────────────────────────────────────────────────
+
+def aggregate(results: list[CaseResult], phases: set[str]) -> dict[str, Any]:
+    """Compute report-ready metrics from a list of per-case results.
+
+    All metrics are robust to missing data: if no bullets were generated for
+    any case, the char section returns "n/a" instead of dividing by zero.
+    """
+    section: dict[str, Any] = {}
+
+    all_bullets = [b for r in results for b in r.bullets]
+    if "char" in phases and all_bullets:
+        first_pass = sum(1 for b in all_bullets if b["first_pass"])
+        within     = sum(1 for b in all_bullets if b["within_tolerance"])
+        deltas     = [b["delta"] for b in all_bullets]
+        iters      = [b["iterations"] for b in all_bullets]
+        section["char"] = {
+            "n":                  len(all_bullets),
+            "first_pass_rate":    first_pass / len(all_bullets),
+            "overall_rate":       within / len(all_bullets),
+            "mean_delta":         statistics.mean(deltas),
+            "max_delta":          max(deltas),
+            "mean_iterations":    statistics.mean(iters),
+            "max_iterations":     max(iters),
+            "iteration_budget":   settings.char_loop_max_iterations,
+            "tolerance":          settings.char_tolerance,
+        }
+
+    if "facts" in phases:
+        per_bullet = [fp for r in results for fp in r.fact_preservation]
+        if per_bullet:
+            total_output_nums = sum(len(fp["output_numerics"]) for fp in per_bullet)
+            total_fabricated  = sum(len(fp["fabricated"]) for fp in per_bullet)
+            total_source_nums = sum(len(fp["source_numerics"]) for fp in per_bullet)
+            total_covered     = sum(
+                len(set(fp["source_numerics"]) & set(fp["output_numerics"]))
+                for fp in per_bullet
+            )
+            section["facts"] = {
+                "bullets_tested":  len(per_bullet),
+                # Headline — the architectural claim
+                "output_numerics": total_output_nums,
+                "fabricated":      total_fabricated,
+                "integrity_rate":  (
+                    1.0 if total_output_nums == 0
+                    else (total_output_nums - total_fabricated) / total_output_nums
+                ),
+                # Context only — not the architectural claim
+                "source_numerics": total_source_nums,
+                "coverage_rate":   (
+                    1.0 if total_source_nums == 0
+                    else total_covered / total_source_nums
+                ),
+            }
+
+    if "retrieval" in phases:
+        all_scores = [s for r in results for s in r.retrieval_scores]
+        if all_scores:
+            section["retrieval"] = {
+                "queries":     len(results),
+                "exemplars":   len(all_scores),
+                "mean_score":  statistics.mean(all_scores),
+                "min_score":   min(all_scores),
+                "max_score":   max(all_scores),
+                "score_stdev": statistics.stdev(all_scores) if len(all_scores) > 1 else 0.0,
+            }
+
+    if "recommender" in phases:
+        hits = [r for r in results if r.hit_at_2 is not None]
+        if hits:
+            section["recommender"] = {
+                "cases":      len(hits),
+                "hit_at_2":   sum(1 for r in hits if r.hit_at_2) / len(hits),
+            }
+
+    if "latency" in phases:
+        # Bullet-weighted: a case that produced 4 bullets contributes 4 samples,
+        # a 1-bullet case contributes 1. Without this, per-bullet percentiles
+        # treat each CASE equally regardless of bullet count, so a single
+        # 1-bullet outlier skews p95 the same as a 4-bullet outlier.
+        per_bullet = sorted(
+            latency
+            for r in results
+            if r.latency_per_bullet_s is not None
+            for latency in (r.latency_per_bullet_s,) * r.bullets_generated
+        )
+        per_case = sorted(r.latency_s for r in results if r.latency_s is not None)
+        # Emit the section whenever either dimension has data, so a run that
+        # records case-level wall-clock but produces zero bullets across every
+        # case (rare — most orchestrator failures early-return before
+        # latency_s is set, but possible) still surfaces the per-case numbers
+        # instead of vanishing from the report.
+        if per_bullet or per_case:
+            section["latency"] = {
+                "bullets":          sum(r.bullets_generated for r in results),
+                "cases":            len(per_case),
+                "p50_per_bullet":   None,
+                "p95_per_bullet":   None,
+                "min_per_bullet":   None,
+                "max_per_bullet":   None,
+                "p50_per_case":     None,
+                "p95_per_case":     None,
+                "min_per_case":     None,
+                "max_per_case":     None,
+            }
+            # Nearest-rank percentile, 0-indexed. For N<20 this lands on max
+            # regardless (mathematically correct — small samples can't resolve
+            # P95 below max), but the ceil form is right for N≥20 too.
+            if per_bullet:
+                p95_idx = max(0, min(len(per_bullet) - 1, math.ceil(0.95 * len(per_bullet)) - 1))
+                section["latency"].update({
+                    "p50_per_bullet": statistics.median(per_bullet),
+                    "p95_per_bullet": per_bullet[p95_idx],
+                    "min_per_bullet": min(per_bullet),
+                    "max_per_bullet": max(per_bullet),
+                })
+            if per_case:
+                case_p95_idx = max(0, min(len(per_case) - 1, math.ceil(0.95 * len(per_case)) - 1))
+                section["latency"].update({
+                    "p50_per_case": statistics.median(per_case),
+                    "p95_per_case": per_case[case_p95_idx],
+                    "min_per_case": min(per_case),
+                    "max_per_case": max(per_case),
+                })
+
+    return section
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Report formatting
+# ─────────────────────────────────────────────────────────────────────────────
+
+def format_report(
+    aggregates_by_backend: dict[str, dict[str, Any]],
+    meta: dict[str, Any],
+) -> str:
+    """Human-readable plain-text report (also written to docs/EVAL_REPORT.md)."""
+    lines: list[str] = []
+    lines.append("=" * 64)
+    lines.append("CVonRAG Evaluation Report")
+    lines.append("=" * 64)
+    lines.append(f"Eval set:           {meta['eval_set']}")
+    lines.append(f"Cases run:          {meta['cases_run']}")
+    lines.append(f"Phases:             {', '.join(sorted(meta['phases']))}")
+    lines.append(f"Qdrant vectors:     {meta['vector_count']}")
+    lines.append(f"Embedding model:    {settings.ollama_embed_model} (dim {settings.qdrant_vector_size})")
+    if meta.get("data_leakage_warning"):
+        lines.append("")
+        lines.append("WARNING: eval CVs are drawn from docs/good_cvs/, which is the")
+        lines.append("         same corpus seeded into Qdrant. Retrieval-quality scores")
+        lines.append("         have data leakage and should be reported with that caveat.")
+    lines.append("")
+
+    for backend, agg in aggregates_by_backend.items():
+        lines.append("─" * 64)
+        lines.append(f"Backend: {backend}    ({meta['backend_models'].get(backend, '?')})")
+        lines.append("─" * 64)
+
+        if "char" in agg:
+            c = agg["char"]
+            lines.append("[Char Validation]")
+            lines.append(f"  Bullets generated:    {c['n']}")
+            lines.append(f"  First-pass accuracy:  {c['first_pass_rate']:.1%}  "
+                         f"(≤{c['tolerance']} chars, 1 iteration)")
+            lines.append(f"  Overall accuracy:     {c['overall_rate']:.1%}  "
+                         f"(≤{c['tolerance']} chars, up to {c['iteration_budget']} iter)")
+            lines.append(f"  Mean char delta:      {c['mean_delta']:.2f}")
+            lines.append(f"  Mean iterations:      {c['mean_iterations']:.2f} / max {c['iteration_budget']}")
+            lines.append("")
+
+        if "facts" in agg:
+            f = agg["facts"]
+            matched = f["output_numerics"] - f["fabricated"]
+            lines.append("[Numeric Integrity]   (the architectural One Rule)")
+            lines.append(f"  Bullets tested:       {f['bullets_tested']}")
+            lines.append(f"  Integrity rate:       {f['integrity_rate']:.1%}  "
+                         f"({matched}/{f['output_numerics']} output numerics matched source)")
+            lines.append(f"  Fabrications:         {f['fabricated']}  "
+                         f"(target: 0 — these are claim violations)")
+            lines.append(f"  Source coverage:      {f['coverage_rate']:.1%}  "
+                         f"(of {f['source_numerics']} source numerics; low OK — ~130-char budget)")
+            lines.append("")
+
+        if "retrieval" in agg:
+            r = agg["retrieval"]
+            lines.append("[Qdrant Retrieval]")
+            lines.append(f"  Queries:              {r['queries']}")
+            lines.append(f"  Mean cosine sim:      {r['mean_score']:.3f}")
+            lines.append(f"  Stdev:                {r['score_stdev']:.3f}")
+            lines.append(f"  Range:                {r['min_score']:.3f} – {r['max_score']:.3f}")
+            lines.append("")
+
+        if "recommender" in agg:
+            r = agg["recommender"]
+            lines.append("[Recommender]")
+            lines.append(f"  Cases scored:         {r['cases']}")
+            lines.append(f"  Hit Rate @2:          {r['hit_at_2']:.1%}")
+            lines.append("")
+
+        if "latency" in agg:
+            latency = agg["latency"]
+            def _s(v: float | None) -> str:
+                return f"{v:.2f}s" if v is not None else "n/a"
+            lines.append(f"[Latency — {meta['backend_models'].get(backend, backend)}]")
+            lines.append(f"  Per bullet (amortised, {latency['bullets']} bullets) — resume-citable")
+            lines.append(f"    P50:                {_s(latency['p50_per_bullet'])}")
+            lines.append(f"    P95:                {_s(latency['p95_per_bullet'])}")
+            lines.append(f"    Range:              {_s(latency['min_per_bullet'])} – {_s(latency['max_per_bullet'])}")
+            lines.append(f"  Per case ({latency['cases']} cases, full orchestrator including JD analysis + scoring + retrieval)")
+            lines.append(f"    P50:                {_s(latency['p50_per_case'])}")
+            lines.append(f"    P95:                {_s(latency['p95_per_case'])}")
+            lines.append(f"    Range:              {_s(latency['min_per_case'])} – {_s(latency['max_per_case'])}")
+            lines.append("")
+
+    return "\n".join(lines)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Main
+# ─────────────────────────────────────────────────────────────────────────────
+
+ALL_PHASES = {"char", "facts", "retrieval", "recommender", "latency"}
+
+
+def _positive_int(value: str) -> int:
+    """argparse type for 'must be > 0' CLI flags. Avoids surprises like
+    --limit 0 (falsy, skips slice, runs everything) and --limit -1
+    (cases[:-1] drops the last case)."""
+    try:
+        n = int(value)
+    except ValueError:
+        # `from None` suppresses exception chaining — argparse converts
+        # ArgumentTypeError to a clean usage error, no traceback noise.
+        raise argparse.ArgumentTypeError(f"{value!r} is not an integer") from None
+    if n <= 0:
+        raise argparse.ArgumentTypeError(f"must be > 0 (got {n})")
+    return n
+
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="CVonRAG pipeline benchmark.")
+    p.add_argument("--eval-set", type=Path, default=_PROJECT_ROOT / "tests" / "eval_set.json",
+                   help="Path to eval_set.json (default: tests/eval_set.json).")
+    p.add_argument("--backend", choices=["groq", "openrouter", "ollama", "both"],
+                   default="both",
+                   help="Which LLM backend(s) to benchmark. 'both' = groq then ollama.")
+    p.add_argument("--phase", default="all",
+                   help="Comma-separated phases to run: char,facts,retrieval,recommender,latency,all")
+    p.add_argument("--limit", type=_positive_int, default=None,
+                   help="Only run the first N cases (smoke testing). Must be > 0.")
+    p.add_argument("--char-target", type=int, default=130,
+                   help="Bullet character target for phase 1.")
+    p.add_argument("--inter-case-sleep", type=float, default=1.5,
+                   help="Seconds to sleep between cases on a hosted backend (Groq rate-limit cushion).")
+    p.add_argument("--output-dir", type=Path, default=_PROJECT_ROOT,
+                   help="Where to write EVAL_REPORT.md / eval_results.json.")
+    return p.parse_args()
+
+
+async def run_backend(
+    backend: str,
+    cases: list[dict],
+    phases: set[str],
+    args: argparse.Namespace,
+) -> tuple[list[CaseResult], dict[str, Any]]:
+    """Run all cases under one backend; returns (results, aggregate)."""
+    cache: dict[str, list[ProjectData]] = {}
+    results: list[CaseResult] = []
+
+    print(f"\n>>> Running {len(cases)} case(s) on backend={backend} ({active_model_label()})", flush=True)
+    for i, case in enumerate(cases, 1):
+        print(f"  [{i}/{len(cases)}] {case['case_id']} … ", end="", flush=True)
+        result = await run_one_case(
+            case, phases, backend, args.char_target, cache,
+        )
+        results.append(result)
+        if result.error:
+            print(f"ERROR ({result.error})")
+            if result.error.startswith("quota_exhausted"):
+                print("  ↳ quota exhausted — stopping this backend.")
+                break
+        else:
+            bits = []
+            if result.bullets:
+                bits.append(f"{len(result.bullets)} bullets")
+            if result.latency_s is not None:
+                bits.append(f"{result.latency_s:.1f}s")
+            if result.hit_at_2 is not None:
+                bits.append("HIT" if result.hit_at_2 else "miss")
+            print(", ".join(bits) if bits else "ok")
+
+        # Rate-limit cushion on hosted backends only.
+        if backend != "ollama" and args.inter_case_sleep > 0 and i < len(cases):
+            await asyncio.sleep(args.inter_case_sleep)
+
+    return results, aggregate(results, phases)
+
+
+def _persist_results(
+    aggregates: dict[str, dict[str, Any]],
+    all_raw: dict[str, list[dict]],
+    meta: dict[str, Any],
+    output_dir: Path,
+) -> None:
+    """Write the markdown report + raw JSON to disk.
+
+    Called once per completed backend (not just at the end) so a Ctrl+C or
+    failure during --backend both leaves the prior backend's results
+    durable on disk — without this, killing the run mid-Ollama would have
+    nuked an already-completed Groq leg.
+    """
+    report = format_report(aggregates, meta)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    (output_dir / "docs").mkdir(parents=True, exist_ok=True)
+    (output_dir / "docs" / "EVAL_REPORT.md").write_text(
+        "```\n" + report + "\n```\n", encoding="utf-8",
+    )
+    (output_dir / "eval_results.json").write_text(
+        json.dumps(
+            {"meta": {**meta, "phases": sorted(meta["phases"])}, "by_backend": all_raw, "aggregates": aggregates},
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+
+async def main_async(args: argparse.Namespace) -> int:
+    # ── Resolve phases ───────────────────────────────────────────────────────
+    if args.phase.strip().lower() == "all":
+        phases = set(ALL_PHASES)
+    else:
+        phases = {p.strip().lower() for p in args.phase.split(",") if p.strip()}
+        if not phases:
+            print(f"No valid phases provided. Choose from {ALL_PHASES}", file=sys.stderr)
+            return 2
+        unknown = phases - ALL_PHASES
+        if unknown:
+            print(f"Unknown phase(s): {unknown}. Choose from {ALL_PHASES}", file=sys.stderr)
+            return 2
+
+    # ── Load cases ───────────────────────────────────────────────────────────
+    if not args.eval_set.exists():
+        print(f"Eval set not found: {args.eval_set}", file=sys.stderr)
+        print("Hint: run `python scripts/build_eval_set.py` first to generate it.", file=sys.stderr)
+        return 2
+    # ValueError covers malformed JSON (re-raised from JSONDecodeError) and
+    # all the validation rules in load_eval_set (missing fields, bad
+    # role_type, duplicate case_id, bad correct_projects entries).
+    try:
+        cases = load_eval_set(args.eval_set)
+    except ValueError as exc:
+        print(f"Error loading eval set: {exc}", file=sys.stderr)
+        return 2
+    if args.limit:
+        cases = cases[:args.limit]
+    if not cases:
+        print("Eval set is empty — nothing to benchmark.", file=sys.stderr)
+        return 2
+
+    # ── Resolve backends ─────────────────────────────────────────────────────
+    if args.backend == "both":
+        backends = ["groq", "ollama"]
+    else:
+        backends = [args.backend]
+
+    # ── Sanity-check Qdrant before burning LLM time ──────────────────────────
+    # Phase 3 (retrieval) hits Qdrant directly. The orchestrator-driven phases
+    # (char/facts/latency) also hit Qdrant inside their own Phase 3 to fetch
+    # style exemplars, so Qdrant being down would fail them mid-run too.
+    # Recommender is pure LLM scoring and does not touch Qdrant.
+    vector_count = 0
+    if phases & {"retrieval", "char", "facts", "latency"}:
+        try:
+            info = await collection_info()
+            vector_count = info.get("vector_count", 0)
+        except Exception as exc:
+            logger.warning("collection_info() failed — Qdrant unreachable (%s); retrieval scores and style exemplars will be unavailable.", exc)
+        if vector_count == 0:
+            print("WARN: Qdrant collection is empty — retrieval scores and style exemplars will be unavailable.", file=sys.stderr)
+
+    # ── Detect data leakage ──────────────────────────────────────────────────
+    leakage = any("docs/good_cvs/" in c["cv_path"].replace("\\", "/") for c in cases)
+
+    # ── Run each backend ─────────────────────────────────────────────────────
+    aggregates: dict[str, dict[str, Any]] = {}
+    all_raw: dict[str, list[dict]] = {}
+    backend_models: dict[str, str] = {}
+    # Meta references the mutable dicts above — they fill in as backends complete.
+    meta: dict[str, Any] = {
+        "eval_set":             str(args.eval_set.relative_to(_PROJECT_ROOT) if args.eval_set.is_relative_to(_PROJECT_ROOT) else args.eval_set),
+        "cases_run":            len(cases),
+        "phases":               phases,
+        "vector_count":         vector_count,
+        "backend_models":       backend_models,
+        "data_leakage_warning": leakage and "retrieval" in phases,
+    }
+
+    for backend in backends:
+        with with_backend(backend):
+            # Fail fast if a hosted backend is selected but no key is set.
+            if backend != "ollama" and _hosted_llm_config() is None:
+                print(f"\nSkipping backend={backend}: no API key configured "
+                      f"(set {backend.upper()}_API_KEY in .env).", file=sys.stderr)
+                continue
+            backend_models[backend] = active_model_label()
+            results, agg = await run_backend(backend, cases, phases, args)
+            aggregates[backend] = agg
+            all_raw[backend] = [
+                {
+                    "case_id":            r.case_id,
+                    "backend":            r.backend,
+                    "bullets":            r.bullets,
+                    "fact_preservation":  r.fact_preservation,
+                    "retrieval_scores":   r.retrieval_scores,
+                    "recommended_titles": r.recommended_titles,
+                    "correct_titles":     r.correct_titles,
+                    "hit_at_2":           r.hit_at_2,
+                    "latency_s":            r.latency_s,
+                    "latency_per_bullet_s": r.latency_per_bullet_s,
+                    "bullets_generated":    r.bullets_generated,
+                    "error":                r.error,
+                }
+                for r in results
+            ]
+            # Persist after each backend so a Ctrl+C or later-backend failure
+            # can't take the already-completed backends' results down with it.
+            _persist_results(aggregates, all_raw, meta, args.output_dir)
+
+    if not aggregates:
+        print("No backend produced results — see warnings above.", file=sys.stderr)
+        return 1
+
+    print("\n" + format_report(aggregates, meta))
+    print(f"\nWrote {args.output_dir / 'docs' / 'EVAL_REPORT.md'}")
+    print(f"Wrote {args.output_dir / 'eval_results.json'}")
+    return 0
+
+
+def main() -> int:
+    args = parse_args()
+    # Windows default console is cp1252 — Unicode separators in the report
+    # crash print(). Reconfigure if available; fall back silently otherwise.
+    for stream in (sys.stdout, sys.stderr):
+        if stream.encoding and stream.encoding.lower() not in ("utf-8", "utf8"):
+            try:
+                stream.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[attr-defined]
+            except (AttributeError, ValueError):
+                pass
+    return asyncio.run(main_async(args))
+
+
+if __name__ == "__main__":
+    sys.exit(main())
