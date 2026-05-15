@@ -257,26 +257,41 @@ def _split_segregated_cluster(cluster: list[dict]) -> list[list[dict]]:
     carries both columns), the layout is the classic "titles sit alone above
     their bullets" pattern. Y-gap clustering doesn't see boundaries here
     because line spacing is uniform across titles and bullets, but each
-    transition L→R *is* a project boundary.
+    transition L→R *is* a project boundary — split there.
 
-    For "parallel-title" PGDBA layouts (the common case after issue #24)
-    multiple rows carry *both* left and right content, so this guard short-
-    circuits and the cluster is returned unchanged.
+    Two short-circuits:
+      1. A cluster with any row carrying *both* columns is the parallel-title
+         PGDBA layout (the common post-#24 case); leave it alone.
+      2. A cluster whose *first* row is a bullet with no title is the
+         "bullet, title-line, bullet, title-line, bullet" interleaved layout
+         (JP44's `Multimodal RAG (GenAI)` tail). The title is a wrap appearing
+         *between* the bullets of a single project, not the start of a new
+         one — treat the whole cluster as one project. Without this short-
+         circuit the alternation pattern over-segments into one cluster per
+         L/R transition.
     """
     if len(cluster) < 2:
         return [cluster]
-    # Every row must be exclusively one column or the other for this pattern
-    # to apply. If any row has both, fall back to the unsplit cluster.
+
+    # Short-circuit #1: any row with both columns → parallel-title PGDBA
+    # layout, no sub-split.
     for r in cluster:
         if r["left_text"] and r["right_text"]:
             return [cluster]
 
+    # Short-circuit #2: leading row is a bullet (no title) → the following
+    # title rows are wrap continuations of *this* project, not boundaries.
+    first = cluster[0]
+    if first["right_text"] and not first["left_text"]:
+        return [cluster]
+
+    # Otherwise: classic title-then-bullet layout. Split where a new title
+    # row arrives after we've already accumulated bullets for the previous
+    # project.
     sub: list[list[dict]] = []
     current: list[dict] = []
     for r in cluster:
         if r["left_text"] and current and any(x["right_text"] for x in current):
-            # Encountered a new title row after we've already accumulated
-            # bullets for the previous project — emit and start fresh.
             sub.append(current)
             current = [r]
         else:
