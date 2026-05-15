@@ -618,6 +618,7 @@ ABSOLUTE PROHIBITIONS:
   ✗ NEVER attach an Exemplar's metric to the user's tool (or vice versa)
   ✗ NEVER invent steps, deployments, or outcomes not in the User JSON
   ✗ NEVER alter any number. 87% stays 87%. 0.250 stays 0.250. RMSE stays RMSE.
+  ✗ NEVER convert between number representations. 0.87 stays 0.87 (not 87%). 92.3% stays 92.3% (not 92.3). 0.250 stays 0.250 (not 0.25). Keep the EXACT format from the User JSON.
   ✗ NEVER reach for `|` as the default separator — natural prose with commas is the baseline
 
 OUTPUT: ONE plain-text bullet line. No markdown, no quotes, no explanation."""
