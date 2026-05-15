@@ -943,10 +943,15 @@ async def main_async(args: argparse.Namespace) -> int:
         backends = [args.backend]
 
     # ── Sanity-check Qdrant before burning LLM time ──────────────────────────
-    info = await collection_info()
-    vector_count = info.get("vector_count", 0)
-    if vector_count == 0 and "retrieval" in phases:
-        print("WARN: Qdrant collection is empty — retrieval scores will be empty.", file=sys.stderr)
+    vector_count = 0
+    if "retrieval" in phases:
+        try:
+            info = await collection_info()
+            vector_count = info.get("vector_count", 0)
+        except Exception as exc:
+            logger.warning("collection_info() failed — Qdrant unreachable (%s); retrieval scores will be unavailable.", exc)
+        if vector_count == 0:
+            print("WARN: Qdrant collection is empty — retrieval scores will be empty.", file=sys.stderr)
 
     # ── Detect data leakage ──────────────────────────────────────────────────
     leakage = any("docs/good_cvs/" in c["cv_path"].replace("\\", "/") for c in cases)
