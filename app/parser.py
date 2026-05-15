@@ -123,7 +123,7 @@ _BULLET_RE = re.compile(r"^\s*[▪•\-–→*]\s+(.+)$")
 # PGDBA CV bullet markers — private-use Unicode that pdfplumber's text layer drops.
 #     Wingdings glyph rendered as ▪ (most PGDBA CVs)
 #   §       Section sign repurposed as a bullet (some templates)
-_BULLET_MARKER_CHARS = {"", "§"}
+_BULLET_MARKER_CHARS = {"", "§", "▪"}
 
 # Section headers used by the PGDBA CV template. Bullets only count when we are
 # inside a project section; everything else (work ex, awards, etc.) is skipped.
@@ -179,16 +179,199 @@ def _clean_bullet_text(text: str) -> str:
     return re.sub(r"^[^a-zA-Z0-9]+", "", text).strip()
 
 
-def _parse_pdf_pgdba(pdf) -> list[RawProject]:
-    """
-    Two-column PGDBA template: left column = project titles, right column = bullets.
+# Section-break outlier multiplier (× median gap). Section transitions
+# (ACADEMIC → ADDITIONAL) leave a 25–35pt gap on PGDBA CVs, vs 14–18pt
+# between-project gaps inside a section. 2.0× median sits cleanly between
+# them: tight CV layouts with 12pt within / 14.6pt between / 29pt section
+# need the section gap to be classified as an outlier (cutoff = 24) so it
+# doesn't dominate the "largest jump in upper half" search. With 2.5×
+# (= 30.5) the section gap stayed in-range and masked the real within-vs-
+# between jump.
+_SECTION_BREAK_MEDIAN_MULTIPLIER = 2.0
 
-    Walk physical lines top-to-bottom; track the most recent left-column title and
-    attach right-column bullets to it. Section headers gate which lines count.
+# Minimum jump (pt) between sorted-adjacent gaps to claim a bi-modal
+# within-vs-between distribution. Below this, gap variation is treated as
+# line-spacing jitter and only section-break outliers split. Tuned at 2.0pt:
+# matches the smallest observed within-vs-between differential on the
+# tightest PGDBA layouts (~2.4pt: 12.2pt within vs 14.6pt between) and
+# rejects spurious sub-2pt jumps that show up in tiny sections (e.g. JP24's
+# 4-row ADDITIONAL section where a 1.9pt bullet-wrap variation would
+# otherwise falsely split "Insurance Chatbot (RAG)" into two fragments).
+_MIN_PROJECT_JUMP_PT = 2.0
+
+
+def _find_project_gap_threshold(gaps: list[float]) -> float:
+    """Find the Y-gap that separates within-project from between-project rows.
+
+    PGDBA layouts produce a mixture distribution of consecutive-line Y-gaps:
+      - 4–6pt  (bullet-wrap continuation lines)
+      - 9–12pt (within-project, between primary bullets)
+      - 14–18pt (between projects in the same section)
+      - 25pt+ (section transitions, e.g. ACADEMIC → ADDITIONAL)
+
+    The natural project boundary sits at the *largest jump in the upper half*
+    of the sorted gap distribution, ignoring section-break outliers. Searching
+    only the upper half avoids mis-locking onto the tiny-to-medium transition
+    (e.g., 6.5 → 9.5pt on a wrap-heavy CV) — that gap is *within* a project.
+
+    Returns the midpoint of the largest qualifying jump. Falls back to the
+    section-break cutoff (= median × ``_SECTION_BREAK_MEDIAN_MULTIPLIER``)
+    when no clear jump exists, so single-project CVs stay as one cluster
+    while still splitting at section transitions.
     """
-    projects: list[RawProject] = []
-    current: RawProject | None = None
+    if len(gaps) < 2:
+        return float("inf")
+
+    sorted_gaps = sorted(gaps)
+    n = len(sorted_gaps)
+    median = sorted_gaps[n // 2]
+    outlier_cutoff = median * _SECTION_BREAK_MEDIAN_MULTIPLIER
+
+    best_jump = 0.0
+    threshold = outlier_cutoff
+
+    # Scan the upper half only — the within-vs-between transition is by
+    # definition in the upper tail (between-project gaps > within-project
+    # gaps). The midpoint of the largest qualifying jump becomes threshold.
+    for i in range(n // 2, n - 1):
+        right = sorted_gaps[i + 1]
+        if right >= outlier_cutoff:
+            break  # crossed into section-break territory — stop searching
+        jump = right - sorted_gaps[i]
+        if jump > best_jump:
+            best_jump = jump
+            threshold = (sorted_gaps[i] + right) / 2
+
+    if best_jump < _MIN_PROJECT_JUMP_PT:
+        # No clear bi-modal split — likely a single project or uniform spacing.
+        # Only split at obvious section transitions.
+        threshold = outlier_cutoff
+
+    return threshold
+
+
+def _split_segregated_cluster(cluster: list[dict]) -> list[list[dict]]:
+    """Split a cluster on the title-on-own-line pattern.
+
+    When every row in a cluster is *strictly* left-only or right-only (no row
+    carries both columns), the layout is the classic "titles sit alone above
+    their bullets" pattern. Y-gap clustering doesn't see boundaries here
+    because line spacing is uniform across titles and bullets, but each
+    transition L→R *is* a project boundary — split there.
+
+    Two short-circuits:
+      1. A cluster with any row carrying *both* columns is the parallel-title
+         PGDBA layout (the common post-#24 case); leave it alone.
+      2. A cluster whose *first* row is a bullet with no title is the
+         "bullet, title-line, bullet, title-line, bullet" interleaved layout
+         (JP44's `Multimodal RAG (GenAI)` tail). The title is a wrap appearing
+         *between* the bullets of a single project, not the start of a new
+         one — treat the whole cluster as one project. Without this short-
+         circuit the alternation pattern over-segments into one cluster per
+         L/R transition.
+    """
+    if len(cluster) < 2:
+        return [cluster]
+
+    # Short-circuit #1: any row with both columns → parallel-title PGDBA
+    # layout, no sub-split.
+    for r in cluster:
+        if r["left_text"] and r["right_text"]:
+            return [cluster]
+
+    # Short-circuit #2: leading row is a bullet (no title) → the following
+    # title rows are wrap continuations of *this* project, not boundaries.
+    first = cluster[0]
+    if first["right_text"] and not first["left_text"]:
+        return [cluster]
+
+    # Otherwise: classic title-then-bullet layout. Split where a new title
+    # row arrives after we've already accumulated bullets for the previous
+    # project.
+    sub: list[list[dict]] = []
+    current: list[dict] = []
+    for r in cluster:
+        if r["left_text"] and current and any(x["right_text"] for x in current):
+            sub.append(current)
+            current = [r]
+        else:
+            current.append(r)
+    if current:
+        sub.append(current)
+    return sub
+
+
+def _cluster_rows_by_gap(rows: list[dict]) -> list[list[dict]]:
+    """Cluster rows by Y-gap into project blocks.
+
+    `rows` items are dicts with at least a "y_top" key. <2 rows ⇒ single
+    cluster. Otherwise discover the within/between-project gap threshold and
+    split wherever a consecutive gap exceeds it. Each cluster is then run
+    through `_split_segregated_cluster` to handle the title-on-own-line
+    layout where Y-gaps don't carry the boundary signal.
+    """
+    if len(rows) < 2:
+        return [rows] if rows else []
+    gaps = [rows[i]["y_top"] - rows[i - 1]["y_top"] for i in range(1, len(rows))]
+    threshold = _find_project_gap_threshold(gaps)
+    raw_clusters: list[list[dict]] = [[rows[0]]]
+    for i, row in enumerate(rows[1:], start=1):
+        if gaps[i - 1] > threshold:
+            raw_clusters.append([row])
+        else:
+            raw_clusters[-1].append(row)
+
+    clusters: list[list[dict]] = []
+    for c in raw_clusters:
+        clusters.extend(_split_segregated_cluster(c))
+    return clusters
+
+
+def _parse_pdf_pgdba(pdf) -> list[RawProject]:
+    """Two-column PGDBA template: left column = project titles, right column = bullets.
+
+    Project titles in this template wrap across multiple lines *parallel to the
+    bullets* — each visual row carries both a title fragment and a bullet, so
+    the old "left-only row = title" rule (which only fired on stray orphan
+    title rows) collapsed every project into the 'CV Bullets' fallback and
+    captured at most a handful of fragments like '(Regression)' or
+    '(Time Series)' as standalone "projects" (issue #24).
+
+    Strategy:
+      1. Pass 1 — Walk lines top-to-bottom. For every line inside an
+         ACADEMIC/ADDITIONAL PROJECTS section, record (y_top, left_text,
+         right_text). Honour STOP section headers so work-experience bullets
+         never enter the pipeline. Track section *boundaries* so each section's
+         rows form an independent gap distribution.
+      2. Pass 2 — Cluster recorded rows by vertical Y-gap *per section
+         independently*. Per-section thresholds prevent one noisier section
+         (e.g. ADDITIONAL with mixed bullet-wrap spacings) from dragging
+         another section's clean within-vs-between threshold (e.g. ACADEMIC
+         with a tight 12-vs-14.6pt split) off the actual boundary.
+      3. Emit one RawProject per cluster: title = concatenated left-column
+         words across the cluster, bullets = cleaned right-column text per row.
+         Drop clusters whose bullets all fail length/header guards.
+    """
+    sections: list[list[dict]] = []
+    current_section: list[dict] = []
     in_target = False
+
+    # pdfplumber's `word["top"]` is page-local, so a section that spans a
+    # page break would otherwise show a large negative gap between the last
+    # row of page N (e.g. y=700) and the first row of page N+1 (e.g. y=100).
+    # That negative value fails `gaps[i-1] > threshold` and silently fuses
+    # the two adjacent projects across the page boundary. Track a running
+    # offset that adds each prior page's height so y_top stays monotonic
+    # across the full document.
+    page_y_offset = 0.0
+
+    def _flush_section() -> None:
+        # Closes the active section so subsequent rows form a fresh
+        # distribution. Called on section header transitions and at EOF.
+        nonlocal current_section
+        if current_section:
+            sections.append(current_section)
+            current_section = []
 
     for page in pdf.pages:
         words      = page.extract_words(x_tolerance=3, y_tolerance=3, keep_blank_chars=False)
@@ -200,9 +383,11 @@ def _parse_pdf_pgdba(pdf) -> list[RawProject]:
             full_line = " ".join(w["text"] for w in line).upper()
 
             if any(h in full_line for h in _PROJECT_SECTION_HEADERS):
+                _flush_section()
                 in_target = True
                 continue
             if any(h in full_line for h in _STOP_SECTION_HEADERS):
+                _flush_section()
                 in_target = False
                 continue
             if not in_target:
@@ -210,32 +395,57 @@ def _parse_pdf_pgdba(pdf) -> list[RawProject]:
 
             left_words  = [w["text"] for w in line if w["x0"] <= threshold]
             right_words = [w["text"] for w in line if w["x0"] >  threshold]
-
-            # New project title in the left column → open a new RawProject.
-            if left_words and not right_words:
-                title = " ".join(left_words).strip()
-                if 3 < len(title) < 80 and not title.upper().startswith(_STOP_SECTION_HEADERS):
-                    if current and current.bullets:
-                        projects.append(current)
-                    current = RawProject(title=title)
+            if not left_words and not right_words:
                 continue
 
-            if not right_words:
-                continue
+            # Add page_y_offset so cross-page gaps remain positive and the
+            # within-vs-between gap distribution stays interpretable.
+            y_top = min(w["top"] for w in line) + page_y_offset
+            current_section.append({
+                "y_top":      float(y_top),
+                "left_text":  " ".join(left_words).strip(),
+                "right_text": " ".join(right_words).strip(),
+            })
 
-            bullet = _clean_bullet_text(" ".join(right_words))
+        # After processing this page, advance the offset by the page height
+        # so the next page's rows start where this one ended.
+        page_y_offset += float(page.height)
+
+    _flush_section()
+    if not sections:
+        return []
+
+    # Cluster each section against its own gap distribution, then concatenate
+    # clusters in document order (ACADEMIC projects first, then ADDITIONAL).
+    clusters: list[list[dict]] = []
+    for section_rows in sections:
+        clusters.extend(_cluster_rows_by_gap(section_rows))
+
+    projects: list[RawProject] = []
+    for cluster in clusters:
+        title_fragments = [r["left_text"] for r in cluster if r["left_text"]]
+        title = " ".join(title_fragments).strip()
+
+        bullets: list[str] = []
+        for r in cluster:
+            if not r["right_text"]:
+                continue
+            bullet = _clean_bullet_text(r["right_text"])
             if len(bullet) < 30:
                 continue
             if bullet.upper().startswith(_STOP_SECTION_HEADERS):
                 continue
+            bullets.append(bullet)
 
-            # Bullet found before any title — open a fallback container.
-            if current is None:
-                current = RawProject(title="CV Bullets")
-            current.bullets.append(bullet)
+        if not bullets:
+            continue
 
-    if current and current.bullets:
-        projects.append(current)
+        if not title or len(title) < 4 or len(title) >= 120 \
+                or title.upper().startswith(_STOP_SECTION_HEADERS):
+            title = "CV Bullets"
+
+        projects.append(RawProject(title=title, bullets=bullets))
+
     return projects
 
 
