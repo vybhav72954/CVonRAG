@@ -215,9 +215,9 @@ def _find_project_gap_threshold(gaps: list[float]) -> float:
     (e.g., 6.5 → 9.5pt on a wrap-heavy CV) — that gap is *within* a project.
 
     Returns the midpoint of the largest qualifying jump. Falls back to the
-    section-break cutoff (= median × 2.5) when no clear jump exists, so
-    single-project CVs stay as one cluster while still splitting at section
-    transitions.
+    section-break cutoff (= median × ``_SECTION_BREAK_MEDIAN_MULTIPLIER``)
+    when no clear jump exists, so single-project CVs stay as one cluster
+    while still splitting at section transitions.
     """
     if len(gaps) < 2:
         return float("inf")
@@ -356,6 +356,15 @@ def _parse_pdf_pgdba(pdf) -> list[RawProject]:
     current_section: list[dict] = []
     in_target = False
 
+    # pdfplumber's `word["top"]` is page-local, so a section that spans a
+    # page break would otherwise show a large negative gap between the last
+    # row of page N (e.g. y=700) and the first row of page N+1 (e.g. y=100).
+    # That negative value fails `gaps[i-1] > threshold` and silently fuses
+    # the two adjacent projects across the page boundary. Track a running
+    # offset that adds each prior page's height so y_top stays monotonic
+    # across the full document.
+    page_y_offset = 0.0
+
     def _flush_section() -> None:
         # Closes the active section so subsequent rows form a fresh
         # distribution. Called on section header transitions and at EOF.
@@ -389,12 +398,18 @@ def _parse_pdf_pgdba(pdf) -> list[RawProject]:
             if not left_words and not right_words:
                 continue
 
-            y_top = min(w["top"] for w in line)
+            # Add page_y_offset so cross-page gaps remain positive and the
+            # within-vs-between gap distribution stays interpretable.
+            y_top = min(w["top"] for w in line) + page_y_offset
             current_section.append({
                 "y_top":      float(y_top),
                 "left_text":  " ".join(left_words).strip(),
                 "right_text": " ".join(right_words).strip(),
             })
+
+        # After processing this page, advance the offset by the page height
+        # so the next page's rows start where this one ended.
+        page_y_offset += float(page.height)
 
     _flush_section()
     if not sections:

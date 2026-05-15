@@ -140,11 +140,13 @@ def _char(text: str, x0: float, top: float) -> dict:
     return {"text": text, "x0": x0, "top": top, "x1": x0 + 4, "bottom": top + 10}
 
 
-def _make_pgdba_page(words: list[dict], chars: list[dict], width: float = 600.0):
+def _make_pgdba_page(words: list[dict], chars: list[dict],
+                     width: float = 600.0, height: float = 800.0):
     page = MagicMock()
     page.extract_words.return_value = words
     page.chars = chars
     page.width = width
+    page.height = height
     # Generic-fallback path uses extract_text — leave it harmless in case PGDBA path bails.
     page.extract_text.return_value = ""
     return page
@@ -417,6 +419,73 @@ class TestPgdbaPath:
         assert any("SARIMA" in b for b in projects[1].bullets)
         assert any("FAISS"  in b for b in projects[2].bullets)
         assert any("DBSCAN" in b for b in projects[3].bullets)
+
+    def test_pgdba_cross_page_section_keeps_project_boundary(self):
+        """A project section spanning two pages must not fuse the last
+        project on page N with the first project on page N+1.
+
+        pdfplumber's ``word["top"]`` is page-local, so without a running
+        page-Y offset the cross-page gap is a large negative number
+        (e.g. ``100 - 700 = -600``). The negative value fails the
+        ``gaps[i-1] > threshold`` check, silently merging the two adjacent
+        projects across the page boundary. The fix maintains a cumulative
+        offset that adds each prior page's height to ``y_top``.
+        """
+        page_height = 800.0
+
+        # Page 1: ACADEMIC PROJECTS header + Project A (3 rows ending near
+        # the bottom of the page).
+        page1_words = [
+            _word("ACADEMIC", 20, 50), _word("PROJECTS", 90, 50),
+            _word("Project",   20, 700), _word("A1",        50, 700),
+            _word("Built",    130, 700), _word("OLS",      180, 700),
+            _word("regression",230, 700),_word("baseline", 300, 700),
+            _word("model",    370, 700),
+            _word("Title",     20, 712), _word("two",       50, 712),
+            _word("Handled",  130, 712), _word("VIF",      200, 712),
+            _word("outliers", 240, 712), _word("Jackknife",310, 712),
+            _word("(A)",       20, 724),
+            _word("Achieved", 130, 724), _word("test",     200, 724),
+            _word("R2=0.85",  250, 724),_word("with",     320, 724),
+            _word("ElasticNet",360, 724),
+        ]
+        page1_chars = [_char("", 110, y) for y in (700, 712, 724)]
+
+        # Page 2: continuation of ACADEMIC — Project B at the top of the
+        # page (no fresh section header). y_top on page 2 starts back at
+        # ~100, which is < the y_top of any page-1 row. Naive gap arithmetic
+        # would produce ~-600 and merge A & B.
+        page2_words = [
+            _word("Project",   20, 100), _word("B1",        50, 100),
+            _word("Forecasted",130, 100),_word("hourly",   210, 100),
+            _word("energy",   260, 100), _word("demand",   310, 100),
+            _word("Title",     20, 112), _word("two",       50, 112),
+            _word("Stationarity",130,112),_word("via",     220, 112),
+            _word("ADF",      260, 112), _word("differenced",310, 112),
+            _word("(B)",       20, 124),
+            _word("Final",    130, 124),_word("SARIMA",   170, 124),
+            _word("MAPE",     230, 124),_word("3.5%",     280, 124),
+            _word("Ljung-Box",320, 124),_word("residual", 390, 124),
+        ]
+        page2_chars = [_char("", 110, y) for y in (100, 112, 124)]
+
+        pdf = _open_pdf_with_pages([
+            _make_pgdba_page(page1_words, page1_chars, height=page_height),
+            _make_pgdba_page(page2_words, page2_chars, height=page_height),
+        ])
+
+        with patch("pdfplumber.open", return_value=pdf):
+            projects = parse_pdf_bytes(b"fake")
+
+        # Two distinct projects, not one fused mega-project.
+        assert len(projects) == 2
+        assert projects[0].title.startswith("Project A1")
+        assert projects[1].title.startswith("Project B1")
+        # OLS belongs to A; SARIMA belongs to B — no cross-page leak.
+        assert any("OLS"    in b for b in projects[0].bullets)
+        assert all("SARIMA" not in b for b in projects[0].bullets)
+        assert any("SARIMA" in b for b in projects[1].bullets)
+        assert all("OLS"    not in b for b in projects[1].bullets)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
