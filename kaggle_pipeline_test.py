@@ -310,17 +310,17 @@ GOLD_STANDARD_BULLETS = [
         "uses_arrow": True,
         "sentence_structure": "verb → tool stack → metric delta → benchmark",
     },
-    # Software Engineering
+    # Data Engineering
     {
         "text": "• Architected distributed Kafka + Spark pipeline | ↓ data latency by 340ms (p99) across 12M daily events",
-        "role_type": "software_engineering",
+        "role_type": "data_engineering",
         "uses_separator": "|",
         "uses_arrow": True,
         "sentence_structure": "verb → tool stack → metric → scale",
     },
     {
         "text": "• Refactored monolith into 8 microservices w/ FastAPI | ↑ deploy frequency 3× & ↓ incident rate by 60%",
-        "role_type": "software_engineering",
+        "role_type": "data_engineering",
         "uses_separator": "|",
         "uses_arrow": True,
         "sentence_structure": "verb → outcome → tool → dual metric",
@@ -342,7 +342,7 @@ GOLD_STANDARD_BULLETS = [
     },
     {
         "text": "• Deployed FastAPI inference service w/ async batching | ↓ p99 latency from 850ms → 210ms at 500 RPS",
-        "role_type": "software_engineering",
+        "role_type": "ml_engineering",
         "uses_separator": "|",
         "uses_arrow": True,
         "sentence_structure": "verb → tool → technique → metric range → scale",

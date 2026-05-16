@@ -277,9 +277,23 @@
   // may already have typed. Bind already runs first, so $roleType reflects
   // the new value, but we read straight from the event target to sidestep
   // any bind/on:change ordering concerns.
+  //
+  // Don't clobber a user-edited JD on role switch. We overwrite only when:
+  //   • the textarea is empty (first pick, or user cleared it), OR
+  //   • the current text matches the sample we last applied (user hasn't
+  //     edited it since we filled it).
+  // Tracking _lastAppliedSample is necessary because the persisted jdText
+  // store survives reloads, so we can't just compare against an in-module
+  // "previous sample" — it has to be the actual string we wrote in.
+  let _lastAppliedSample = '';
+
   function onRoleChange(e) {
     const sample = SAMPLE_JDS[e.target.value];
-    if (sample) jdText.set(sample);
+    if (!sample) return;
+    const current = get(jdText);
+    if (current && current !== _lastAppliedSample) return;  // user-edited, preserve
+    jdText.set(sample);
+    _lastAppliedSample = sample;
   }
 
   async function analyseJD() {
@@ -372,12 +386,12 @@
   }
 
   const ROLES = [
-    { value: 'ml_engineering',          label: 'ML Engineering' },
-    { value: 'data_science',            label: 'Data Scientists' },
-    { value: 'data_science_consultant', label: 'Consultant' },
-    { value: 'quant_finance',           label: 'Quant / Finance' },
-    { value: 'product_management',      label: 'Product Management' },
-    { value: 'general',                 label: 'General' },
+    { value: 'ml_engineering',     label: 'ML Engineering' },
+    { value: 'data_science',       label: 'Data Science' },
+    { value: 'data_engineering',   label: 'Data Engineering' },
+    { value: 'quant_finance',      label: 'Quant / Finance' },
+    { value: 'product_management', label: 'Product Management' },
+    { value: 'general',            label: 'General' },
   ];
 
   $: groupedBullets = (() => {

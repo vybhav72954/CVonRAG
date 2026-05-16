@@ -98,9 +98,9 @@ Excellent problem-solving skills and the ability to think critically and creativ
 Strong communication and interpersonal skills, with the ability to collaborate effectively in a team-oriented, fast-paced environment
 Previous internship experience or relevant projects in the AI field is a plus`,
 
-  data_science_consultant: `Company: BCG
+  data_engineering: `Company: BCG
 
-BCG - Data Science Consultant
+BCG - Data Engineer (BCG X)
 
 As a part of BCG's X team, you will work closely with consulting teams on a diverse range of advanced analytics and engineering topics. You will have the opportunity to leverage analytical methodologies to deliver value to BCG's Consulting (case) teams and Practice Areas (domain) through providing analytical and engineering subject matter expertise. As a Data Engineer, you will play a crucial role in designing, developing, and maintaining data pipelines, systems, and solutions that empower our clients to make informed business decisions. You will collaborate closely with cross-functional teams, including data scientists, analysts, and business stakeholders, to deliver high-quality data solutions that meet our clients' needs.
 

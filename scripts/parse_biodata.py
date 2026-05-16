@@ -314,7 +314,7 @@ def stream_optimize(request_payload: dict, api_url: str) -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 
 ROLE_CHOICES = [
-    "ml_engineering", "data_science", "data_science_consultant",
+    "ml_engineering", "data_science", "data_engineering",
     "quant_finance", "product_management", "general",
 ]
 

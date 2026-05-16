@@ -10,7 +10,7 @@ What it does:
   1. Reads every PDF in --pdf_dir
   2. Extracts all bullet points (lines beginning with ▪, •, -, or –)
   3. Calls Ollama LLM once per bullet to tag:
-       - role_type       (ml_engineering / data_science / data_science_consultant / etc.)
+       - role_type       (ml_engineering / data_science / data_engineering / etc.)
        - uses_separator  ("|" / ";" / None)
        - uses_arrow      (True if bullet contains ↑ ↓ →)
        - sentence_structure  (e.g. "verb → tool → metric → impact")
@@ -237,7 +237,7 @@ You are a CV analyst. Given ONE resume bullet point, return ONLY a valid JSON ob
 
 Schema:
 {
-  "role_type": "ml_engineering|data_science|data_science_consultant|quant_finance|product_management|general",
+  "role_type": "ml_engineering|data_science|data_engineering|quant_finance|product_management|general",
   "uses_separator": "|" or ";" or null,
   "uses_arrow": true or false,
   "uses_abbreviations": ["w/", "vs", "~"],
