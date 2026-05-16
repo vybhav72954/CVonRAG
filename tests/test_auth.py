@@ -586,17 +586,21 @@ class TestDailyResetEdgeCases:
         from datetime import datetime, timezone
         monkeypatch.setattr(settings, "admin_emails", ["admin@example.org"])
 
+        # Capture the UTC date both before and after the request so a midnight
+        # rollover happening mid-test doesn't flake the assertion. The server
+        # stores whichever side of midnight it observed when require_user ran.
+        date_before = datetime.now(timezone.utc).date()
         with patch("app.main._do_recommend", new=AsyncMock(return_value=[])):
             resp = client.post(
                 "/recommend", json=RECOMMEND_BODY,
                 headers=_auth("fresh@example.org"),
             )
+        date_after = datetime.now(timezone.utc).date()
         assert resp.status_code == 200
 
         rows = client.get("/admin/usage", headers=_auth("admin@example.org")).json()["users"]
         row = next(u for u in rows if u["email"] == "fresh@example.org")
-        today_iso = datetime.now(timezone.utc).date().isoformat()
-        assert row["today_date"] == today_iso
+        assert row["today_date"] in {date_before.isoformat(), date_after.isoformat()}
 
     def test_yesterday_today_date_triggers_reset(
         self, client, gate_enabled, monkeypatch
@@ -628,17 +632,20 @@ class TestDailyResetEdgeCases:
                 await s.commit()
         asyncio.run(_rewind())
 
+        # Capture date around the reset-triggering request — see the fresh-user
+        # test above for the rationale (midnight-rollover flake protection).
+        date_before = datetime.now(timezone.utc).date()
         with patch("app.main._sse_stream", new=lambda body: _empty_sse()):
             resp = client.post(
                 "/optimize", json=OPTIMIZE_BODY,
                 headers=_auth("yesterday@example.org"),
             )
+        date_after = datetime.now(timezone.utc).date()
         assert resp.status_code == 200
 
         rows = client.get("/admin/usage", headers=_auth("admin@example.org")).json()["users"]
         row = next(u for u in rows if u["email"] == "yesterday@example.org")
-        today_iso = datetime.now(timezone.utc).date().isoformat()
-        assert row["today_date"] == today_iso
+        assert row["today_date"] in {date_before.isoformat(), date_after.isoformat()}
         # Reset to 0 then incremented this request.
         assert row["optimize_today"] == 1
         assert row["bullets_today"] == 1
