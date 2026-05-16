@@ -20,6 +20,7 @@ dependencies = [
     "python-multipart>=0.0.9",
     "sqlalchemy[asyncio]>=2.0",
     "aiosqlite>=0.20",
+    "google-auth>=2.35",
 ]
 
 # Platform-specific dependencies

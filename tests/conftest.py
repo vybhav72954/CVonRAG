@@ -9,42 +9,42 @@ import pytest
 @pytest.fixture(autouse=True)
 def _isolate_settings_from_local_env(monkeypatch, tmp_path):
     """
-    Configure application settings and shared state to isolate tests from the developer's local environment.
-    
-    Clears ingest secrets, disables global rate limiting and the invite-code requirement, redirects SQLite to a per-test file under the provided tmp_path, resets the cached database engine/session factory, clears in-memory rate-limiter state, and resets the Groq quota circuit breaker so tests start from a clean, deterministic baseline.
+    Isolate every test from the developer's local environment.
+
+    • ingest_secret      → "" (a real INGEST_SECRET in .env would otherwise
+                              produce spurious 403s on /ingest)
+    • rate_limit_enabled → False
+    • OAuth gate         → disabled (google_oauth_client_id="") so
+                              require_user() returns None and tests that
+                              don't send a Bearer token still pass. The
+                              dedicated auth tests opt back in via
+                              patch.object(settings, "google_oauth_client_id", ...)
+                              plus a monkeypatched _verify_id_token.
+    • sqlite_path        → per-test tmp_path file (no dev-DB pollution)
+    • _limiter state     → cleared
+    • Groq quota breaker → reset
     """
     from app.main import settings as main_settings, _limiter
     from app.chains import settings as chains_settings, _reset_quota_circuit
     from app.db import _reset_factory_for_tests
 
-    # Both modules import the same cached Settings instance; patch once on each
-    # binding to keep both views in sync.
     monkeypatch.setattr(main_settings,   "ingest_secret", "")
     monkeypatch.setattr(chains_settings, "ingest_secret", "")
 
-    # Disable rate limiting globally; individual rate-limit tests opt in via patch.object.
     monkeypatch.setattr(main_settings, "rate_limit_enabled", False)
 
-    # Disable the invite-code gate by default. The require_invite dep short-
-    # circuits to None when this is False, so existing tests that hit
-    # /parse, /recommend, /optimize without an X-Invite-Code header still pass.
-    monkeypatch.setattr(main_settings, "invite_codes_required", False)
-    # Per-test SQLite file. Without this, every test would create/share the
-    # dev DB at ./cvonrag.db.
-    monkeypatch.setattr(main_settings, "sqlite_path", str(tmp_path / "test_invites.db"))
-    # Drop the cached engine/session-factory so the next init_db() picks up
-    # the new sqlite_path (db.py memoises both module-level).
+    # OAuth gate off by default. Auth tests opt in by patching client_id back
+    # on AND providing a fake _verify_id_token.
+    monkeypatch.setattr(main_settings, "google_oauth_client_id", "")
+    monkeypatch.setattr(main_settings, "google_oauth_hd", "")
+    monkeypatch.setattr(main_settings, "admin_emails", [])
+
+    # Per-test SQLite file.
+    monkeypatch.setattr(main_settings, "sqlite_path", str(tmp_path / "test_users.db"))
     _reset_factory_for_tests()
 
-    # Clear any accumulated window state so tests start clean.
-    # _checks_since_gc and _window_seconds also reset (P8) so an unrelated test
-    # can't trip the GC threshold or P7's mixed-window guard on the next call.
     _limiter._windows.clear()
     _limiter._checks_since_gc = 0
     _limiter._window_seconds = None
 
-    # Reset the Groq quota-exhaustion circuit breaker. If a prior test
-    # tripped it (or a developer's prior session left it tripped during an
-    # interactive run), subsequent _groq_chat calls would fail fast and
-    # produce confusing test failures unrelated to the test under test.
     _reset_quota_circuit()

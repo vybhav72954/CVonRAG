@@ -3,24 +3,30 @@
  * Set VITE_API_URL in frontend/.env (defaults to http://localhost:8000)
  */
 import { get } from 'svelte/store';
-import { inviteCode } from '$lib/stores';
+import { idToken, userEmail } from '$lib/stores';
 
 const BASE = import.meta.env.VITE_API_URL ?? 'http://localhost:8000';
 
 // ── Auth header helper ──────────────────────────────────────────────────────
-// Per-batchmate invite code is held in the inviteCode store (persistent to
-// sessionStorage). When the backend has INVITE_CODES_REQUIRED=true, every
-// gated request (parse/recommend/optimize) needs this header or returns 401.
-// When the code is empty (user hasn't entered one yet), we omit the header
-// entirely — the backend will reject with a 401 whose message is surfaced
-// via formatErrorDetail like any other error, prompting the user to enter
-/**
- * Produce HTTP headers that include the current invite code when available.
- * @returns {Object} An object containing `{'X-Invite-Code': <code>}` if an invite code is set, otherwise an empty object.
- */
+// Google ID token from the idToken store (persistent in sessionStorage; lives
+// for the GIS-issued 1-hour expiry or until the tab closes). Sent as
+// `Authorization: Bearer <id_token>` on every gated request. When the token
+// is empty or the backend returns 401 (expired/revoked), the page flips back
+// to the sign-in card via clearAuth().
 function authHeaders() {
-  const code = get(inviteCode);
-  return code ? { 'X-Invite-Code': code } : {};
+  const t = get(idToken);
+  return t ? { Authorization: `Bearer ${t}` } : {};
+}
+
+/** Clear local auth state. Triggered on 401 from any gated endpoint, or
+ *  manually by the sign-out button. The Google Identity Services library
+ *  handles its own session cookie; we only own the local sessionStorage copy. */
+export function clearAuth() {
+  idToken.set('');
+  userEmail.set('');
+  if (typeof window !== 'undefined' && window.google?.accounts?.id) {
+    try { window.google.accounts.id.disableAutoSelect(); } catch { /* GSI not loaded yet */ }
+  }
 }
 
 // F8: production deploys that forget to set VITE_API_URL silently fall back to
@@ -190,6 +196,7 @@ export async function parseCV(file, { onProgress, onProject, onDone, onError } =
   clearTimeout(timer);
 
   if (!resp.ok) {
+    if (resp.status === 401) clearAuth();
     const body = await resp.json().catch(() => null);
     if (isCurrent('parse', controller)) {
       onError?.(formatErrorDetail(body, `HTTP ${resp.status} ${resp.statusText}`));
@@ -235,6 +242,7 @@ export async function recommendProjects(payload, { onDone, onError } = {}) {
     });
 
     if (!resp.ok) {
+      if (resp.status === 401) clearAuth();
       const body = await resp.json().catch(() => null);
       clearTimeout(timer);
       if (isCurrent('recommend', controller)) {
@@ -295,6 +303,7 @@ export async function optimizeResume(payload, { onToken, onBullet, onDone, onErr
   clearTimeout(timer);
 
   if (!resp.ok) {
+    if (resp.status === 401) clearAuth();
     const body = await resp.json().catch(() => null);
     if (isCurrent('optimize', controller)) {
       onError?.(formatErrorDetail(body, `HTTP ${resp.status} ${resp.statusText}`));
