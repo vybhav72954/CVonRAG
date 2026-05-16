@@ -253,7 +253,12 @@
     // runs forever and 'Continue to JD' never enables). Reconcile to a
     // definitive state based on whether anything actually parsed.
     if (get(parseStatus) === 'streaming') {
-      parseStatus.set(get(parsedProjects).length > 0 ? 'done' : 'error');
+      if (get(parsedProjects).length > 0) {
+        parseStatus.set('done');
+      } else {
+        parseStatus.set('error');
+        parseError.set('Parse ended without producing any projects. Try uploading again.');
+      }
     }
   }
 
