@@ -590,8 +590,10 @@ class TestFileMagic:
 
     def test_pdf_filename_returns_415_before_magic_check(self, client):
         """A .pdf filename is rejected at the extension gate regardless of what
-        the actual bytes are — even if the file is a perfectly valid PDF
-        (issue #28). Distinct from the H7 magic-mismatch path."""
+        the actual bytes are (issue #28). The fixture deliberately sends
+        DOCX-magic bytes under a .pdf filename — bytes that would *pass* a
+        magic-byte check — proving the extension gate fires earlier than the
+        magic check. Distinct from the H7 magic-mismatch path."""
         resp = client.post(
             "/parse",
             files={"file": ("cv.pdf", _DOCX_MAGIC + b"x" * 200, _PDF_MIME)},
@@ -637,10 +639,15 @@ class TestFileMagic:
         mock.assert_not_called()
 
     def test_magic_check_runs_after_size_check(self, client):
-        """Files that are too small fail with 400 before reaching the magic check."""
+        """Files that are too small fail with 400 before reaching the magic check.
+
+        ``b"PK"`` is only a 2-byte partial DOCX prefix (full magic is the
+        4-byte ``PK\\x03\\x04``), but that's incidental — the 100-byte size
+        floor fires first regardless of whether the magic would have matched.
+        """
         resp = client.post(
             "/parse",
-            files={"file": ("cv.docx", b"PK", _DOCX_MIME)},  # valid magic, too short
+            files={"file": ("cv.docx", b"PK", _DOCX_MIME)},  # partial DOCX prefix, too short
         )
         assert resp.status_code == 400  # not 415
 
