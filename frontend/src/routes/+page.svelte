@@ -284,12 +284,12 @@
   }
 
   const ROLES = [
-    { value: 'ml_engineering',       label: 'ML Engineering' },
-    { value: 'data_science',         label: 'Data Science' },
-    { value: 'software_engineering', label: 'Software Engineering' },
-    { value: 'quant_finance',        label: 'Quant / Finance' },
-    { value: 'product_management',   label: 'Product Management' },
-    { value: 'general',              label: 'General' },
+    { value: 'ml_engineering',          label: 'ML Engineering' },
+    { value: 'data_science',            label: 'Data Scientists' },
+    { value: 'data_science_consultant', label: 'Consultant' },
+    { value: 'quant_finance',           label: 'Quant / Finance' },
+    { value: 'product_management',      label: 'Product Management' },
+    { value: 'general',                 label: 'General' },
   ];
 
   $: groupedBullets = (() => {
