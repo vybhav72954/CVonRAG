@@ -10,7 +10,7 @@ import logging
 from functools import lru_cache
 from typing import Annotated, Literal
 
-from pydantic import Field, model_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -140,6 +140,21 @@ class Settings(BaseSettings):
     google_oauth_client_id: str = ""
     google_oauth_hd: str = ""
     admin_emails: list[str] = []
+
+    @field_validator("admin_emails")
+    @classmethod
+    def _normalise_admin_emails(cls, v: list[str]) -> list[str]:
+        """Lower-case + strip each entry so the comparison in
+        `require_admin` is case-insensitive.
+
+        `user.email` is stored lower-cased (see app/auth.py — the email
+        claim from the ID token is normalised before being trusted as
+        identity). If an operator writes `ADMIN_EMAILS=["Admin@Foo.org"]`
+        in .env, without this validator the membership check silently
+        fails and the admin sees a permanent 403 with no diagnostic.
+        Normalising at config-load time fixes the bug once, not per call.
+        """
+        return [e.strip().lower() for e in v if e and e.strip()]
 
     # Per-user daily cap on /optimize calls. Resets at 00:00 UTC.
     # ge=1 catches a misconfig (MAX_DAILY_OPTIMIZATIONS=0 would make every

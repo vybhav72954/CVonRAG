@@ -18,9 +18,12 @@ function authHeaders() {
   return t ? { Authorization: `Bearer ${t}` } : {};
 }
 
-/** Clear local auth state. Triggered on 401 from any gated endpoint, or
- *  manually by the sign-out button. The Google Identity Services library
- *  handles its own session cookie; we only own the local sessionStorage copy. */
+/** Clear local auth state. Triggered on 401 (bad/expired token) or 403
+ *  (wrong-hd / unverified email) from any gated endpoint, or manually by
+ *  the sign-out button. Both 401 and 403 are unrecoverable for the current
+ *  Google account, so we bounce the user back to the sign-in card to pick
+ *  a different one. Google Identity Services handles its own session cookie;
+ *  we only own the local sessionStorage copy. */
 export function clearAuth() {
   idToken.set('');
   userEmail.set('');
@@ -196,7 +199,7 @@ export async function parseCV(file, { onProgress, onProject, onDone, onError } =
   clearTimeout(timer);
 
   if (!resp.ok) {
-    if (resp.status === 401) clearAuth();
+    if (resp.status === 401 || resp.status === 403) clearAuth();
     const body = await resp.json().catch(() => null);
     if (isCurrent('parse', controller)) {
       onError?.(formatErrorDetail(body, `HTTP ${resp.status} ${resp.statusText}`));
@@ -242,7 +245,7 @@ export async function recommendProjects(payload, { onDone, onError } = {}) {
     });
 
     if (!resp.ok) {
-      if (resp.status === 401) clearAuth();
+      if (resp.status === 401 || resp.status === 403) clearAuth();
       const body = await resp.json().catch(() => null);
       clearTimeout(timer);
       if (isCurrent('recommend', controller)) {
@@ -303,7 +306,7 @@ export async function optimizeResume(payload, { onToken, onBullet, onDone, onErr
   clearTimeout(timer);
 
   if (!resp.ok) {
-    if (resp.status === 401) clearAuth();
+    if (resp.status === 401 || resp.status === 403) clearAuth();
     const body = await resp.json().catch(() => null);
     if (isCurrent('optimize', controller)) {
       onError?.(formatErrorDetail(body, `HTTP ${resp.status} ${resp.statusText}`));

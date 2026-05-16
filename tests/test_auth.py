@@ -249,6 +249,26 @@ class TestAdminUsage:
         resp = client.get("/admin/usage", headers=_auth("alice@example.org"))
         assert resp.status_code == 403
 
+    def test_admin_email_match_is_case_insensitive(self, client, gate_enabled, monkeypatch):
+        """The field_validator on admin_emails lower-cases entries at load
+        time, so an operator who writes `ADMIN_EMAILS=["Admin@Example.org"]`
+        in .env still gets a working allowlist. Locks in the invariant —
+        if someone later strips the normaliser, this test fails before the
+        admin sees a permanent silent 403 in prod.
+
+        Use Settings.model_validate(...) to exercise the validator instead
+        of monkeypatching, since direct setattr bypasses field_validators."""
+        from app.config import Settings
+        s = Settings.model_validate({"admin_emails": ["Admin@Example.org", "  OTHER@example.ORG  "]})
+        assert s.admin_emails == ["admin@example.org", "other@example.org"]
+
+        # End-to-end: a config value with mixed-case entries still matches a
+        # lower-cased identity (which is what the verified email claim
+        # always becomes at app/auth.py).
+        monkeypatch.setattr(settings, "admin_emails", s.admin_emails)
+        resp = client.get("/admin/usage", headers=_auth("admin@example.org"))
+        assert resp.status_code == 200
+
 
 # ── Counter increments ───────────────────────────────────────────────────────
 
