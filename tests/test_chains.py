@@ -15,7 +15,6 @@ Coverage:
   • Groq 429 retry logic (H2)
 """
 
-import asyncio
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 from app.models import (
