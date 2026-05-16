@@ -529,6 +529,21 @@ _SAMPLE_BIODATA_PATH = (
 )
 
 
+@pytest.fixture(scope="class")
+def parsed_sample_biodata():
+    """Parse the shipped sample once per test class.
+
+    Skips (rather than erroring with FileNotFoundError) when the artifact is
+    missing — keeps the rest of the suite triagable when CI fails on a fresh
+    checkout that hasn't pulled LFS / static assets yet.
+    """
+    if not _SAMPLE_BIODATA_PATH.is_file():
+        pytest.skip(f"Sample biodata missing at {_SAMPLE_BIODATA_PATH}")
+    return parse_document_bytes(
+        _SAMPLE_BIODATA_PATH.read_bytes(), "sample-biodata.docx"
+    )
+
+
 class TestSampleBiodata:
     """Guards the static sample shipped at /sample-biodata.docx.
 
@@ -544,10 +559,8 @@ class TestSampleBiodata:
         size = _SAMPLE_BIODATA_PATH.stat().st_size
         assert size < 50_000, f"Sample biodata exceeds 50 KB cap: {size} bytes"
 
-    def test_sample_biodata_parses_cleanly(self):
-        projects = parse_document_bytes(
-            _SAMPLE_BIODATA_PATH.read_bytes(), "sample-biodata.docx"
-        )
+    def test_sample_biodata_parses_cleanly(self, parsed_sample_biodata):
+        projects = parsed_sample_biodata
         assert len(projects) >= 4, (
             f"Sample must parse into ≥4 distinct projects, got {len(projects)}"
         )
@@ -559,15 +572,12 @@ class TestSampleBiodata:
                 f"Project title looks malformed: {p.title!r}"
             )
 
-    def test_sample_exercises_number_preservation_surface(self):
+    def test_sample_exercises_number_preservation_surface(self, parsed_sample_biodata):
         """The sample should hit every numeric format the alchemist must preserve
         verbatim: percentages, decimals, integers (with thousands separators),
         and scientific notation. Guards against accidentally stripping examples
         when editing the sample copy."""
-        projects = parse_document_bytes(
-            _SAMPLE_BIODATA_PATH.read_bytes(), "sample-biodata.docx"
-        )
-        all_text = " ".join(b for p in projects for b in p.bullets)
+        all_text = " ".join(b for p in parsed_sample_biodata for b in p.bullets)
 
         assert re.search(r"\d+(\.\d+)?%", all_text), "no percentage in sample"
         assert re.search(r"\b\d+\.\d+\b", all_text), "no decimal in sample"
@@ -578,14 +588,11 @@ class TestSampleBiodata:
             "no scientific notation in sample"
         )
 
-    def test_sample_carries_at_least_one_known_tool(self):
+    def test_sample_carries_at_least_one_known_tool(self, parsed_sample_biodata):
         """The sample mentions concrete tools so downstream LLM fact extraction
         has something to populate `CoreFact.tools` with. Pure text-only bullets
         would silently degrade the demo."""
-        projects = parse_document_bytes(
-            _SAMPLE_BIODATA_PATH.read_bytes(), "sample-biodata.docx"
-        )
-        all_text = " ".join(b for p in projects for b in p.bullets).lower()
+        all_text = " ".join(b for p in parsed_sample_biodata for b in p.bullets).lower()
         known_tools = ("python", "scikit-learn", "pytorch", "pandas", "numpy", "statsmodels")
         assert any(t in all_text for t in known_tools), (
             f"sample bullets mention none of {known_tools}"

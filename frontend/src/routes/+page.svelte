@@ -1,6 +1,7 @@
 <script>
   import { onMount } from 'svelte';
   import { get } from 'svelte/store';
+  import { base } from '$app/paths';
   import { parseCV, recommendProjects, optimizeResume, checkHealth, abortInFlight } from '$lib/api';
   import {
     step,
@@ -438,7 +439,7 @@
   <!-- Sample biodata download capsule (issue #29 / closes #7) -->
   <a
     class="sample-capsule"
-    href="/sample-biodata.docx"
+    href="{base}/sample-biodata.docx"
     download="sample-biodata.docx"
     aria-label="Download a sample biodata to see the expected format"
   >
