@@ -8,7 +8,7 @@ import httpx
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from app.models import CoreFact, ProjectData, ProjectRecommendation
+from app.models import CoreFact, ProjectData
 from app.recommender import (
     _project_score,
     _top_metrics,

@@ -3,11 +3,21 @@ CVonRAG — main.py
 FastAPI application with async SSE streaming.
 
 Endpoints:
-  POST /optimize   →  SSE stream (tokens + bullets + metadata)
-  POST /parse      →  SSE stream (parse .docx biodata → structured projects + facts)
-  POST /ingest     →  Admin: seed Qdrant with Gold Standard bullets
-  GET  /health     →  Liveness probe
-  GET  /           →  Welcome
+  POST /optimize     → SSE stream (tokens + bullets + metadata)
+  POST /parse        → SSE stream (parse .docx biodata → structured projects + facts)
+  POST /recommend    → JSON: rank projects against the JD
+  POST /ingest       → Admin (CLI script): seed Qdrant with Gold Standard bullets
+  GET  /admin/usage  → Admin (OAuth + ADMIN_EMAILS allowlist): per-user counters
+  GET  /health       → Liveness probe
+  GET  /             → Welcome
+
+Auth surface:
+  • /parse, /recommend, /optimize, /admin/usage gate on
+    `Authorization: Bearer <Google ID token>` via require_user / require_admin.
+  • /ingest keeps `X-Ingest-Secret` (CLI script, no browser → no OAuth).
+  • All three Bearer-gated routes ALSO declare `_rate_limit(...)` ahead of
+    `require_user(...)` in the route signature so a per-IP 429 short-circuits
+    before any token verify or per-user counter mutation.
 """
 
 from __future__ import annotations
@@ -23,15 +33,14 @@ from datetime import UTC, datetime
 from math import ceil
 
 import httpx
-from fastapi import Depends, FastAPI, File, Header, HTTPException, Request, UploadFile, status
+from fastapi import Body, Depends, FastAPI, File, Header, HTTPException, Request, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import select
-from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.auth import check_and_reserve_bullets, require_invite
+from app.auth import check_and_reserve_bullets, require_admin, require_user
 from app.chains import (
     CVonRAGOrchestrator,
     HostedLLMQuotaExhausted,
@@ -39,12 +48,10 @@ from app.chains import (
     close_http,
 )
 from app.config import get_settings
-from app.db import Invite, close_db, get_session, init_db
+from app.db import User, close_db, get_session, init_db
 from app.models import (
     GeneratedBullet,
     HealthResponse,
-    InviteCreate,
-    InviteUsage,
     OptimizationRequest,
     RecommendRequest,
     RecommendResponse,
@@ -52,6 +59,7 @@ from app.models import (
     StreamChunk,
     StreamEventType,
     UsageResponse,
+    UserUsage,
 )
 from app.parser import parse_and_stream
 from app.recommender import recommend_projects as _do_recommend
@@ -143,17 +151,7 @@ _limiter = _RateLimiter()
 
 
 async def _rate_check(request: Request, key: str, max_calls: int) -> None:
-    """
-    Enforce per-IP rate limits for an incoming request and raise an HTTP 429 when the caller is over the limit.
-    
-    Parameters:
-    	request (Request): Incoming request used to identify the caller's IP.
-    	key (str): Namespace or bucket name for rate limiting (e.g., "optimize", "parse").
-    	max_calls (int): Maximum allowed calls within the configured rate-limit window.
-    
-    Raises:
-    	HTTPException: 429 Too Many Requests with a `Retry-After` header indicating how many seconds to wait.
-    """
+    """Enforce per-IP rate limits; raise 429 if the caller is over the limit."""
     ip   = request.client.host if request.client else "unknown"
     wait = await _limiter.check(ip, key, max_calls, settings.rate_limit_window)
     if wait is not None:
@@ -162,6 +160,26 @@ async def _rate_check(request: Request, key: str, max_calls: int) -> None:
             detail=f"Rate limit exceeded. Try again in {ceil(wait)}s.",
             headers={"Retry-After": str(ceil(wait))},
         )
+
+
+def _rate_limit(key: str):
+    """FastAPI dep factory: rate-limit a route by IP before any auth runs.
+
+    MUST be declared BEFORE `require_user` in the route signature so a 429
+    short-circuits before the JWT is verified and the per-user counter is
+    incremented. The previous inline `await _rate_check(...)` in the handler
+    body ran AFTER `require_user`, which left a rate-limited caller with an
+    already-bumped counter row.
+
+    settings.rate_limit_<key> is read at request time (via getattr) so
+    monkeypatched test values take effect without a re-import.
+    """
+    cap_attr = f"rate_limit_{key}"
+
+    async def _dep(request: Request) -> None:
+        await _rate_check(request, key, getattr(settings, cap_attr))
+
+    return _dep
 
 
 # ── Admin secret helper ───────────────────────────────────────────────────────
@@ -192,26 +210,21 @@ def _check_admin_secret(provided: str | None) -> None:
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    """
-    Initialize application resources on startup and clean them up on shutdown.
-    
-    On startup this function checks that the Qdrant collection exists (logs a warning on failure but does not abort startup) and initializes the SQLite invite database (logs and re-raises the exception if invite codes are required by configuration). On shutdown it closes the shared HTTP client used by LLM chains, the vector/Qdrant clients, and the SQLite engine.
-    """
+    """Initialise resources on startup; clean up on shutdown."""
     logger.info("CVonRAG starting — checking Qdrant collection …")
     try:
         await ensure_collection_exists()
         logger.info("Qdrant ready.")
     except Exception as exc:
         logger.warning("Qdrant startup check failed (will retry on first request): %s", exc)
-    # SQLite invite DB — create the table file/schema if missing. Any failure
-    # here aborts startup: even when INVITE_CODES_REQUIRED=false, the admin
-    # endpoints (`/admin/invites`, `/admin/usage`) still depend on the session
-    # factory; letting the app start in a broken state would surface as 500s
-    # on those calls rather than a clean boot failure (B13).
+    # SQLite users DB — create the table file/schema if missing. Any failure
+    # here aborts startup: even when the OAuth gate is in dev-bypass mode,
+    # /admin/usage still depends on the session factory; letting the app
+    # boot in a broken state would surface as 500s rather than a clean fail.
     try:
         await init_db()
     except Exception:
-        logger.exception("Invite DB init failed; aborting startup")
+        logger.exception("Users DB init failed; aborting startup")
         raise
     yield
     # ── Shutdown: close singleton clients ──────────────────────────────
@@ -422,8 +435,9 @@ _DOCX_ONLY_ERROR = (
 )
 async def parse_cv(
     request: Request,
+    _rl: None = Depends(_rate_limit("parse")),
     file: UploadFile = File(...),
-    _invite: Invite | None = Depends(require_invite("parse")),
+    _user: User | None = Depends(require_user("parse")),
 ):
     """
     Stream extraction progress and parsed project data from an uploaded .docx biodata as Server-Sent Events.
@@ -446,7 +460,6 @@ async def parse_cv(
     Returns:
         StreamingResponse: A `text/event-stream` response that emits SSE-formatted `StreamChunk` objects for each event.
     """
-    await _rate_check(request, "parse", settings.rate_limit_parse)
     if not file.filename:
         raise HTTPException(status_code=400, detail="No filename provided.")
 
@@ -510,8 +523,9 @@ async def parse_cv(
 )
 async def recommend(
     request: Request,
-    body: RecommendRequest,
-    _invite: Invite | None = Depends(require_invite("recommend")),
+    _rl: None = Depends(_rate_limit("recommend")),
+    body: RecommendRequest = Body(...),
+    _user: User | None = Depends(require_user("recommend")),
 ):
     """
     Score candidate projects against a job description and return the top recommendations.
@@ -521,7 +535,6 @@ async def recommend(
     Returns:
         RecommendResponse: Contains `recommendations` — a list of scored projects with `recommended` flags and one-line reasoning for each.
     """
-    await _rate_check(request, "recommend", settings.rate_limit_recommend)
     try:
         recs = await _do_recommend(
             projects=body.projects,
@@ -549,8 +562,9 @@ async def recommend(
 )
 async def optimize(
     request: Request,
-    body: OptimizationRequest,
-    invite: Invite | None = Depends(require_invite("optimize")),
+    _rl: None = Depends(_rate_limit("optimize")),
+    body: OptimizationRequest = Body(...),
+    user: User | None = Depends(require_user("optimize")),
     session: AsyncSession = Depends(get_session),
 ):
     """
@@ -566,7 +580,6 @@ async def optimize(
           - `error`: `{ "error_message": "<string>" }` — pipeline or runtime error information.
           - `done`: `{ "data": { "elapsed_seconds": <number> } }` — completion metadata.
     """
-    await _rate_check(request, "optimize", settings.rate_limit_optimize)
     # H3: guard hosted-LLM quota before starting the stream.
     # 429 backoff is handled inside chains.py, but the best defence is not
     # sending 200+ LLM calls in the first place. Applies to whichever hosted
@@ -584,11 +597,11 @@ async def optimize(
                     f"of projects, or set GROQ_MAX_BULLETS_PER_REQUEST higher in .env."
                 ),
             )
-    # Per-invite daily bullet cap. The require_invite dep already counted +1
+    # Per-user daily bullet cap. The require_user dep already counted +1
     # toward optimize_today; this reserves the requested bullets against the
-    # invite's per-day bullet budget before any LLM calls happen.
-    quota_time = invite.last_seen if invite else datetime.now(UTC)
-    await check_and_reserve_bullets(invite, requested, session, quota_time)
+    # user's per-day bullet budget before any LLM calls happen.
+    quota_time = user.last_seen if user else datetime.now(UTC)
+    await check_and_reserve_bullets(user, requested, session, quota_time)
     return StreamingResponse(
         _sse_stream(body),
         media_type="text/event-stream",
@@ -665,67 +678,28 @@ async def ingest(
         )
 
 
-# ── Admin: invite management ──────────────────────────────────────────────────
-
-@app.post("/admin/invites", response_model=InviteUsage, tags=["admin"])
-async def create_invite(
-    body: InviteCreate,
-    x_ingest_secret: str | None = Header(default=None),
-    session: AsyncSession = Depends(get_session),
-):
-    """
-    Create a new invite code; endpoint is protected by the `X-Ingest-Secret` header.
-    
-    Parameters:
-        body (InviteCreate): Invite data including the invite `code` and optional `name`.
-    
-    Returns:
-        InviteUsage: A validated representation of the newly created invite.
-    """
-    _check_admin_secret(x_ingest_secret)
-    invite = Invite(code=body.code, name=body.name)
-    session.add(invite)
-    try:
-        await session.commit()
-    except IntegrityError:
-        await session.rollback()
-        # `from None` suppresses exception chaining — the IntegrityError is
-        # intentional control flow (PRIMARY KEY collision = the 409 case we
-        # explicitly want), not an unexpected error worth showing as the
-        # __cause__ in logs or the response.
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail=f"Invite code '{body.code}' already exists.",
-        ) from None
-    await session.refresh(invite)
-    return InviteUsage.model_validate(invite, from_attributes=True)
-
+# ── Admin: usage readout ──────────────────────────────────────────────────────
+# Self-onboarding via OAuth means there's no /admin/invites — first sign-in
+# from an @<hd> account creates the user row. /admin/usage gates on Google
+# OAuth + ADMIN_EMAILS allowlist (no more X-Ingest-Secret here; that header
+# is reserved for /ingest's CLI script auth).
 
 _USAGE_MAX_LIMIT = 500
 
 
 @app.get("/admin/usage", response_model=UsageResponse, tags=["admin"])
 async def list_usage(
-    x_ingest_secret: str | None = Header(default=None),
+    _admin: User = Depends(require_admin),
     session: AsyncSession = Depends(get_session),
     limit: int = 100,
     offset: int = 0,
 ):
+    """Paginated readout of every authenticated user + their counters.
+
+    Authentication: Authorization: Bearer <id_token> for an email in
+    settings.admin_emails. Non-admin users get 403; unauthenticated requests
+    get 401.
     """
-    Return a paginated list of invite codes with their cumulative and today's usage counts.
-    
-    Parameters:
-        x_ingest_secret (str | None): Value of the `X-Ingest-Secret` header used to authorize admin access (required unless server secret is unset).
-        limit (int): Number of invites to return; must be between 1 and _USAGE_MAX_LIMIT (default 100).
-        offset (int): Number of invites to skip before returning results (default 0).
-    
-    Returns:
-        UsageResponse: An object containing invites ordered by invite code with their usage metrics.
-    
-    Raises:
-        HTTPException: 403 if the provided admin secret is invalid; 422 if `limit` or `offset` are outside allowed ranges.
-    """
-    _check_admin_secret(x_ingest_secret)
     if limit < 1 or limit > _USAGE_MAX_LIMIT:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -738,11 +712,11 @@ async def list_usage(
         )
     rows = (
         await session.scalars(
-            select(Invite).order_by(Invite.code).offset(offset).limit(limit)
+            select(User).order_by(User.email).offset(offset).limit(limit)
         )
     ).all()
     return UsageResponse(
-        invites=[InviteUsage.model_validate(r, from_attributes=True) for r in rows],
+        users=[UserUsage.model_validate(r, from_attributes=True) for r in rows],
     )
 
 

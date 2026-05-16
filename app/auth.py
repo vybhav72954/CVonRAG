@@ -1,52 +1,64 @@
 """
 CVonRAG — auth.py
-Invite-code auth + per-code usage tracking.
+Google Workspace OAuth auth + per-user usage tracking.
 
-One invite code per batchmate. The code IS the identity (no OAuth — see plan).
-The X-Invite-Code request header is required on /parse, /recommend, /optimize.
+One row per OAuth-authenticated user, keyed on the verified `email` claim.
+The Authorization: Bearer <id_token> header is required on /parse, /recommend,
+/optimize. Admin endpoints (/admin/usage) additionally require the user's
+email to appear in settings.admin_emails.
 
-CONCURRENCY MODEL (B2/B3 fix)
-─────────────────────────────
+TOKEN VERIFICATION
+──────────────────
+`_verify_id_token` uses google.oauth2.id_token.verify_oauth2_token, which:
+  • fetches Google's JWKS (cached internally),
+  • verifies the JWT signature,
+  • checks the `aud` claim equals our client_id,
+  • checks `iss` is accounts.google.com / https://accounts.google.com,
+  • checks `exp` has not passed.
+We then check `hd` (hosted domain) and `email_verified` ourselves before
+trusting the email as identity. The verify call is sync and CPU/IO-bound on
+JWKS fetch, so it's wrapped in asyncio.to_thread to keep the event loop free.
+
+CONCURRENCY MODEL
+─────────────────
 All counter updates use atomic conditional UPDATE statements rather than
-SELECT-then-mutate. SQLite serializes write transactions, so two concurrent
+SELECT-then-mutate. SQLite serialises write transactions, so two concurrent
 /optimize calls at `optimize_today = 19` cannot both bump to 20:
 
-    UPDATE invites
+    UPDATE users
        SET optimize_today = optimize_today + 1, ...
-     WHERE code = ?
+     WHERE email = ?
        AND optimize_today < 20
 
 The second request reads 20 inside its own transaction, the WHERE clause is
-false, `rowcount == 0`, and we surface a 429. The naive read-mutate-commit
-pattern had a real race here because two readers could both see 19 before
-either committed; this implementation closes that window.
+false, `rowcount == 0`, and we surface a 429.
 
-PRE-INCREMENT (still)
-─────────────────────
+PRE-INCREMENT
+─────────────
 A failing /optimize still counts toward the daily quota. Otherwise an abusive
-caller could trigger many failures without exhausting their daily budget,
-which is exactly the behavior the cap is meant to prevent.
-
-BULLET RESERVATION
-──────────────────
-`check_and_reserve_bullets` runs AFTER body parsing in /optimize (so the
-caller knows `total_bullets_requested`). Same atomic-UPDATE pattern: a single
-conditional statement either commits the reservation or rejects on cap.
+caller could trigger many failures without exhausting their daily budget.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import UTC, date, datetime, timedelta
 from math import ceil
 from typing import Literal
 
+import cachecontrol
+import requests
 from fastapi import Depends, Header, HTTPException, status
+from google.auth import exceptions as google_auth_exceptions
+from google.auth.transport import requests as google_requests
+from google.oauth2 import id_token
 from sqlalchemy import or_, select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
-from app.db import Invite, get_session
+from app.db import User, get_session
 
 logger = logging.getLogger("cvonrag")
 settings = get_settings()
@@ -55,135 +67,213 @@ EndpointName = Literal["parse", "recommend", "optimize"]
 
 
 def _seconds_until_midnight_utc(ref_dt: datetime | None = None) -> int:
-    """
-    Compute the number of whole seconds until the next 00:00 UTC.
-
-    Parameters:
-        ref_dt (datetime | None): Reference datetime for the calculation; defaults to the current UTC time if not provided.
-
-    Returns:
-        seconds (int): Seconds until the next UTC midnight, rounded up to the next integer and at least 1.
-    """
+    """Whole seconds until the next 00:00 UTC, ≥ 1."""
     now = ref_dt or datetime.now(UTC)
     tomorrow = now + timedelta(days=1)
     tomorrow = tomorrow.replace(hour=0, minute=0, second=0, microsecond=0)
     return max(int(ceil((tomorrow - now).total_seconds())), 1)
 
 
-async def _lazy_reset_daily(session: AsyncSession, code: str, today: date) -> None:
+# ── Google ID token verification ──────────────────────────────────────────────
+
+# Module-level transport handles JWKS fetching with HTTP-level caching.
+# Google's JWKS endpoint returns Cache-Control headers (~6h max-age); without
+# response caching every verify call would re-fetch the certs from Google.
+# A CacheControl-wrapped requests Session honours those headers and keeps
+# JWKS in-memory across verify calls. The bare urllib3 transport we used
+# previously did connection pooling but NOT response caching — auth latency
+# was paying ~10ms of JWKS round-trip per request unnecessarily.
+_google_session = cachecontrol.CacheControl(requests.Session())
+_google_request = google_requests.Request(_google_session)
+
+
+def _verify_id_token_sync(token: str, client_id: str) -> dict:
+    """Sync wrapper around google.oauth2.id_token.verify_oauth2_token.
+
+    Returns the decoded claim payload on success; raises ValueError on any
+    verification failure (bad signature, wrong aud/iss, expired, malformed).
+    Kept as a separate function so tests can patch `_verify_id_token` (the
+    async wrapper below) without having to mock Google's JWKS endpoint.
     """
-    Perform an idempotent UTC-day rollover for an invite's daily counters.
-    
-    If the invite's stored `today_date` is NULL or not equal to `today`, sets `today_date` to `today` and resets `optimize_today` and `bullets_today` to 0. The update is safe to call concurrently and has no effect when the stored date already matches `today`.
+    return id_token.verify_oauth2_token(token, _google_request, audience=client_id)
+
+
+async def _verify_id_token(token: str, client_id: str) -> dict:
+    """Async-friendly wrapper. JWKS fetch + JWT verify is sync, so offload to a thread."""
+    return await asyncio.to_thread(_verify_id_token_sync, token, client_id)
+
+
+# Google's published `iss` values. The library already checks this, but we
+# assert here too so a future libversion change can't silently widen the set.
+_VALID_ISSUERS = {"accounts.google.com", "https://accounts.google.com"}
+
+
+async def _authenticate_bearer(authorization: str | None) -> str:
+    """Verify a Bearer token and return the authenticated email.
+
+    Raises HTTPException 401 on any verification failure. The caller has
+    already short-circuited the dev-bypass case (client_id == ""), so by the
+    time we reach here we are committed to verifying.
     """
+    if not authorization or not authorization.lower().startswith("bearer "):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing or malformed Authorization header (expected 'Bearer <id_token>').",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    token = authorization.split(" ", 1)[1].strip()
+    if not token:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Empty bearer token.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    try:
+        claims = await _verify_id_token(token, settings.google_oauth_client_id)
+    except google_auth_exceptions.TransportError as exc:
+        # JWKS fetch failed (network blip, Google outage, DNS, etc.). Not the
+        # user's fault and not a permanent state — surface as 503 so the
+        # client retries instead of treating it as a bad-credentials 401
+        # (which would also wrongly trigger frontend clearAuth on the next
+        # request).
+        logger.warning("Could not fetch Google JWKS: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Token verification temporarily unavailable.",
+        ) from None
+    except (ValueError, google_auth_exceptions.GoogleAuthError) as exc:
+        # ValueError = bad token (signature, aud, iss, exp, malformed JWT).
+        # GoogleAuthError = remaining non-transport google-auth failures
+        # (MalformedError etc.). Without this catch, those would bubble as
+        # 500 and leak a stack trace.
+        logger.info("ID token verification failed: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or expired ID token.",
+            headers={"WWW-Authenticate": "Bearer"},
+        ) from None
+
+    # Defence-in-depth: verify_oauth2_token already validates iss, but pin it.
+    if claims.get("iss") not in _VALID_ISSUERS:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="ID token issuer is not Google.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    # The hd claim is what restricts sign-in to the institutional Workspace.
+    # An empty configured hd would skip this check — but `_enforce_oauth_consistency`
+    # in config.py refuses to boot when client_id is set and hd is empty, so the
+    # `if` is defence-in-depth against runtime monkeypatching (tests) only.
+    if settings.google_oauth_hd:
+        if claims.get("hd") != settings.google_oauth_hd:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=(
+                    f"Sign-in restricted to the {settings.google_oauth_hd} "
+                    "Google Workspace. Use your institutional account."
+                ),
+            )
+
+    if not claims.get("email_verified"):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Google account email is not verified.",
+        )
+
+    email = (claims.get("email") or "").strip().lower()
+    if not email:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="ID token has no email claim.",
+        )
+    return email
+
+
+async def _upsert_user(session: AsyncSession, email: str) -> None:
+    """Insert a row for `email` if absent; idempotent on repeat calls."""
+    exists = await session.scalar(select(User.email).where(User.email == email))
+    if exists is not None:
+        return
+    session.add(User(email=email))
+    try:
+        await session.commit()
+    except IntegrityError:
+        # Two concurrent first-sign-ins for the same email — the loser sees
+        # PRIMARY KEY collision. Both should succeed (row exists either way).
+        await session.rollback()
+
+
+async def _lazy_reset_daily(session: AsyncSession, email: str, today: date) -> None:
+    """Idempotent UTC-day rollover for a user's daily counters."""
     await session.execute(
-        update(Invite)
+        update(User)
         .where(
-            Invite.code == code,
-            or_(Invite.today_date.is_(None), Invite.today_date != today),
+            User.email == email,
+            or_(User.today_date.is_(None), User.today_date != today),
         )
         .values(today_date=today, optimize_today=0, bullets_today=0)
     )
 
 
-async def _invite_exists(session: AsyncSession, code: str) -> bool:
-    """
-    Check whether an invite with the given code exists.
-    
-    Parameters:
-        code (str): The invite code to look up.
-    
-    Returns:
-        bool: True if an invite row with the code exists, False otherwise.
-    """
-    return (
-        await session.scalar(select(Invite.code).where(Invite.code == code))
-    ) is not None
+def require_user(endpoint: EndpointName):
+    """FastAPI dependency factory: verify ID token + atomically bump counters.
 
-
-def require_invite(endpoint: EndpointName):
-    """
-    Create a FastAPI dependency that enforces invite-code authentication and atomically updates per-endpoint usage counters.
-    
-    This factory returns a dependency callable which:
-    - Validates the `X-Invite-Code` header (raises 401 if missing or unknown when invite codes are required).
-    - Performs an idempotent UTC-midnight rollover of daily counters before updating.
-    - Atomically increments the appropriate per-endpoint counter and `last_seen`; for `endpoint == "optimize"` the update enforces the daily optimize cap and raises 429 with a `Retry-After` header when the cap is reached.
-    - Returns the updated `Invite` row for downstream handlers, or `None` when invite-code checks are disabled by configuration.
-    
-    Parameters:
-        endpoint (EndpointName): Which endpoint the dependency will protect; one of `"parse"`, `"recommend"`, or `"optimize"`.
-    
-    Returns:
-        A FastAPI dependency callable that yields the updated `Invite` row when invite checks are active, or `None` when the invite gate is disabled.
+    On `endpoint == "optimize"` the atomic UPDATE also enforces the daily
+    optimize cap and raises 429 with Retry-After on overage.
+    Returns the updated User row, or None when OAuth is disabled
+    (settings.google_oauth_client_id == "", dev/tests).
     """
 
     async def _dep(
-        x_invite_code: str | None = Header(default=None),
+        authorization: str | None = Header(default=None),
         session: AsyncSession = Depends(get_session),
-    ) -> Invite | None:
-        """
-        Validate and atomically record per-invite usage for the specified endpoint and return the updated Invite row.
-        
-        Parameters:
-            x_invite_code (str | None): Raw value of the `X-Invite-Code` header; leading/trailing whitespace is tolerated and will be stripped.
-            session (AsyncSession): Database session used for atomic updates and reads.
-        
-        Returns:
-            Invite | None: The updated Invite row after the increment, or `None` when invite enforcement is disabled via configuration.
-        
-        Raises:
-            HTTPException: 401 Unauthorized if the header is missing/empty or the invite code does not exist.
-            HTTPException: 429 Too Many Requests if the optimize endpoint has reached its per-code daily cap; response includes a `Retry-After` header indicating seconds until UTC midnight.
-        """
-        if not settings.invite_codes_required:
+    ) -> User | None:
+        # Dev / test bypass: empty client_id means the gate is off.
+        if not settings.google_oauth_client_id:
             return None
 
-        # Strip whitespace defensively (B1) — InviteCreate.code rejects
-        # whitespace at creation, so a stored code never contains it. The
-        # strip here just absorbs copy-paste artifacts on the user side.
-        code = (x_invite_code or "").strip()
-        if not code:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Missing X-Invite-Code header.",
-            )
+        email = await _authenticate_bearer(authorization)
+
+        # First sign-in: create the row before any counter update can target it.
+        await _upsert_user(session, email)
 
         now = datetime.now(UTC)
         today = now.date()
 
         # 1) Reset daily counters if the UTC date rolled over. Idempotent.
-        await _lazy_reset_daily(session, code, today)
+        await _lazy_reset_daily(session, email, today)
 
         # 2) Atomic counter increment, with cap check for /optimize.
         if endpoint == "optimize":
             stmt = (
-                update(Invite)
+                update(User)
                 .where(
-                    Invite.code == code,
-                    Invite.optimize_today < settings.max_daily_optimizations,
+                    User.email == email,
+                    User.optimize_today < settings.max_daily_optimizations,
                 )
                 .values(
-                    optimize_today=Invite.optimize_today + 1,
-                    optimize_count=Invite.optimize_count + 1,
+                    optimize_today=User.optimize_today + 1,
+                    optimize_count=User.optimize_count + 1,
                     last_seen=now,
                 )
             )
         elif endpoint == "parse":
             stmt = (
-                update(Invite)
-                .where(Invite.code == code)
+                update(User)
+                .where(User.email == email)
                 .values(
-                    parse_count=Invite.parse_count + 1,
+                    parse_count=User.parse_count + 1,
                     last_seen=now,
                 )
             )
         else:  # recommend
             stmt = (
-                update(Invite)
-                .where(Invite.code == code)
+                update(User)
+                .where(User.email == email)
                 .values(
-                    recommend_count=Invite.recommend_count + 1,
+                    recommend_count=User.recommend_count + 1,
                     last_seen=now,
                 )
             )
@@ -192,16 +282,8 @@ def require_invite(endpoint: EndpointName):
         await session.commit()
 
         if result.rowcount == 0:
-            # Two possible reasons: code doesn't exist, OR (optimize-only) the
-            # cap was already at the limit. Disambiguate with one extra read.
-            # This read only fires on the rejection path; the happy path is
-            # still one round-trip.
-            if not await _invite_exists(session, code):
-                raise HTTPException(
-                    status_code=status.HTTP_401_UNAUTHORIZED,
-                    detail="Unknown invite code.",
-                )
-            # Code exists → must have been the cap check (only fires for optimize).
+            # User row exists (_upsert_user ensured it), so the only way an
+            # UPDATE returns rowcount==0 is the cap predicate (optimize only).
             raise HTTPException(
                 status_code=status.HTTP_429_TOO_MANY_REQUESTS,
                 detail=(
@@ -212,71 +294,85 @@ def require_invite(endpoint: EndpointName):
                 headers={"Retry-After": str(_seconds_until_midnight_utc(now))},
             )
 
-        # Fetch the updated row for the handler. check_and_reserve_bullets
-        # only reads `invite.code`, but returning the full row keeps the API
-        # surface honest with the type annotation.
-        invite = await session.scalar(select(Invite).where(Invite.code == code))
-        return invite
+        user = await session.scalar(select(User).where(User.email == email))
+        return user
 
     return _dep
 
 
+async def require_admin(
+    user: User | None = Depends(require_user("recommend")),
+) -> User:
+    """Wraps require_user and additionally enforces the ADMIN_EMAILS allowlist.
+
+    The "recommend" endpoint key is a deliberate choice — admin browsing of
+    /admin/usage is a read-only action, so bumping the admin's own
+    `recommend_count` row on each call is honest accounting (the admin is
+    also a user). Using "optimize" would burn an `optimize_today` slot per
+    admin page load, which is wrong; "parse" doesn't fit either (no upload).
+
+    Raises 401 if the dev bypass is active (client_id empty) — admin
+    endpoints must never run unauthenticated, since /admin/usage exposes
+    every signed-in user's counters. Letting a misconfigured prod boot
+    serve them open would be the worst silent failure in the system.
+    """
+    if user is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=(
+                "Admin endpoints require Google OAuth authentication. "
+                "Set GOOGLE_OAUTH_CLIENT_ID in the server environment."
+            ),
+        )
+    if user.email not in settings.admin_emails:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="This account is not authorised for admin endpoints.",
+        )
+    return user
+
+
 async def check_and_reserve_bullets(
-    invite: Invite | None,
+    user: User | None,
     requested: int,
     session: AsyncSession,
     quota_check_time: datetime,
 ) -> None:
+    """Atomically reserve `requested` bullets against the user's per-day cap.
+
+    No-op when user is None (dev bypass) or requested <= 0. Same atomic
+    UPDATE-with-WHERE pattern as require_user: if reserving would exceed the
+    cap, rowcount == 0 and we raise 429.
+
+    No second _lazy_reset_daily here. The require_user("optimize") dep ran
+    moments ago and already reset today_date for THIS request's UTC day.
+    Recomputing today + resetting here would race against a UTC rollover
+    that happens mid-request: dep at 23:59:59 increments optimize_today
+    against day N, then this reset at 00:00:00.001 would see today=N+1 and
+    zero everything — including the increment we just made.
     """
-    Reserve the specified number of bullets from an invite's per-day quota, atomically updating the invite row.
-
-    If `invite` is None or `requested` is less than or equal to 0, the function returns without action. The function performs a UTC-day rollover for the invite's daily counters before attempting an atomic reservation that ensures the per-day bullet cap is not exceeded.
-
-    Parameters:
-        invite (Invite | None): The invite row to charge bullets against; when `None` the function is a no-op.
-        requested (int): Number of bullets to reserve for this request.
-        session (AsyncSession): Database session used for atomic updates and reads.
-        quota_check_time (datetime): The timestamp from the original quota evaluation (captured by require_invite); used to compute consistent Retry-After headers.
-
-    Raises:
-        HTTPException 401: If the invite was removed between the reservation attempt and the follow-up read ("Invite revoked mid-request.").
-        HTTPException 429: If reserving `requested` bullets would exceed the invite's remaining daily bullets. The response includes a `Retry-After` header with seconds until 00:00 UTC and a detail message stating the daily cap and remaining bullets.
-    """
-    if invite is None or requested <= 0:
+    if user is None or requested <= 0:
         return
 
-    code = invite.code
+    email = user.email
 
-    # No second `_lazy_reset_daily` here. The require_invite("optimize") dep
-    # ran moments ago and already reset today_date for THIS request's UTC
-    # day. Recomputing today + resetting here would race against a UTC
-    # rollover that happens mid-request: dep at 23:59:59 increments
-    # optimize_today against day N, then this reset at 00:00:00.001 would
-    # see today=N+1 and zero everything — including the increment we just
-    # made. Trusting the dep keeps both the increment and the reservation
-    # on the same day.
-
-    # Atomic reservation: only commits if bullets_today + requested fits.
     stmt = (
-        update(Invite)
+        update(User)
         .where(
-            Invite.code == code,
-            Invite.bullets_today + requested <= settings.max_daily_bullets,
+            User.email == email,
+            User.bullets_today + requested <= settings.max_daily_bullets,
         )
-        .values(bullets_today=Invite.bullets_today + requested)
+        .values(bullets_today=User.bullets_today + requested)
     )
     result = await session.execute(stmt)
     await session.commit()
 
     if result.rowcount == 0:
-        # Cap would be exceeded (or — vanishingly unlikely — the invite was
-        # revoked between the dep and now). Re-read to compute remaining for
-        # the error message.
-        fresh = await session.scalar(select(Invite).where(Invite.code == code))
+        fresh = await session.scalar(select(User).where(User.email == email))
         if fresh is None:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Invite revoked mid-request.",
+                detail="User row vanished mid-request.",
             )
         remaining = max(settings.max_daily_bullets - fresh.bullets_today, 0)
         raise HTTPException(

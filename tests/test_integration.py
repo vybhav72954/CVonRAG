@@ -6,7 +6,7 @@ No running services needed.
 
 import json
 import pytest
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, patch
 
 from app.models import (
     CoreFact,

@@ -4,7 +4,6 @@ Unit tests for app/parser.py — no live Ollama or file system needed.
 All LLM calls are mocked; document parsing is tested with synthetic bytes.
 """
 
-import io
 import json
 import re
 from pathlib import Path
@@ -18,7 +17,6 @@ from app.parser import (
     _clean_bullet_text,
     _is_label,
     _is_pgdba_template,
-    _is_project_heading,
     _make_slug,
     _strip_fences,
     extract_facts,
