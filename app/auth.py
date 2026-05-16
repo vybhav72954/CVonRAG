@@ -47,9 +47,11 @@ from datetime import UTC, date, datetime, timedelta
 from math import ceil
 from typing import Literal
 
-import urllib3
+import cachecontrol
+import requests
 from fastapi import Depends, Header, HTTPException, status
-from google.auth.transport import urllib3 as google_urllib3
+from google.auth import exceptions as google_auth_exceptions
+from google.auth.transport import requests as google_requests
 from google.oauth2 import id_token
 from sqlalchemy import or_, select, update
 from sqlalchemy.exc import IntegrityError
@@ -74,12 +76,15 @@ def _seconds_until_midnight_utc(ref_dt: datetime | None = None) -> int:
 
 # ── Google ID token verification ──────────────────────────────────────────────
 
-# Module-level transport handles JWKS fetching with internal caching (~6h
-# TTL). Reused across every verify call. urllib3 is preferred over the
-# requests-backed transport because urllib3 is already a transitive
-# dependency (via httpx) — no need to add the heavier `requests` library.
-_google_http = urllib3.PoolManager()
-_google_request = google_urllib3.Request(_google_http)
+# Module-level transport handles JWKS fetching with HTTP-level caching.
+# Google's JWKS endpoint returns Cache-Control headers (~6h max-age); without
+# response caching every verify call would re-fetch the certs from Google.
+# A CacheControl-wrapped requests Session honours those headers and keeps
+# JWKS in-memory across verify calls. The bare urllib3 transport we used
+# previously did connection pooling but NOT response caching — auth latency
+# was paying ~10ms of JWKS round-trip per request unnecessarily.
+_google_session = cachecontrol.CacheControl(requests.Session())
+_google_request = google_requests.Request(_google_session)
 
 
 def _verify_id_token_sync(token: str, client_id: str) -> dict:
@@ -126,9 +131,22 @@ async def _authenticate_bearer(authorization: str | None) -> str:
 
     try:
         claims = await _verify_id_token(token, settings.google_oauth_client_id)
-    except ValueError as exc:
-        # verify_oauth2_token raises ValueError for ANY failure: bad signature,
-        # wrong aud, wrong iss, expired, malformed. Don't leak which one.
+    except google_auth_exceptions.TransportError as exc:
+        # JWKS fetch failed (network blip, Google outage, DNS, etc.). Not the
+        # user's fault and not a permanent state — surface as 503 so the
+        # client retries instead of treating it as a bad-credentials 401
+        # (which would also wrongly trigger frontend clearAuth on the next
+        # request).
+        logger.warning("Could not fetch Google JWKS: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Token verification temporarily unavailable.",
+        ) from None
+    except (ValueError, google_auth_exceptions.GoogleAuthError) as exc:
+        # ValueError = bad token (signature, aud, iss, exp, malformed JWT).
+        # GoogleAuthError = remaining non-transport google-auth failures
+        # (MalformedError etc.). Without this catch, those would bubble as
+        # 500 and leak a stack trace.
         logger.info("ID token verification failed: %s", exc)
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -145,7 +163,9 @@ async def _authenticate_bearer(authorization: str | None) -> str:
         )
 
     # The hd claim is what restricts sign-in to the institutional Workspace.
-    # An empty configured hd (dev only) skips this check.
+    # An empty configured hd would skip this check — but `_enforce_oauth_consistency`
+    # in config.py refuses to boot when client_id is set and hd is empty, so the
+    # `if` is defence-in-depth against runtime monkeypatching (tests) only.
     if settings.google_oauth_hd:
         if claims.get("hd") != settings.google_oauth_hd:
             raise HTTPException(

@@ -21,6 +21,8 @@ dependencies = [
     "sqlalchemy[asyncio]>=2.0",
     "aiosqlite>=0.20",
     "google-auth>=2.35",
+    "requests>=2.32",
+    "cachecontrol>=0.14",
 ]
 
 # Platform-specific dependencies

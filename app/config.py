@@ -211,6 +211,33 @@ class Settings(BaseSettings):
         return self
 
     @model_validator(mode="after")
+    def _enforce_oauth_consistency(self) -> "Settings":
+        """OAuth must be either fully on or fully off. Reject half-configured.
+
+        Three valid states:
+          • `client_id == ""`  → gate disabled (dev/test bypass).
+          • `client_id == "X"` + `hd == "Y"`  → gate fully enforced.
+          • `client_id == "X"` + `hd == ""`   → REJECTED at boot.
+
+        The half-configured state would silently let any Google account sign
+        in (since the hd check is skipped on empty `google_oauth_hd`). That's
+        fail-open behaviour the operator almost certainly didn't intend.
+        Failing fast at boot is safer than waiting until production traffic
+        exposes the gap. Fires regardless of `APP_ENV` because dev
+        environments are also at risk if accidentally exposed.
+        """
+        if self.google_oauth_client_id and not self.google_oauth_hd:
+            msg = (
+                "GOOGLE_OAUTH_CLIENT_ID is set but GOOGLE_OAUTH_HD is empty. "
+                "Half-configured OAuth silently allows any Google account to "
+                "sign in. Set GOOGLE_OAUTH_HD to your institutional Workspace "
+                "domain, or leave both env vars empty to disable the gate."
+            )
+            logging.getLogger("cvonrag").error(msg)
+            raise RuntimeError(msg)
+        return self
+
+    @model_validator(mode="after")
     def _enforce_production_oauth(self) -> "Settings":
         """Fail boot if Google OAuth is misconfigured in production.
 

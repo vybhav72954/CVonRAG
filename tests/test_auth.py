@@ -343,6 +343,74 @@ class TestCounterIncrement:
 
 # ── Daily caps ────────────────────────────────────────────────────────────────
 
+class TestOAuthVerifyErrorHandling:
+    """When _verify_id_token raises non-ValueError exceptions, the route must
+    NOT bubble a 500. TransportError (JWKS fetch failure) gets 503;
+    other GoogleAuthError subclasses get 401 alongside the regular ValueError
+    path."""
+
+    def test_jwks_transport_error_returns_503(self, client, gate_enabled, monkeypatch):
+        from google.auth import exceptions as google_auth_exceptions
+
+        async def _fake(token, client_id):
+            raise google_auth_exceptions.TransportError("simulated JWKS outage")
+        monkeypatch.setattr("app.auth._verify_id_token", _fake)
+
+        resp = client.post(
+            "/recommend", json=RECOMMEND_BODY,
+            headers={"Authorization": "Bearer anything"},
+        )
+        assert resp.status_code == 503
+        assert "temporarily unavailable" in resp.json()["detail"]
+
+    def test_malformed_google_auth_error_returns_401(self, client, gate_enabled, monkeypatch):
+        from google.auth import exceptions as google_auth_exceptions
+
+        async def _fake(token, client_id):
+            raise google_auth_exceptions.MalformedError("bad JWT structure")
+        monkeypatch.setattr("app.auth._verify_id_token", _fake)
+
+        resp = client.post(
+            "/recommend", json=RECOMMEND_BODY,
+            headers={"Authorization": "Bearer anything"},
+        )
+        # GoogleAuthError (non-TransportError) → 401, same as ValueError.
+        assert resp.status_code == 401
+        assert "Invalid or expired" in resp.json()["detail"]
+
+
+class TestSettingsValidators:
+    """Boot-time validators enforce config invariants."""
+
+    def test_half_configured_oauth_refuses_to_boot(self):
+        """`client_id` set + `hd` empty would silently let any Google account
+        sign in. `_enforce_oauth_consistency` rejects this at Settings
+        construction time, regardless of APP_ENV."""
+        from app.config import Settings
+        with pytest.raises(RuntimeError) as excinfo:
+            Settings.model_validate({
+                "google_oauth_client_id": "some-id.apps.googleusercontent.com",
+                "google_oauth_hd": "",
+            })
+        assert "GOOGLE_OAUTH_HD" in str(excinfo.value)
+
+    def test_fully_off_oauth_boots_fine(self):
+        from app.config import Settings
+        s = Settings.model_validate({
+            "google_oauth_client_id": "",
+            "google_oauth_hd": "",
+        })
+        assert s.google_oauth_client_id == ""
+
+    def test_fully_on_oauth_boots_fine(self):
+        from app.config import Settings
+        s = Settings.model_validate({
+            "google_oauth_client_id": "some-id.apps.googleusercontent.com",
+            "google_oauth_hd": "example.org",
+        })
+        assert s.google_oauth_hd == "example.org"
+
+
 class TestRateLimitBeforeAuth:
     """The per-IP rate limiter must run BEFORE require_user — otherwise a
     429'd request still verifies the JWT, upserts the user row, and bumps
