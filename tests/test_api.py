@@ -361,9 +361,13 @@ class TestRateLimit:
             yield ("done", {"total_projects": 0, "total_facts": 0})
 
         from app.main import settings, _limiter
-        # Must be .docx now (issue #28): /parse rejects .pdf with 415 before
-        # the rate-limiter ever sees the request, so a .pdf payload here
-        # would no longer exercise the limiter.
+        # .docx fixture (issue #28): /parse runs _rate_check BEFORE the
+        # docx-only extension gate, so a .pdf payload would still consume
+        # rate-limit slots and the 429 assertion would technically pass.
+        # The reason we switched is semantic: the test mocks parse_and_stream
+        # and expects the first call to reach it (i.e. the happy path); a
+        # .pdf payload would 415 at the extension gate without invoking the
+        # mock, defeating the test's intent.
         _file = ("cv.docx", _DOCX_MAGIC + b"x" * 200, _DOCX_MIME)
         with patch.object(settings, "rate_limit_enabled", True), \
              patch.object(settings, "rate_limit_parse", 1), \
@@ -407,7 +411,8 @@ class TestRateLimit:
             yield ("done", None)
 
         from app.main import settings, _limiter
-        # .docx now (issue #28); see test_parse_429_after_limit_exceeded note.
+        # .docx fixture; see test_parse_429_after_limit_exceeded comment for
+        # why we don't use .pdf here.
         _file = ("cv.docx", _DOCX_MAGIC + b"x" * 200, _DOCX_MIME)
         with patch.object(settings, "rate_limit_enabled", True), \
              patch.object(settings, "rate_limit_parse", 1), \

@@ -118,7 +118,7 @@
     return name.endsWith('.docx');
   }
 
-  function rejectNonDocx(file) {
+  function rejectNonDocx() {
     // Mirror uploadFile()'s success-path reset surface so stale recommendations
     // from a prior cycle don't survive a rejected re-upload and bleed through
     // to step 2/3 if the user proceeds with a different file later.
@@ -134,14 +134,14 @@
     e.preventDefault(); dragOver = false;
     const f = e.dataTransfer?.files?.[0];
     if (!f) return;
-    if (!isDocxLike(f)) { rejectNonDocx(f); return; }
+    if (!isDocxLike(f)) { rejectNonDocx(); return; }
     uploadFile(f);
   }
 
   function onFileChange(e) {
     const f = e.target.files?.[0];
     if (!f) return;
-    if (!isDocxLike(f)) { rejectNonDocx(f); return; }
+    if (!isDocxLike(f)) { rejectNonDocx(); return; }
     uploadFile(f);
   }
 

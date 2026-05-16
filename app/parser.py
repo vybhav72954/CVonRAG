@@ -26,6 +26,7 @@ import logging
 import re
 from collections.abc import AsyncGenerator
 from dataclasses import dataclass, field
+from typing import Literal
 
 from app.chains import _strip_json_fences as _strip_fences
 from app.config import get_settings
@@ -501,7 +502,7 @@ def parse_pdf_bytes(file_bytes: bytes) -> list[RawProject]:
 def parse_document_bytes(
     file_bytes: bytes,
     filename: str,
-    caller: str = "user",
+    caller: Literal["user", "admin"] = "user",
 ) -> list[RawProject]:
     """Route to the correct parser based on file extension.
 
