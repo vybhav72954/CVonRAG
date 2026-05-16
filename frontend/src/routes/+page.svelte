@@ -160,6 +160,23 @@
   }
 
   onMount(() => {
+    // Rehydrate persisted state for users returning after this PR landed:
+    //   • roleType: if the stored value is no longer in ROLES (e.g. legacy
+    //     "software_engineering"), the <select> falls back to its first
+    //     option visually but the store keeps the dead string — Analyse JD
+    //     then 422s. Reset to the default so UI and payload stay in sync.
+    //   • _lastAppliedSample: jdText persists across reload but the in-module
+    //     tracker doesn't, so an auto-filled sample would look user-edited
+    //     on the next role switch and the clobber-guard would wrongly block
+    //     it. Re-match against SAMPLE_JDS to restore the marker.
+    const validRoles = new Set(ROLES.map(r => r.value));
+    if (!validRoles.has(get(roleType))) roleType.set('ml_engineering');
+
+    const currentJD = get(jdText);
+    if (currentJD && Object.values(SAMPLE_JDS).includes(currentJD)) {
+      _lastAppliedSample = currentJD;
+    }
+
     refreshHealth();
     const onVisible = () => { if (document.visibilityState === 'visible') refreshHealth(); };
     document.addEventListener('visibilitychange', onVisible);
@@ -278,13 +295,9 @@
   // the new value, but we read straight from the event target to sidestep
   // any bind/on:change ordering concerns.
   //
-  // Don't clobber a user-edited JD on role switch. We overwrite only when:
-  //   • the textarea is empty (first pick, or user cleared it), OR
-  //   • the current text matches the sample we last applied (user hasn't
-  //     edited it since we filled it).
-  // Tracking _lastAppliedSample is necessary because the persisted jdText
-  // store survives reloads, so we can't just compare against an in-module
-  // "previous sample" — it has to be the actual string we wrote in.
+  // Don't clobber a user-edited JD on role switch. We overwrite only when
+  // the textarea is empty OR its contents match the sample we last applied
+  // (or rehydrated in onMount — see the reload comment there).
   let _lastAppliedSample = '';
 
   function onRoleChange(e) {
