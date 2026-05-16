@@ -499,7 +499,7 @@ class TestParseDocumentBytes:
     def test_unsupported_extension_user_path_raises_docx_only(self):
         """User path: any non-.docx extension gets the docx-only error
         (issue #28). No format-name leakage to the caller."""
-        with pytest.raises(ValueError, match="Only .docx biodata files are supported"):
+        with pytest.raises(ValueError, match=r"Only \.docx biodata files are supported"):
             parse_document_bytes(b"data", "resume.txt")
 
     def test_unsupported_extension_admin_path_raises_generic(self):
@@ -522,7 +522,7 @@ class TestParseDocumentBytes:
         the ValueError message carries the docx-only conversion guidance so
         the API layer can surface it back to the user verbatim."""
         with patch("app.parser.parse_pdf_bytes", return_value=[]) as pdf_mock:
-            with pytest.raises(ValueError, match="Only .docx biodata files are supported"):
+            with pytest.raises(ValueError, match=r"Only \.docx biodata files are supported"):
                 parse_document_bytes(b"x", "file.pdf")
         pdf_mock.assert_not_called()
 

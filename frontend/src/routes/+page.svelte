@@ -119,7 +119,11 @@
   }
 
   function rejectNonDocx(file) {
+    // Mirror uploadFile()'s success-path reset surface so stale recommendations
+    // from a prior cycle don't survive a rejected re-upload and bleed through
+    // to step 2/3 if the user proceeds with a different file later.
     resetParse();
+    resetRecommend();
     parseStatus.set('error');
     parseError.set(DOCX_ONLY_MESSAGE);
     if (fileInput) fileInput.value = '';
