@@ -45,6 +45,17 @@ MINIMAL_REQUEST = {
 _DOCX_MAGIC = b"PK\x03\x04"           # ZIP / OOXML container
 _PDF_MAGIC  = b"%PDF-1.4\n"           # PDF header (any version starts with %PDF)
 
+# MIME types used in upload tests
+_DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+_PDF_MIME  = "application/pdf"
+
+# Exact backend error string for the .docx-only user-upload gate (issue #28).
+# Keep in sync with app.main._DOCX_ONLY_ERROR.
+_DOCX_ONLY_ERROR = (
+    "Only .docx biodata files are supported. "
+    "Please convert your biodata to Word format before uploading."
+)
+
 INGEST_BODY = {
     "bullets": [
         {
@@ -350,7 +361,10 @@ class TestRateLimit:
             yield ("done", {"total_projects": 0, "total_facts": 0})
 
         from app.main import settings, _limiter
-        _file = ("cv.pdf", _PDF_MAGIC + b"x" * 200, "application/pdf")
+        # Must be .docx now (issue #28): /parse rejects .pdf with 415 before
+        # the rate-limiter ever sees the request, so a .pdf payload here
+        # would no longer exercise the limiter.
+        _file = ("cv.docx", _DOCX_MAGIC + b"x" * 200, _DOCX_MIME)
         with patch.object(settings, "rate_limit_enabled", True), \
              patch.object(settings, "rate_limit_parse", 1), \
              patch("app.main.parse_and_stream", side_effect=_mock_stream):
@@ -393,7 +407,8 @@ class TestRateLimit:
             yield ("done", None)
 
         from app.main import settings, _limiter
-        _file = ("cv.pdf", _PDF_MAGIC + b"x" * 200, "application/pdf")
+        # .docx now (issue #28); see test_parse_429_after_limit_exceeded note.
+        _file = ("cv.docx", _DOCX_MAGIC + b"x" * 200, _DOCX_MIME)
         with patch.object(settings, "rate_limit_enabled", True), \
              patch.object(settings, "rate_limit_parse", 1), \
              patch.object(settings, "rate_limit_optimize", 1), \
@@ -518,19 +533,22 @@ class TestParse:
         assert "event: project"  in body
         assert "event: done"     in body
 
-    def test_valid_pdf_streams_sse(self, client):
+    def test_pdf_upload_rejected_with_415(self, client):
+        """User biodata path is .docx-only (issue #28). A genuine .pdf upload —
+        correct extension, correct %PDF magic, well-formed payload — is rejected
+        with 415 before parse_and_stream is ever called. Admin PDF ingestion
+        via scripts/ingest_pdfs.py is unaffected (different code path)."""
         from unittest.mock import patch
 
-        async def _mock_stream(file_bytes, filename):
-            yield ("done", {"total_projects": 0, "total_facts": 0})
-
-        with patch("app.main.parse_and_stream", side_effect=_mock_stream):
+        with patch("app.main.parse_and_stream") as mock_stream:
             resp = client.post(
                 "/parse",
-                files={"file": ("cv.pdf", _PDF_MAGIC + b"x" * 200, "application/pdf")},
+                files={"file": ("cv.pdf", _PDF_MAGIC + b"x" * 200, _PDF_MIME)},
             )
 
-        assert resp.status_code == 200
+        assert resp.status_code == 415
+        assert resp.json()["detail"] == _DOCX_ONLY_ERROR
+        mock_stream.assert_not_called()
 
     def test_parse_error_yields_error_event(self, client):
         from unittest.mock import patch
@@ -548,35 +566,39 @@ class TestParse:
         assert "event: error" in resp.text
 
 
-# ── Magic-byte validation (H7) ────────────────────────────────────────────────
+# ── Magic-byte validation (H7) + docx-only gate (issue #28) ──────────────────
 
 class TestFileMagic:
-    """H7: file-type is verified by magic bytes, not just the filename extension."""
-
-    _DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-    _PDF_MIME  = "application/pdf"
+    """File-type is verified by magic bytes, not just the filename extension (H7),
+    and the user upload path is .docx-only (issue #28)."""
 
     def test_docx_with_pdf_magic_returns_415(self, client):
-        """A .docx file that starts with %PDF bytes is rejected."""
+        """A .docx-named file that starts with %PDF bytes is rejected with the
+        docx-only message — catches a user who renamed a PDF to .docx to try
+        to bypass the extension check."""
         resp = client.post(
             "/parse",
-            files={"file": ("resume.docx", _PDF_MAGIC + b"x" * 200, self._DOCX_MIME)},
+            files={"file": ("resume.docx", _PDF_MAGIC + b"x" * 200, _DOCX_MIME)},
         )
         assert resp.status_code == 415
+        assert resp.json()["detail"] == _DOCX_ONLY_ERROR
 
-    def test_pdf_with_docx_magic_returns_415(self, client):
-        """A .pdf file that starts with PK bytes is rejected."""
+    def test_pdf_filename_returns_415_before_magic_check(self, client):
+        """A .pdf filename is rejected at the extension gate regardless of what
+        the actual bytes are — even if the file is a perfectly valid PDF
+        (issue #28). Distinct from the H7 magic-mismatch path."""
         resp = client.post(
             "/parse",
-            files={"file": ("cv.pdf", _DOCX_MAGIC + b"x" * 200, self._PDF_MIME)},
+            files={"file": ("cv.pdf", _DOCX_MAGIC + b"x" * 200, _PDF_MIME)},
         )
         assert resp.status_code == 415
+        assert resp.json()["detail"] == _DOCX_ONLY_ERROR
 
     def test_renamed_exe_as_docx_returns_415(self, client):
         """A Windows executable (MZ header) renamed to .docx is rejected."""
         resp = client.post(
             "/parse",
-            files={"file": ("cv.docx", b"MZ\x90\x00" + b"x" * 200, self._DOCX_MIME)},
+            files={"file": ("cv.docx", b"MZ\x90\x00" + b"x" * 200, _DOCX_MIME)},
         )
         assert resp.status_code == 415
 
@@ -588,27 +610,32 @@ class TestFileMagic:
         with patch("app.main.parse_and_stream", side_effect=_mock_stream):
             resp = client.post(
                 "/parse",
-                files={"file": ("cv.docx", _DOCX_MAGIC + b"x" * 200, self._DOCX_MIME)},
+                files={"file": ("cv.docx", _DOCX_MAGIC + b"x" * 200, _DOCX_MIME)},
             )
         assert resp.status_code == 200
 
-    def test_valid_pdf_magic_passes_check(self, client):
-        """A .pdf file with correct %PDF magic proceeds past validation."""
+    def test_valid_pdf_rejected_at_user_path(self, client):
+        """A valid PDF (correct extension + %PDF magic) is rejected at /parse
+        with the docx-only message (issue #28). The admin scripts that ingest
+        Gold-CV PDFs use parse_document_bytes(..., caller='admin') and remain
+        unaffected — this guard covers only the user upload route."""
         async def _mock_stream(fb, fn):
             yield ("done", {"total_projects": 0, "total_facts": 0})
 
-        with patch("app.main.parse_and_stream", side_effect=_mock_stream):
+        with patch("app.main.parse_and_stream", side_effect=_mock_stream) as mock:
             resp = client.post(
                 "/parse",
-                files={"file": ("cv.pdf", _PDF_MAGIC + b"x" * 200, self._PDF_MIME)},
+                files={"file": ("cv.pdf", _PDF_MAGIC + b"x" * 200, _PDF_MIME)},
             )
-        assert resp.status_code == 200
+        assert resp.status_code == 415
+        assert resp.json()["detail"] == _DOCX_ONLY_ERROR
+        mock.assert_not_called()
 
     def test_magic_check_runs_after_size_check(self, client):
         """Files that are too small fail with 400 before reaching the magic check."""
         resp = client.post(
             "/parse",
-            files={"file": ("cv.docx", b"PK", self._DOCX_MIME)},  # valid magic, too short
+            files={"file": ("cv.docx", b"PK", _DOCX_MIME)},  # valid magic, too short
         )
         assert resp.status_code == 400  # not 415
 

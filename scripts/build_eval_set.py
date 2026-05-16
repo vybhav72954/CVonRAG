@@ -101,7 +101,7 @@ JD_TEMPLATES = {
 async def build_case(cv_path: Path, case_idx: int) -> dict:
     """Parse one CV, return a skeleton case dict ready for human editing."""
     file_bytes = cv_path.read_bytes()
-    raw_projects = parse_document_bytes(file_bytes, cv_path.name)
+    raw_projects = parse_document_bytes(file_bytes, cv_path.name, caller="admin")
     if not raw_projects:
         raise RuntimeError(f"No projects extracted from {cv_path.name}")
 

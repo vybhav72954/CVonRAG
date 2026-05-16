@@ -496,9 +496,17 @@ class TestPgdbaPath:
 # ─────────────────────────────────────────────────────────────────────────────
 
 class TestParseDocumentBytes:
-    def test_unsupported_extension_raises(self):
-        with pytest.raises(ValueError, match="Unsupported"):
+    def test_unsupported_extension_user_path_raises_docx_only(self):
+        """User path: any non-.docx extension gets the docx-only error
+        (issue #28). No format-name leakage to the caller."""
+        with pytest.raises(ValueError, match="Only .docx biodata files are supported"):
             parse_document_bytes(b"data", "resume.txt")
+
+    def test_unsupported_extension_admin_path_raises_generic(self):
+        """Admin path keeps the original 'Use .docx or .pdf' message so the
+        ingest / eval scripts surface the more permissive contract."""
+        with pytest.raises(ValueError, match="Unsupported"):
+            parse_document_bytes(b"data", "resume.txt", caller="admin")
 
     def test_unsupported_csv_raises(self):
         with pytest.raises(ValueError):
@@ -509,9 +517,21 @@ class TestParseDocumentBytes:
             parse_document_bytes(b"x", "file.docx")
         mock.assert_called_once()
 
-    def test_pdf_routes_to_pdf_parser(self):
+    def test_pdf_rejected_on_user_path(self):
+        """Issue #28: PDFs are not supported on the user upload path. Verify
+        the ValueError message carries the docx-only conversion guidance so
+        the API layer can surface it back to the user verbatim."""
+        with patch("app.parser.parse_pdf_bytes", return_value=[]) as pdf_mock:
+            with pytest.raises(ValueError, match="Only .docx biodata files are supported"):
+                parse_document_bytes(b"x", "file.pdf")
+        pdf_mock.assert_not_called()
+
+    def test_pdf_routes_to_pdf_parser_on_admin_path(self):
+        """Admin / eval callers can still parse PDFs via caller='admin' — the
+        scripts in scripts/ingest_pdfs.py, scripts/build_eval_set.py, and
+        scripts/evaluate.py rely on this path."""
         with patch("app.parser.parse_pdf_bytes", return_value=[]) as mock:
-            parse_document_bytes(b"x", "file.pdf")
+            parse_document_bytes(b"x", "file.pdf", caller="admin")
         mock.assert_called_once()
 
     def test_case_insensitive_extension(self):

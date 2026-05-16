@@ -152,11 +152,12 @@ async function readSSEStream(resp, onEvent, onError) {
 // ── POST /parse — upload CV → SSE project stream ──────────────────────────────
 
 /**
- * Upload a .docx or .pdf and stream parsed project events to the provided callbacks.
+ * Upload a .docx biodata and stream parsed project events to the provided callbacks.
  *
  * Streams Server-Sent Events (SSE) from the /parse endpoint and invokes the matching callback for each event.
+ * PDFs are rejected with HTTP 415 (issue #28) — the user biodata path is .docx-only.
  *
- * @param {File} file - The resume file to upload (expected .docx or .pdf).
+ * @param {File} file - The biodata file to upload (.docx only).
  * @param {{ onProgress?: (data: any) => void, onProject?: (data: any) => void, onDone?: (data: any) => void, onError?: (msg: string) => void }} [callbacks] - Handlers for streamed events:
  *   - onProgress: called with incremental progress updates.
  *   - onProject: called for each parsed project object.
