@@ -1,28 +1,54 @@
+<div align="center">
+
 # CVonRAG
 
-**RAG-powered resume bullet optimizer. 100% local, 100% free.**
+### RAG-powered resume bullet optimizer for the PGDBA placement window
+**IIM Calcutta · IIT Kharagpur · ISI Kolkata**
 
-Upload your biodata, paste a job description, and the AI recommends which of your projects to highlight, then generates 3–5 polished, character-count-validated bullets, grouped by project and ready to paste.
+[![Python](https://img.shields.io/badge/Python-3.12+-3776AB?style=flat-square&logo=python&logoColor=white)](https://python.org)
+[![FastAPI](https://img.shields.io/badge/FastAPI-async-009688?style=flat-square&logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com)
+[![SvelteKit](https://img.shields.io/badge/SvelteKit-2-FF3E00?style=flat-square&logo=svelte&logoColor=white)](https://kit.svelte.dev)
+[![Tailwind](https://img.shields.io/badge/Tailwind-CSS-06B6D4?style=flat-square&logo=tailwindcss&logoColor=white)](https://tailwindcss.com)
+[![Qdrant](https://img.shields.io/badge/Qdrant-vector_db-DC382D?style=flat-square&logo=qdrant&logoColor=white)](https://qdrant.tech)
+[![Groq](https://img.shields.io/badge/Groq-Llama_3.3_70B-F55036?style=flat-square&logo=groq&logoColor=white)](https://groq.com)
+[![Ollama](https://img.shields.io/badge/Ollama-embeddings-000000?style=flat-square&logo=ollama&logoColor=white)](https://ollama.com)
+[![Tests](https://img.shields.io/badge/tests-395_passing-brightgreen?style=flat-square&logo=pytest&logoColor=white)](#tests)
+[![License](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](LICENSE)
+[![Status](https://img.shields.io/badge/status-pre--launch-orange?style=flat-square)](#)
 
-No OpenAI. No Anthropic. No paid APIs. Runs entirely on your machine.
+*Upload a biodata `.docx`. Paste a job description. Get character-validated, JD-aligned bullets — with every number, tool, and outcome preserved verbatim.*
+
+</div>
 
 ---
 
-## What it does
+## Overview
+
+A batchmate uploads a simple biodata `.docx` (project list with brief descriptions — see `docs/Vybhav Chaturvedi_Biodata.docx` for the canonical shape) and pastes a target job description. The system parses their projects, scores each against the JD, retrieves stylistic patterns from a curated Qdrant corpus, and generates polished resume-ready bullets at a target character budget — preserving every number, tool, and outcome from the biodata, while only the sentence structure is borrowed from the Gold Standard exemplars.
 
 ```
-You upload:   your biodata (.docx or .pdf)
-              a job description (pasted in browser)
+You upload:    your biodata (.docx or .pdf)
+               a job description (pasted in browser)
 
-System does:  extracts ALL your projects and facts automatically
-              scores every project against the JD (0–100% match)
-              recommends the best 2–3 with one-line reasoning
-              lets you override the selection
-              generates bullets grouped by project
-              validates each bullet to ±2 characters of your target
+System does:   extracts your projects + facts (tools, metrics, outcome)
+               scores every project against the JD (0–100% match)
+               recommends the best 2–3 with one-line reasoning
+               lets you override the selection
+               generates bullets grouped by project
+               validates each bullet within ±2 chars of your target (best-effort)
 ```
 
-Numbers are preserved exactly. RMSE=0.250 stays 0.250. The style comes from a curated Gold Standard corpus — never the content.
+**The architectural One Rule:** numbers, tools, and outcomes come from your biodata only — never from the Gold Standard corpus. `RMSE=0.250` stays `0.250`. `0.87` is not rewritten as `87%`. See `CLAUDE.md` for the full architectural rationale.
+
+---
+
+## How this repo is used
+
+| Audience | What you do |
+|---|---|
+| **Batchmate (end user)** | Open the deployed Vercel URL, enter your invite code, upload biodata, paste JD. No setup. |
+| **Vybhav (admin)** | Curate Gold CVs, seed Qdrant, deploy via `docs/DEPLOYMENT.md`, issue invite codes. |
+| **Self-hosting (anyone else)** | Clone → local dev per the steps below → adapt `docs/DEPLOYMENT.md` to your hosting choice. |
 
 ---
 
@@ -30,161 +56,110 @@ Numbers are preserved exactly. RMSE=0.250 stays 0.250. The style comes from a cu
 
 | Layer | Tool |
 |---|---|
-| LLM + Embeddings | Ollama + Qwen2.5 + nomic-embed-text |
-| Vector Store | Qdrant |
-| Backend | FastAPI + SSE streaming |
+| LLM (primary) | Groq (Llama 3.3 70B) — Developer paid tier |
+| LLM (fallback) | OpenRouter, switchable via `LLM_PROVIDER` env var |
+| Embeddings | Ollama `nomic-embed-text` (768-dim, self-hosted) |
+| Vector store | Qdrant (local Docker for dev, Qdrant Cloud free tier for prod) |
+| Identity / quotas | SQLite + invite codes + per-user daily caps |
+| Backend | FastAPI + uvicorn (SSE streaming) |
 | Frontend | SvelteKit + Tailwind |
+| Tests | pytest (395 mocked tests, no live services) |
+
+Architecture rationale and trade-offs: `docs/LLM_HOSTING.md`. Pipeline phases: `CLAUDE.md`. Per-file deep dive: `docs/DEVELOPER.md`.
 
 ---
 
-## Prerequisites
+## Local development (every contributor)
+
+Need 4 things running. Once installed, each session is just `docker start qdrant`, `ollama serve`, `uvicorn`, `npm run dev`.
+
+### Prerequisites
 
 | Tool | Version | Install |
 |---|---|---|
 | Python | 3.12+ | [python.org](https://python.org) |
-| uv | latest | `curl -LsSf https://astral.sh/uv/install.sh | sh` |
+| uv | latest | `curl -LsSf https://astral.sh/uv/install.sh \| sh` |
 | Docker | 24+ | [docker.com](https://docker.com) |
 | Ollama | latest | [ollama.com/download](https://ollama.com/download) |
 | Node.js | 20+ | [nodejs.org](https://nodejs.org) |
 
----
-
-## Getting started (admin setup — run once)
-
-These steps are done by whoever runs the server. Users just open the browser.
-
-### 1. Install and configure
+### One-time setup
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/cvonrag.git
-cd cvonrag
-uv venv && source .venv/bin/activate
+git clone https://github.com/vybhav72954/CVonRAG.git
+cd CVonRAG
+uv venv && source .venv/bin/activate     # Windows: .venv\Scripts\activate
 uv pip install -e ".[dev]"
-cp .env.example .env    # defaults work for local dev
-```
+cp .env.example .env
 
-### 2. Start Qdrant
+# Edit .env — set GROQ_API_KEY (required for the hosted LLM path)
 
-```bash
+# Qdrant (Docker)
 docker run -d --name qdrant -p 6333:6333 \
   -v qdrant_storage:/qdrant/storage \
   qdrant/qdrant:v1.12.4
-```
 
-### 3. Pull Ollama models
-
-```bash
+# Embeddings — always required, even with Groq for the LLM
 ollama serve
+ollama pull nomic-embed-text
 
-# Pick based on your RAM:
-ollama pull qwen2.5:14b       # >= 12 GB free RAM
-# ollama pull qwen2.5:7b      # 8-12 GB free RAM
+# Seed Qdrant with the Gold Standard corpus (admin only — see docs/DEVELOPER.md)
+python scripts/ingest_pdfs.py --pdf_dir docs/good_cvs --skip_tag
 
-ollama pull nomic-embed-text   # always — for embeddings
+# Frontend
+cd frontend && npm install
 ```
 
-**Low VRAM?** See [DEVELOPER.md §B](DEVELOPER.md#section-b--kaggle-h100-inference-recommended-for-low-vram) — run inference on a free Kaggle H100 instead.
-
-### 4. Seed the style corpus (once)
-
-The system needs a collection of Gold Standard CVs to learn bullet style from. These are your curated CVs — users never upload or access them. They teach the system sentence structure and style patterns only; user content is never drawn from them.
+### Each session
 
 ```bash
-mkdir ~/good_cvs
-# place 5–20 good CV PDFs here (IIT/IIM placement CVs, strong peers' CVs, etc.)
-
-python scripts/ingest_pdfs.py --pdf_dir ~/good_cvs --dry_run   # preview
-python scripts/ingest_pdfs.py --pdf_dir ~/good_cvs             # seed
+docker start qdrant
+ollama serve
+uvicorn app.main:app --reload --port 8000     # backend on :8000
+cd frontend && npm run dev                    # frontend on :5173
 ```
 
-Verify: `curl http://localhost:8000/health` → `"vector_count"` should be > 0. Do this once.
+Health check:
+```bash
+curl http://localhost:8000/health
+# Expect: status=ok, vector_count>=288, llm_ok=true, embed_ok=true
+```
 
-### 5. Start the backend and frontend
+---
+
+## Tests
 
 ```bash
-# Backend:
-uvicorn app.main:app --reload --port 8000
-
-# Frontend (in another terminal):
-cd frontend && npm install && npm run dev
-# -> http://localhost:5173
+pytest                                         # 395 mocked tests, ~13s, no live services
+pytest -x                                      # stop on first failure
+pytest --cov=app --cov-report=term-missing     # with coverage
+pytest --collect-only -q | tail -1             # verify current count
 ```
 
----
-
-## User flow (what batchmates see)
-
-Users visit `http://localhost:5173` and:
-
-**Screen 1 — Upload CV**
-Drag and drop a `.docx` biodata or `.pdf`. All projects are extracted automatically. Metrics are highlighted in amber — they're preserved exactly. Editing facts is optional and non-blocking.
-
-**Screen 2 — Paste JD → AI Recommendation**
-Paste the full job description, click "Analyse JD". The system scores every project against the JD and shows:
-- A ranked list with match percentage and one-line reasoning per project
-- The top 2–3 pre-selected, rest shown as "also available"
-- A toggle to override the selection
-
-Then click "Generate Bullets".
-
-**Screen 3 — Results**
-Bullets stream live, grouped by project. Each bullet shows:
-- Character count and ±2 tolerance badge
-- Number of iterations taken to hit the target
-- Individual Copy button
-- Copy All at the top
+Test count is current as of the Eleventh-pass; verify with the last command if reading this in the future.
 
 ---
 
-## Running the tests
+## Deployment
 
-```bash
-pytest        # 243 tests, no live services needed, ~9 seconds
-```
+For the production deploy (Groq Developer + Qdrant Cloud + Railway + Vercel, ~$5–10/mo for the placement window): **see [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md)** for the step-by-step runbook.
 
----
-
-## Architecture: the 5-phase pipeline
-
-```
-POST /parse
-  -> parser.py extracts projects + facts via LLM (SSE stream)
-
-POST /recommend
-  -> recommender.py scores projects vs JD
-  -> returns ranked list with match % and reasons
-
-POST /optimize
-  Phase 1: OptimizationRequest validated
-  Phase 2: SemanticMatcher — JD analysis + fact scoring
-  Phase 3: Qdrant — retrieve style exemplars (top-K by embedding similarity)
-  Phase 4: BulletAlchemist — generate + ±2 char-limit loop (up to 4 iterations)
-  Phase 5: SSE stream — tokens + bullets + metadata -> browser
-```
-
-**Content/style firewall:** CoreFacts (your numbers, tools, outcomes) are immutable. StyleExemplars (from Qdrant) provide sentence patterns only. The two never mix.
+Architectural decisions and trade-offs: [`docs/LLM_HOSTING.md`](docs/LLM_HOSTING.md).
+End-to-end test runbook: [`docs/flow.md`](docs/flow.md).
 
 ---
 
-## Low VRAM / best quality: Kaggle H100
+## Documentation map
 
-If Ollama is slow or in low-VRAM mode, run the heavy inference on Kaggle's free H100 instead. Qwen2.5-72B in 4-bit quantisation gives noticeably better bullet quality than local 14b.
-
-See [DEVELOPER.md §B](DEVELOPER.md#section-b--kaggle-h100-inference-recommended-for-low-vram) for step-by-step.
-
----
-
-## Troubleshooting
-
-**`ollama_ok: false` in `/health`** → run `ollama serve` and `ollama pull qwen2.5:14b`
-
-**`vector_count: 0`** → seed Qdrant: `python scripts/ingest_pdfs.py --pdf_dir ~/good_cvs`
-
-**Bullets outside ±2** → add `CHAR_LOOP_MAX_ITERATIONS=6` to `.env`
-
-**Frontend network error** → check `frontend/.env` has `VITE_API_URL=http://localhost:8000`
-
-Full troubleshooting: [DEVELOPER.md](docs/DEVELOPER.md#section-h--troubleshooting)
+| File | Purpose |
+|---|---|
+| `README.md` (this file) | Project overview + local dev quickstart |
+| `CLAUDE.md` (root) | Canonical architectural reference — read before editing any code |
+| `docs/DEVELOPER.md` | Comprehensive operator guide (setup, troubleshooting, eval cycle) |
+| `docs/DEPLOYMENT.md` | Step-by-step production deployment runbook |
+| `docs/LLM_HOSTING.md` | Why Groq + Ollama embeddings; provider switch mechanics |
+| `docs/flow.md` | Placement-day end-to-end test + admin runbook |
+| `docs/AUDIT_HISTORY.md` | Full per-pass audit history (passes 1–10 archived) |
 
 ---
 
