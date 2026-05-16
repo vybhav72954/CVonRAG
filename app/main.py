@@ -3,11 +3,21 @@ CVonRAG — main.py
 FastAPI application with async SSE streaming.
 
 Endpoints:
-  POST /optimize   →  SSE stream (tokens + bullets + metadata)
-  POST /parse      →  SSE stream (parse docx/pdf → structured projects + facts)
-  POST /ingest     →  Admin: seed Qdrant with Gold Standard bullets
-  GET  /health     →  Liveness probe
-  GET  /           →  Welcome
+  POST /optimize     → SSE stream (tokens + bullets + metadata)
+  POST /parse        → SSE stream (parse docx/pdf → structured projects + facts)
+  POST /recommend    → JSON: rank projects against the JD
+  POST /ingest       → Admin (CLI script): seed Qdrant with Gold Standard bullets
+  GET  /admin/usage  → Admin (OAuth + ADMIN_EMAILS allowlist): per-user counters
+  GET  /health       → Liveness probe
+  GET  /             → Welcome
+
+Auth surface:
+  • /parse, /recommend, /optimize, /admin/usage gate on
+    `Authorization: Bearer <Google ID token>` via require_user / require_admin.
+  • /ingest keeps `X-Ingest-Secret` (CLI script, no browser → no OAuth).
+  • All three Bearer-gated routes ALSO declare `_rate_limit(...)` ahead of
+    `require_user(...)` in the route signature so a per-IP 429 short-circuits
+    before any token verify or per-user counter mutation.
 """
 
 from __future__ import annotations

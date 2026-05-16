@@ -286,14 +286,15 @@ async def require_admin(
     """Wraps require_user and additionally enforces the ADMIN_EMAILS allowlist.
 
     The "recommend" endpoint key is a deliberate choice — admin browsing of
-    /admin/usage is a read-only action, so charging it against the cheap
-    recommend counter rather than the gated optimize counter keeps the
-    rate-limit math honest. (It still increments recommend_count for the
-    admin's own row, which is correct: the admin is also a user.)
+    /admin/usage is a read-only action, so bumping the admin's own
+    `recommend_count` row on each call is honest accounting (the admin is
+    also a user). Using "optimize" would burn an `optimize_today` slot per
+    admin page load, which is wrong; "parse" doesn't fit either (no upload).
 
     Raises 401 if the dev bypass is active (client_id empty) — admin
-    endpoints must never run unauthenticated; allowing them to would be a
-    silent prod misconfig of the worst kind.
+    endpoints must never run unauthenticated, since /admin/usage exposes
+    every signed-in user's counters. Letting a misconfigured prod boot
+    serve them open would be the worst silent failure in the system.
     """
     if user is None:
         raise HTTPException(
