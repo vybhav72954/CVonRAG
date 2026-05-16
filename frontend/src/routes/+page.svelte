@@ -3,6 +3,7 @@
   import { get } from 'svelte/store';
   import { base } from '$app/paths';
   import { parseCV, recommendProjects, optimizeResume, checkHealth, abortInFlight, clearAuth } from '$lib/api';
+  import { SAMPLE_JDS } from '$lib/sampleJDs';
   import {
     step,
     idToken, userEmail,
@@ -159,6 +160,23 @@
   }
 
   onMount(() => {
+    // Rehydrate persisted state for users returning after this PR landed:
+    //   • roleType: if the stored value is no longer in ROLES (e.g. legacy
+    //     "software_engineering"), the <select> falls back to its first
+    //     option visually but the store keeps the dead string — Analyse JD
+    //     then 422s. Reset to the default so UI and payload stay in sync.
+    //   • _lastAppliedSample: jdText persists across reload but the in-module
+    //     tracker doesn't, so an auto-filled sample would look user-edited
+    //     on the next role switch and the clobber-guard would wrongly block
+    //     it. Re-match against SAMPLE_JDS to restore the marker.
+    const validRoles = new Set(ROLES.map(r => r.value));
+    if (!validRoles.has(get(roleType))) roleType.set('ml_engineering');
+
+    const currentJD = get(jdText);
+    if (currentJD && Object.values(SAMPLE_JDS).includes(currentJD)) {
+      _lastAppliedSample = currentJD;
+    }
+
     refreshHealth();
     const onVisible = () => { if (document.visibilityState === 'visible') refreshHealth(); };
     document.addEventListener('visibilitychange', onVisible);
@@ -270,6 +288,27 @@
   }
 
   // ── Step 2: JD → Recommend → Generate ────────────────────────────────────
+  // Prefill the JD textarea with a role-targeted sample whenever the user
+  // picks a new role (issue #30). "general" is intentionally absent from
+  // SAMPLE_JDS so picking it is a no-op — preserves any custom JD the user
+  // may already have typed. Bind already runs first, so $roleType reflects
+  // the new value, but we read straight from the event target to sidestep
+  // any bind/on:change ordering concerns.
+  //
+  // Don't clobber a user-edited JD on role switch. We overwrite only when
+  // the textarea is empty OR its contents match the sample we last applied
+  // (or rehydrated in onMount — see the reload comment there).
+  let _lastAppliedSample = '';
+
+  function onRoleChange(e) {
+    const sample = SAMPLE_JDS[e.target.value];
+    if (!sample) return;
+    const current = get(jdText);
+    if (current && current !== _lastAppliedSample) return;  // user-edited, preserve
+    jdText.set(sample);
+    _lastAppliedSample = sample;
+  }
+
   async function analyseJD() {
     if ($jdText.length < 50) return;
     resetRecommend();
@@ -360,12 +399,12 @@
   }
 
   const ROLES = [
-    { value: 'ml_engineering',       label: 'ML Engineering' },
-    { value: 'data_science',         label: 'Data Science' },
-    { value: 'software_engineering', label: 'Software Engineering' },
-    { value: 'quant_finance',        label: 'Quant / Finance' },
-    { value: 'product_management',   label: 'Product Management' },
-    { value: 'general',              label: 'General' },
+    { value: 'ml_engineering',     label: 'ML Engineering' },
+    { value: 'data_science',       label: 'Data Science' },
+    { value: 'data_engineering',   label: 'Data Engineering' },
+    { value: 'quant_finance',      label: 'Quant / Finance' },
+    { value: 'product_management', label: 'Product Management' },
+    { value: 'general',            label: 'General' },
   ];
 
   $: groupedBullets = (() => {
@@ -719,7 +758,7 @@
     <div class="settings-grid">
       <div>
         <label for="role-select" class="field-label">Role type</label>
-        <select id="role-select" bind:value={$roleType} class="field" style="font-size:0.75rem">
+        <select id="role-select" bind:value={$roleType} on:change={onRoleChange} class="field" style="font-size:0.75rem">
           {#each ROLES as r}<option value={r.value}>{r.label}</option>{/each}
         </select>
       </div>

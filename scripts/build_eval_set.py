@@ -63,7 +63,7 @@ logger = logging.getLogger("cvonrag.build_eval_set")
 ROLE_ROTATION = [
     "data_science",
     "ml_engineering",
-    "software_engineering",
+    "data_engineering",
     "quant_finance",
     "product_management",
 ]
@@ -80,10 +80,11 @@ JD_TEMPLATES = {
         "models. Stack: PyTorch, FastAPI, Docker, Kubernetes. Experience with "
         "model serving, monitoring, and CI/CD for ML systems."
     ),
-    "software_engineering": (
-        "[EDIT ME] We are hiring a Backend Engineer for a high-throughput trading "
-        "system. Stack: Python, PostgreSQL, Redis, async I/O. Strong systems "
-        "fundamentals and a track record shipping production services."
+    "data_engineering": (
+        "[EDIT ME] We are hiring a Data Engineer to design and maintain "
+        "production data pipelines on a cloud data warehouse. Stack: Python, "
+        "PySpark, Airflow, Snowflake/Databricks, AWS or GCP. Strong SQL and "
+        "infrastructure-as-code experience required."
     ),
     "quant_finance": (
         "[EDIT ME] We are hiring a Quantitative Researcher to develop alpha "

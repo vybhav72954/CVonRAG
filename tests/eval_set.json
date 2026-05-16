@@ -1,6 +1,6 @@
 [
   {
-    "_comment": "Stub eval set documenting the schema. Run `python scripts/build_eval_set.py` to auto-populate from docs/good_cvs/, then hand-edit JDs + correct_projects. NOTE: docs/good_cvs/ CVs are also seeded into Qdrant — Phase 3 retrieval has data leakage on those; use held-out CVs for an honest number. Fields: case_id (str, unique), cv_path (str, repo-relative), jd_text (str, ≥50 chars), target_role_type (one of data_science|ml_engineering|software_engineering|product_management|quant_finance|general), target_char_limit (int, 60–300), max_bullets (int, optional, default 4), correct_projects (list[str], case-insensitive substring matched against parsed project titles), _parsed_project_titles (list[str], optional reference)."
+    "_comment": "Stub eval set documenting the schema. Run `python scripts/build_eval_set.py` to auto-populate from docs/good_cvs/, then hand-edit JDs + correct_projects. NOTE: docs/good_cvs/ CVs are also seeded into Qdrant — Phase 3 retrieval has data leakage on those; use held-out CVs for an honest number. Fields: case_id (str, unique), cv_path (str, repo-relative), jd_text (str, ≥50 chars), target_role_type (one of data_science|ml_engineering|data_engineering|product_management|quant_finance|general), target_char_limit (int, 60–300), max_bullets (int, optional, default 4), correct_projects (list[str], case-insensitive substring matched against parsed project titles), _parsed_project_titles (list[str], optional reference)."
   },
   {
     "case_id": "example-01-data_science",

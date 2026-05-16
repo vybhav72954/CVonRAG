@@ -206,6 +206,14 @@ html {
     box-shadow: 0 0 0 3px var(--accent-dim), 0 0 30px rgba(124, 58, 237, 0.08);
     background: rgba(255,255,255,0.05);
   }
+  /* Browser-native <option> elements ignore the parent <select>'s color/bg in
+     most browsers (the dropdown menu is rendered by the OS, not CSS). Without
+     this rule, options appear as near-white text on the OS-default light
+     background and are invisible until hovered (Chrome/Edge on Windows). */
+  .field option {
+    background-color: var(--surface-solid);
+    color: var(--text);
+  }
 
   /* ── Chips / Badges ────────────────────────────────────────────────── */
   .chip {

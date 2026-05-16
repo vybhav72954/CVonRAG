@@ -18,12 +18,12 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 # ── Enums ─────────────────────────────────────────────────────────────────────
 
 class RoleType(StrEnum):
-    SOFTWARE_ENGINEERING = "software_engineering"
-    DATA_SCIENCE         = "data_science"
-    ML_ENGINEERING       = "ml_engineering"
-    PRODUCT_MANAGEMENT   = "product_management"
-    QUANT_FINANCE        = "quant_finance"
-    GENERAL              = "general"
+    DATA_ENGINEERING   = "data_engineering"
+    DATA_SCIENCE       = "data_science"
+    ML_ENGINEERING     = "ml_engineering"
+    PRODUCT_MANAGEMENT = "product_management"
+    QUANT_FINANCE      = "quant_finance"
+    GENERAL            = "general"
 
 
 class JDTone(StrEnum):
