@@ -2,10 +2,10 @@
   import { onMount } from 'svelte';
   import { get } from 'svelte/store';
   import { base } from '$app/paths';
-  import { parseCV, recommendProjects, optimizeResume, checkHealth, abortInFlight } from '$lib/api';
+  import { parseCV, recommendProjects, optimizeResume, checkHealth, abortInFlight, clearAuth } from '$lib/api';
   import {
     step,
-    inviteCode,
+    idToken, userEmail,
     parsedProjects, parseStatus, parseProgress, parseError, parseWarnings, resetParse,
     jdText, roleType, charLimit, maxBullets, topK,
     recommendations, recommendStatus, recommendError, selectedIds, resetRecommend,
@@ -13,37 +13,110 @@
     isUploading, isRecommending, isGenerating,
   } from '$lib/stores';
 
-  // ── Invite-code entry ────────────────────────────────────────────────────
-  // Admin issues one code per batchmate. Until the user enters one, all
-  // backend calls would 401 — so step 1 hides its upload UI behind the
-  // entry card below. The code is sessionStorage-persisted via the store.
-  let inviteInput = '';
+  // ── Google Sign-In ───────────────────────────────────────────────────────
+  // Until the user signs in, every gated backend call would 401 — so step 1
+  // hides its upload UI behind the sign-in card below. The Google ID token
+  // (1-hour expiry) is sessionStorage-persisted via the idToken store; on
+  // expiry the backend returns 401 and api.js's clearAuth() flips us back
+  // to this card.
 
-  // Mirror the backend's InviteCreate.code pattern so the user gets instant,
-  // actionable feedback instead of a confusing 401 "Unknown invite code".
-  const INVITE_CODE_PATTERN = /^[A-Za-z0-9_-]{3,64}$/;
+  const GOOGLE_CLIENT_ID = import.meta.env.VITE_GOOGLE_OAUTH_CLIENT_ID ?? '';
+  const GOOGLE_HD        = import.meta.env.VITE_GOOGLE_OAUTH_HD ?? '';
+  let gsiButtonRef;       // DOM target for renderButton
+  let gsiError = '';      // surfaced when the GIS library can't load / init
 
-  function saveInviteCode() {
-    const v = inviteInput.trim();
-    if (INVITE_CODE_PATTERN.test(v)) {
-      inviteCode.set(v);
-      inviteInput = '';
+  /** Decode the JWT payload client-side. Used ONLY to extract `email` for
+   *  display in the header chip — the backend re-verifies the signature on
+   *  every request, so this is not a trust boundary. */
+  function _decodeEmail(jwt) {
+    try {
+      const payload = jwt.split('.')[1];
+      // base64url → base64
+      const b64 = payload.replace(/-/g, '+').replace(/_/g, '/');
+      const json = atob(b64.padEnd(b64.length + ((4 - b64.length % 4) % 4), '='));
+      return JSON.parse(json).email ?? '';
+    } catch {
+      return '';
     }
   }
 
-  function changeInviteCode() {
+  function handleCredentialResponse(response) {
+    const token = response?.credential ?? '';
+    if (!token) {
+      gsiError = 'Sign-in failed: no credential returned.';
+      return;
+    }
+    idToken.set(token);
+    userEmail.set(_decodeEmail(token));
+    gsiError = '';
+  }
+
+  /** Wait for the GIS script (loaded async in app.html) to be ready, then
+   *  initialize and render the sign-in button. Two-tier wait:
+   *    1. Fast poll (30 × 100ms = 3s) — covers the common case where the
+   *       script is already loaded by the time the gate card mounts.
+   *    2. Slower poll (30 × 1s = 30s) — flaky-network fallback. The async
+   *       defer script tag can take noticeably longer to load on slow home
+   *       connections, and giving up after 3s strands the user with an
+   *       error they can't recover from without a page refresh.
+   *  gsiError is only set after the full 33s budget is exhausted, and is
+   *  cleared on a successful retry so a transient slow load doesn't leave
+   *  a stale message visible after the button renders. */
+  async function initGoogleSignIn() {
+    if (!GOOGLE_CLIENT_ID) {
+      gsiError = 'VITE_GOOGLE_OAUTH_CLIENT_ID is not set — sign-in disabled.';
+      return;
+    }
+    // Tier 1: fast poll.
+    for (let i = 0; i < 30; i++) {  // up to ~3s
+      if (window.google?.accounts?.id) break;
+      await new Promise(r => setTimeout(r, 100));
+    }
+    // Tier 2: slower poll for flaky networks.
+    for (let i = 0; i < 30 && !window.google?.accounts?.id; i++) {  // up to +30s
+      await new Promise(r => setTimeout(r, 1000));
+    }
+    if (!window.google?.accounts?.id) {
+      gsiError = 'Google sign-in library failed to load after 30s. Check your network connection or browser settings, then refresh.';
+      return;
+    }
+    gsiError = '';  // clear any stale slow-load message before we render
+    try {
+      window.google.accounts.id.initialize({
+        client_id: GOOGLE_CLIENT_ID,
+        callback: handleCredentialResponse,
+        // hd is a UX hint — restricts the account picker. Server-side hd
+        // claim verification in app/auth.py is the enforcement.
+        hd: GOOGLE_HD || undefined,
+        auto_select: false,
+        ux_mode: 'popup',
+        context: 'signin',
+      });
+      if (gsiButtonRef) {
+        window.google.accounts.id.renderButton(gsiButtonRef, {
+          theme: 'filled_black',
+          size: 'large',
+          type: 'standard',
+          text: 'signin_with',
+          shape: 'pill',
+          logo_alignment: 'left',
+        });
+      }
+    } catch (err) {
+      gsiError = `Sign-in init failed: ${err.message ?? err}`;
+    }
+  }
+
+  function signOut() {
     // Abort any in-flight gated requests first — otherwise an /optimize
-    // stream started under the old code keeps burning the old code's quota
-    // and mutates stores after the user is effectively signed out.
+    // stream started under the old token keeps burning quota and mutates
+    // stores after the user is effectively signed out.
     abortInFlight('parse');
     abortInFlight('recommend');
     abortInFlight('optimize');
-    // Reset the transient status flags. abortInFlight cancels the fetch
-    // silently, so no onDone/onError fires and stores like genStatus stay
-    // stuck at "streaming". Without this the UI would still show
-    // "Generating…" or a stale error banner after the user enters a new code.
-    // Persisted state (parsedProjects, bullets, jdText, …) deliberately
-    // survives — if the user re-enters a valid code they can keep working.
+    // Reset transient status flags so a stale "streaming…" banner doesn't
+    // linger after sign-out. Persisted state (parsedProjects, bullets, …)
+    // deliberately survives — if the user signs back in, they can keep working.
     parseStatus.set('idle');
     parseProgress.set('');
     parseError.set('');
@@ -53,9 +126,7 @@
     genStatus.set('idle');
     tokenBuffer.set('');
     genError.set('');
-    // Wipe the code and bounce the user back to step 1 — the gate will then
-    // show the entry card again.
-    inviteCode.set('');
+    clearAuth();
     step.set(1);
   }
 
@@ -99,6 +170,11 @@
       window.removeEventListener('beforeunload', onBeforeUnload);
     };
   });
+
+  // Re-init the Google sign-in button whenever the gate is open AND the
+  // button slot mounts. The `gsiButtonRef` reactive trigger fires on first
+  // mount and after sign-out (when the card re-renders).
+  $: if (gsiButtonRef && !$idToken) initGoogleSignIn();
 
   // ── Step 1: Upload & Parse ────────────────────────────────────────────────
   let dragOver  = false;
@@ -317,62 +393,48 @@
 </div>
 {/if}
 
-<!-- ── Invite-code chip (visible on every step once a code is set) ────────── -->
-{#if $inviteCode}
-<div class="invite-chip" aria-label="Active invite code">
+<!-- ── Signed-in chip (visible on every step once signed in) ────────────── -->
+{#if $idToken}
+<div class="invite-chip" aria-label="Signed-in account">
   <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-    <path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"/>
+    <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/>
+    <circle cx="12" cy="7" r="4"/>
   </svg>
-  <span class="mono">Code: <strong>{$inviteCode}</strong></span>
-  <button class="invite-change" type="button" on:click={changeInviteCode}>change</button>
+  <span class="mono">Signed in: <strong>{$userEmail || '…'}</strong></span>
+  <button class="invite-change" type="button" on:click={signOut}>sign out</button>
 </div>
 {/if}
 
 <!-- ═══════════════════════════════════════════════════════════════════════════
-     INVITE GATE: shown when no code is set. Hides the rest of the wizard
-     until the user enters their batchmate-specific code.
+     SIGN-IN GATE: shown when no Google ID token is held. Hides the rest of
+     the wizard until the user signs in with their institutional account.
      ═══════════════════════════════════════════════════════════════════════ -->
-{#if !$inviteCode}
+{#if !$idToken}
 <div class="fade-in step-container">
-  <div class="hero-section">
+  <div class="hero-section" style="align-items:center;text-align:center">
     <div class="hero-badge">
       <div class="badge-dot"></div>
       <span>Sign in</span>
     </div>
-    <h1 class="hero-title">Enter your <span class="gradient-text">invite code</span></h1>
+    <h1 class="hero-title">Sign in with your <span class="gradient-text">institutional Google account</span></h1>
     <p class="hero-subtitle">
-      CVonRAG is invite-only for the PGDBA batch. Vybhav has shared a unique
-      code with you — paste it below to access the optimizer. Your code tracks
-      your daily quota so one batchmate can't accidentally burn through the
-      shared LLM budget.
+      CVonRAG is restricted to your batch's Google Workspace. Your sign-in
+      tracks your daily quota so one user can't accidentally burn through the
+      shared LLM budget. Tokens expire after an hour; just sign in again when
+      that happens.
     </p>
   </div>
 
-  <div class="invite-card">
-    <label for="invite-input" class="field-label" style="font-size:0.8125rem;font-weight:600">Invite code</label>
-    <input
-      id="invite-input"
-      type="text"
-      bind:value={inviteInput}
-      placeholder="e.g. AMAN-2K24"
-      class="field mono"
-      autocomplete="off"
-      spellcheck="false"
-      on:keydown={e => { if (e.key === 'Enter') saveInviteCode(); }}
-    />
-    <button
-      class="btn-primary"
-      style="width:100%;padding:0.875rem;margin-top:0.875rem"
-      disabled={!INVITE_CODE_PATTERN.test(inviteInput.trim())}
-      on:click={saveInviteCode}
-    >
-      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-        <path d="M5 12h14M12 5l7 7-7 7"/>
-      </svg>
-      Continue
-    </button>
-    <p class="mono" style="font-size:0.7rem;color:var(--muted);margin-top:0.75rem;text-align:center">
-      Don't have one? Ping <strong>Vybhav</strong> on the PGDBA WhatsApp group.
+  <div class="invite-card" style="display:flex;flex-direction:column;align-items:center;gap:0.875rem">
+    <div bind:this={gsiButtonRef} aria-label="Google sign-in button"></div>
+    {#if gsiError}
+      <p class="mono" style="font-size:0.7rem;color:var(--red);text-align:center">
+        {gsiError}
+      </p>
+    {/if}
+    <p class="mono" style="font-size:0.7rem;color:var(--muted);text-align:center">
+      Trouble signing in? Make sure you're using your institutional Google
+      account (not a personal Gmail).
     </p>
   </div>
 </div>
@@ -892,7 +954,7 @@
 </div>
 {/if}
 
-{/if}  <!-- close invite-gate {:else} from the top of the wizard -->
+{/if}  <!-- close sign-in gate {:else} from the top of the wizard -->
 
 <style>
   /* ── Invite chip + card ─────────────────────────────────────────────── */

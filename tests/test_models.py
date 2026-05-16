@@ -13,7 +13,6 @@ Tests:
 import pytest
 from pydantic import ValidationError
 from typing import Any
-from typing import Any
 
 from app.models import (
     CoreFact,
@@ -23,13 +22,9 @@ from app.models import (
     RoleType,
     JDTone,
     StyleExemplar,
-    ScoredFact,
     BulletDraft,
-    BulletMetadata,
-    GeneratedBullet,
     StreamChunk,
     StreamEventType,
-    HealthResponse,
 )
 
 

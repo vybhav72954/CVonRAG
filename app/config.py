@@ -10,7 +10,7 @@ import logging
 from functools import lru_cache
 from typing import Annotated, Literal
 
-from pydantic import Field, model_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -119,32 +119,53 @@ class Settings(BaseSettings):
     rate_limit_recommend: int = 20    # max /recommend calls per IP per window
     rate_limit_optimize: int = 5      # max /optimize calls per IP per window
 
-    # ── Admin auth ────────────────────────────────────────────────────────────
-    # Set INGEST_SECRET in .env to protect the /ingest and /admin/* endpoints.
-    # Leave blank to allow unauthenticated access (dev only).
+    # ── Admin secret (ingest only) ────────────────────────────────────────────
+    # Used ONLY by /ingest, which is hit by scripts/ingest_pdfs.py (a CLI tool
+    # with no browser, so OAuth doesn't fit). Human-facing admin endpoints
+    # (/admin/usage) authenticate via Google OAuth + ADMIN_EMAILS allowlist
+    # instead. Leave blank to allow unauthenticated /ingest in dev.
     ingest_secret: str = ""
 
-    # ── Invite-code auth ──────────────────────────────────────────────────────
-    # Per-batchmate identity gate on /parse, /recommend, /optimize. Each
-    # batchmate gets a unique code (admin creates via POST /admin/invites).
-    # Code is sent in the X-Invite-Code request header. Per-code daily caps
-    # below stop a single batchmate from exhausting the hosted-LLM quota.
-    # Set INVITE_CODES_REQUIRED=false to disable (dev / tests).
-    invite_codes_required: bool = True
-    # Hard daily cap: after this many /optimize calls in one UTC day, the
-    # invite code returns 429 until 00:00 UTC. 20 is comfortable for normal
-    # iteration, low enough that an accidental refresh loop cannot drain a
-    # day's free-tier hosted-LLM quota.
+    # ── Google Workspace OAuth ────────────────────────────────────────────────
+    # Replaces the prior invite-code gate. Frontend uses Google Identity
+    # Services to obtain a 1-hour ID token and sends it as
+    # `Authorization: Bearer <id_token>` on every gated request.
+    # • google_oauth_client_id — Google Cloud OAuth 2.0 Web Client ID. Empty
+    #   string disables the gate entirely (dev / tests), so require_user()
+    #   returns None and the existing "no auth in tests" pattern keeps working.
+    # • google_oauth_hd — institutional Google Workspace domain to restrict
+    #   sign-in to (the `hd` claim in the verified ID token). Empty string
+    #   accepts any Google account (dev only; never leave empty in prod).
+    # • admin_emails — comma-separated emails allowlisted for /admin/*.
+    google_oauth_client_id: str = ""
+    google_oauth_hd: str = ""
+    admin_emails: list[str] = []
+
+    @field_validator("admin_emails")
+    @classmethod
+    def _normalise_admin_emails(cls, v: list[str]) -> list[str]:
+        """Lower-case + strip each entry so the comparison in
+        `require_admin` is case-insensitive.
+
+        `user.email` is stored lower-cased (see app/auth.py — the email
+        claim from the ID token is normalised before being trusted as
+        identity). If an operator writes `ADMIN_EMAILS=["Admin@Foo.org"]`
+        in .env, without this validator the membership check silently
+        fails and the admin sees a permanent 403 with no diagnostic.
+        Normalising at config-load time fixes the bug once, not per call.
+        """
+        return [e.strip().lower() for e in v if e and e.strip()]
+
+    # Per-user daily cap on /optimize calls. Resets at 00:00 UTC.
     # ge=1 catches a misconfig (MAX_DAILY_OPTIMIZATIONS=0 would make every
     # /optimize call hit `0 < 0` → false → 429 immediately, surfacing as a
     # mysterious runtime issue instead of a clear boot-time failure).
     max_daily_optimizations: Annotated[int, Field(ge=1)] = 20
-    # Bullet-level cap (each /optimize may produce up to total_bullets_requested
-    # bullets, hard-capped to groq_max_bullets_per_request=15 per call).
+    # Per-user daily cap on cumulative bullets generated.
     # 60/day = 3 optimize × 20 bullets, or 20 optimize × 3 bullets — both
-    # reasonable for a batchmate iterating on a single resume.
+    # reasonable for a single user iterating on one resume.
     max_daily_bullets: Annotated[int, Field(ge=1)] = 60
-    # SQLite path for the invite table. Default keeps the DB next to the app
+    # SQLite path for the users table. Default keeps the DB next to the app
     # for local dev; deployments should mount this to a persistent volume.
     sqlite_path: str = "./cvonrag.db"
 
@@ -180,19 +201,84 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def _warn_production_ingest_secret(self) -> "Settings":
-        """
-        Warns if running in production without an ingest secret.
-        
-        If `app_env` is "production" and `ingest_secret` is empty, logs a warning that `/ingest` and `/admin/*` will be unauthenticated to prevent accidental exposure of the deployment. 
-        
-        Returns:
-            Settings: The same `Settings` instance (`self`).
-        """
+        """Warn if /ingest is unauthenticated in production."""
         if self._is_production_env() and not self.ingest_secret:
             logging.getLogger("cvonrag").warning(
-                "INGEST_SECRET is empty in production — /ingest and /admin/* "
-                "are unauthenticated. Set a long random INGEST_SECRET in .env "
+                "INGEST_SECRET is empty in production — /ingest is "
+                "unauthenticated. Set a long random INGEST_SECRET in .env "
                 "before exposing the API to the internet."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _enforce_oauth_consistency(self) -> "Settings":
+        """OAuth must be either fully on or fully off. Reject half-configured.
+
+        Three valid states:
+          • `client_id == ""`  → gate disabled (dev/test bypass).
+          • `client_id == "X"` + `hd == "Y"`  → gate fully enforced.
+          • `client_id == "X"` + `hd == ""`   → REJECTED at boot.
+
+        The half-configured state would silently let any Google account sign
+        in (since the hd check is skipped on empty `google_oauth_hd`). That's
+        fail-open behaviour the operator almost certainly didn't intend.
+        Failing fast at boot is safer than waiting until production traffic
+        exposes the gap. Fires regardless of `APP_ENV` because dev
+        environments are also at risk if accidentally exposed.
+        """
+        if self.google_oauth_client_id and not self.google_oauth_hd:
+            msg = (
+                "GOOGLE_OAUTH_CLIENT_ID is set but GOOGLE_OAUTH_HD is empty. "
+                "Half-configured OAuth silently allows any Google account to "
+                "sign in. Set GOOGLE_OAUTH_HD to your institutional Workspace "
+                "domain, or leave both env vars empty to disable the gate."
+            )
+            logging.getLogger("cvonrag").error(msg)
+            raise RuntimeError(msg)
+        return self
+
+    @model_validator(mode="after")
+    def _enforce_production_oauth(self) -> "Settings":
+        """Fail boot if Google OAuth is misconfigured in production.
+
+        Empty `google_oauth_client_id` leaves the entire user-facing API
+        unauthenticated (`require_user` short-circuits to None for everyone);
+        empty `google_oauth_hd` accepts any Google account, defeating the
+        institutional restriction. Both are silent-data-leak class failures,
+        so a misconfigured prod deploy MUST refuse to start rather than
+        log a warning and serve traffic anyway.
+
+        `admin_emails` empty is only a UX problem (nobody can hit
+        `/admin/usage`), so it stays a warning.
+        """
+        if not self._is_production_env():
+            return self
+        log = logging.getLogger("cvonrag")
+        problems: list[str] = []
+        if not self.google_oauth_client_id:
+            problems.append(
+                "GOOGLE_OAUTH_CLIENT_ID is empty — /parse, /recommend, "
+                "/optimize, /admin/usage would be UNAUTHENTICATED."
+            )
+        if not self.google_oauth_hd:
+            problems.append(
+                "GOOGLE_OAUTH_HD is empty — any Google account could sign in, "
+                "defeating the institutional Workspace restriction."
+            )
+        if problems:
+            msg = (
+                "Refusing to start in production with broken OAuth config. "
+                "Set the missing env vars in .env (or unset APP_ENV=production "
+                "for local testing). Problems:\n  - "
+                + "\n  - ".join(problems)
+            )
+            log.error(msg)
+            raise RuntimeError(msg)
+        if not self.admin_emails:
+            log.warning(
+                "ADMIN_EMAILS is empty in production — /admin/usage will "
+                "reject every request (no allowlisted emails). Add at least "
+                "one admin email."
             )
         return self
 

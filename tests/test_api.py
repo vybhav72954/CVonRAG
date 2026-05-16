@@ -5,7 +5,7 @@ FastAPI endpoint tests via TestClient (no running services needed).
 
 import json
 import pytest
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, patch
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
@@ -503,8 +503,7 @@ class TestParse:
         assert resp.status_code == 413
 
     def test_valid_docx_streams_sse(self, client):
-        from unittest.mock import AsyncMock, patch, MagicMock
-        import json as _json
+        from unittest.mock import patch
 
         async def _mock_stream(file_bytes, filename):
             yield ("progress", {"message": "Found 1 project.", "current": 0, "total": 1})

@@ -66,13 +66,17 @@ const setHelpers = {
   deserialize: (a) => new Set(Array.isArray(a) ? a : []),
 };
 
-// ── Invite code (per-batchmate identity) ─────────────────────────────────────
-// Admin issues one code per batchmate via POST /admin/invites; the code is
-// sent in the X-Invite-Code header by api.js on every gated request. Persisted
-// to sessionStorage so a tab refresh keeps the user "signed in" for the
-// lifetime of the tab. Empty string = no code entered yet (the page shows
-// the invite-entry card in that state).
-export const inviteCode = persistent('inviteCode', '');
+// ── Google OAuth identity ────────────────────────────────────────────────────
+// idToken is the JWT received from Google Identity Services after sign-in
+// (1-hour expiry, no refresh). Sent as `Authorization: Bearer <idToken>` by
+// api.js on every gated request. Persisted to sessionStorage so a tab refresh
+// keeps the user "signed in" until token expiry or tab close — whichever
+// comes first. userEmail is decoded client-side from the JWT payload for
+// display purposes only; the backend re-verifies and trusts only its own
+// decoded email claim. Empty strings = not signed in (the page shows the
+// Google Sign-In card in that state).
+export const idToken   = persistent('idToken', '');
+export const userEmail = persistent('userEmail', '');
 
 // ── Wizard step ───────────────────────────────────────────────────────────────
 /** @type {import('svelte/store').Writable<1|2|3>} */

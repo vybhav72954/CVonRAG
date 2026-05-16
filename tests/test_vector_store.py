@@ -7,7 +7,6 @@ Mocking Qdrant and Ollama HTTP endpoints.
 import pytest
 from unittest.mock import AsyncMock, patch, MagicMock
 import httpx
-from qdrant_client.http.models import Distance, VectorParams
 from qdrant_client import AsyncQdrantClient
 
 from app.vector_store import (
