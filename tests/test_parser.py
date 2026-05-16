@@ -553,6 +553,8 @@ class TestSampleBiodata:
     """
 
     def test_sample_file_exists_and_under_size_cap(self):
+        """Sample ships at the expected path and stays small enough to keep
+        the static-asset bundle (and a user's first download) snappy."""
         assert _SAMPLE_BIODATA_PATH.is_file(), (
             f"Missing shipped sample at {_SAMPLE_BIODATA_PATH}"
         )
@@ -560,6 +562,9 @@ class TestSampleBiodata:
         assert size < 50_000, f"Sample biodata exceeds 50 KB cap: {size} bytes"
 
     def test_sample_biodata_parses_cleanly(self, parsed_sample_biodata):
+        """Sample must parse into ≥4 distinct projects with ≥2 bullets each via
+        the production dispatch (parse_document_bytes). Guards the structural
+        contract a first-time user will see when they upload this file."""
         projects = parsed_sample_biodata
         assert len(projects) >= 4, (
             f"Sample must parse into ≥4 distinct projects, got {len(projects)}"
