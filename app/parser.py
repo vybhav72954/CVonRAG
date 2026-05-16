@@ -26,6 +26,7 @@ import logging
 import re
 from collections.abc import AsyncGenerator
 from dataclasses import dataclass, field
+from typing import Literal
 
 from app.chains import _strip_json_fences as _strip_fences
 from app.config import get_settings
@@ -498,14 +499,37 @@ def parse_pdf_bytes(file_bytes: bytes) -> list[RawProject]:
 # Dispatch
 # ─────────────────────────────────────────────────────────────────────────────
 
-def parse_document_bytes(file_bytes: bytes, filename: str) -> list[RawProject]:
-    """Route to the correct parser based on file extension."""
+def parse_document_bytes(
+    file_bytes: bytes,
+    filename: str,
+    caller: Literal["user", "admin"] = "user",
+) -> list[RawProject]:
+    """Route to the correct parser based on file extension.
+
+    The user upload path (``caller="user"``, default) accepts ``.docx`` only.
+    PDFs from the user path were quality-degraded by design — ``parse_pdf_bytes``
+    is calibrated for the PGDBA CV template (Wingdings markers, two-column
+    layouts, Y-gap clustering), not arbitrary user biodata. Admin / eval
+    callers (``caller="admin"``) keep the original both-formats behavior so
+    ``scripts/ingest_pdfs.py`` and ``scripts/build_eval_set.py`` still work
+    against Gold and held-out CV PDFs.
+    """
     fname = filename.lower()
     if fname.endswith(".docx"):
         return parse_docx_bytes(file_bytes)
     if fname.endswith(".pdf"):
-        return parse_pdf_bytes(file_bytes)
-    raise ValueError(f"Unsupported file type '{filename}'. Use .docx or .pdf")
+        if caller == "admin":
+            return parse_pdf_bytes(file_bytes)
+        raise ValueError(
+            "Only .docx biodata files are supported. "
+            "Please convert your biodata to Word format before uploading."
+        )
+    if caller == "admin":
+        raise ValueError(f"Unsupported file type '{filename}'. Use .docx or .pdf")
+    raise ValueError(
+        "Only .docx biodata files are supported. "
+        "Please convert your biodata to Word format before uploading."
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────

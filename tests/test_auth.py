@@ -55,9 +55,13 @@ RECOMMEND_BODY = {
     "top_k": 1,
 }
 
-# Minimal payload that passes /parse's magic-byte + 100-byte length check.
-_PDF_MAGIC = b"%PDF-1.4\n"
-_VALID_PDF_FILE = ("cv.pdf", _PDF_MAGIC + b"x" * 200, "application/pdf")
+# Minimal payload that passes /parse's docx-only gate + magic-byte +
+# 100-byte length check. 200 bytes of filler keeps it well above the floor.
+# Issue #28 (PR #36) restricted /parse to .docx; a .pdf fixture here would now
+# get 415 BEFORE any auth logic runs, which would no longer exercise the gate.
+_DOCX_MAGIC = b"PK\x03\x04"
+_DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+_VALID_PARSE_FILE = ("cv.docx", _DOCX_MAGIC + b"x" * 200, _DOCX_MIME)
 
 _CLIENT_ID = "test-client-id.apps.googleusercontent.com"
 _HD = "example.org"
@@ -218,13 +222,13 @@ class TestOAuthAuth:
     # ── /parse parity ────────────────────────────────────────────────────────
 
     def test_parse_missing_header_returns_401(self, client, gate_enabled):
-        resp = client.post("/parse", files={"file": _VALID_PDF_FILE})
+        resp = client.post("/parse", files={"file": _VALID_PARSE_FILE})
         assert resp.status_code == 401
 
     def test_parse_valid_token_reaches_handler(self, client, gate_enabled):
         with patch("app.main.parse_and_stream", side_effect=_mock_parse_stream):
             resp = client.post(
-                "/parse", files={"file": _VALID_PDF_FILE},
+                "/parse", files={"file": _VALID_PARSE_FILE},
                 headers=_auth("alice@example.org"),
             )
         assert resp.status_code == 200
@@ -311,7 +315,7 @@ class TestCounterIncrement:
         monkeypatch.setattr(settings, "admin_emails", ["admin@example.org"])
         with patch("app.main.parse_and_stream", side_effect=_mock_parse_stream):
             client.post(
-                "/parse", files={"file": _VALID_PDF_FILE},
+                "/parse", files={"file": _VALID_PARSE_FILE},
                 headers=_auth("alice@example.org"),
             )
         rows = self._usage_for(client, "admin@example.org")
