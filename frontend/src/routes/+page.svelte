@@ -51,21 +51,35 @@
   }
 
   /** Wait for the GIS script (loaded async in app.html) to be ready, then
-   *  initialize and render the sign-in button. Polls briefly because the
-   *  script tag has `async defer` and may not be loaded yet on first mount. */
+   *  initialize and render the sign-in button. Two-tier wait:
+   *    1. Fast poll (30 × 100ms = 3s) — covers the common case where the
+   *       script is already loaded by the time the gate card mounts.
+   *    2. Slower poll (30 × 1s = 30s) — flaky-network fallback. The async
+   *       defer script tag can take noticeably longer to load on slow home
+   *       connections, and giving up after 3s strands the user with an
+   *       error they can't recover from without a page refresh.
+   *  gsiError is only set after the full 33s budget is exhausted, and is
+   *  cleared on a successful retry so a transient slow load doesn't leave
+   *  a stale message visible after the button renders. */
   async function initGoogleSignIn() {
     if (!GOOGLE_CLIENT_ID) {
       gsiError = 'VITE_GOOGLE_OAUTH_CLIENT_ID is not set — sign-in disabled.';
       return;
     }
+    // Tier 1: fast poll.
     for (let i = 0; i < 30; i++) {  // up to ~3s
       if (window.google?.accounts?.id) break;
       await new Promise(r => setTimeout(r, 100));
     }
+    // Tier 2: slower poll for flaky networks.
+    for (let i = 0; i < 30 && !window.google?.accounts?.id; i++) {  // up to +30s
+      await new Promise(r => setTimeout(r, 1000));
+    }
     if (!window.google?.accounts?.id) {
-      gsiError = 'Google sign-in library failed to load. Check your connection or browser settings.';
+      gsiError = 'Google sign-in library failed to load after 30s. Check your network connection or browser settings, then refresh.';
       return;
     }
+    gsiError = '';  // clear any stale slow-load message before we render
     try {
       window.google.accounts.id.initialize({
         client_id: GOOGLE_CLIENT_ID,

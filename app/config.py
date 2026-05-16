@@ -211,29 +211,42 @@ class Settings(BaseSettings):
         return self
 
     @model_validator(mode="after")
-    def _warn_production_oauth(self) -> "Settings":
-        """Warn if Google OAuth is misconfigured in production.
+    def _enforce_production_oauth(self) -> "Settings":
+        """Fail boot if Google OAuth is misconfigured in production.
 
-        In prod, `google_oauth_client_id` and `google_oauth_hd` must both be
-        set. An empty client_id leaves the API wide open (require_user returns
-        None for everyone); an empty hd accepts any Google account, defeating
-        the institutional restriction. Admin endpoints additionally need at
-        least one email in `admin_emails`, otherwise nobody can hit /admin/*.
+        Empty `google_oauth_client_id` leaves the entire user-facing API
+        unauthenticated (`require_user` short-circuits to None for everyone);
+        empty `google_oauth_hd` accepts any Google account, defeating the
+        institutional restriction. Both are silent-data-leak class failures,
+        so a misconfigured prod deploy MUST refuse to start rather than
+        log a warning and serve traffic anyway.
+
+        `admin_emails` empty is only a UX problem (nobody can hit
+        `/admin/usage`), so it stays a warning.
         """
         if not self._is_production_env():
             return self
         log = logging.getLogger("cvonrag")
+        problems: list[str] = []
         if not self.google_oauth_client_id:
-            log.warning(
-                "GOOGLE_OAUTH_CLIENT_ID is empty in production — /parse, "
-                "/recommend, /optimize are UNAUTHENTICATED. Set it before "
-                "exposing the API."
+            problems.append(
+                "GOOGLE_OAUTH_CLIENT_ID is empty — /parse, /recommend, "
+                "/optimize, /admin/usage would be UNAUTHENTICATED."
             )
         if not self.google_oauth_hd:
-            log.warning(
-                "GOOGLE_OAUTH_HD is empty in production — any Google account "
-                "can sign in. Set it to your institutional Workspace domain."
+            problems.append(
+                "GOOGLE_OAUTH_HD is empty — any Google account could sign in, "
+                "defeating the institutional Workspace restriction."
             )
+        if problems:
+            msg = (
+                "Refusing to start in production with broken OAuth config. "
+                "Set the missing env vars in .env (or unset APP_ENV=production "
+                "for local testing). Problems:\n  - "
+                + "\n  - ".join(problems)
+            )
+            log.error(msg)
+            raise RuntimeError(msg)
         if not self.admin_emails:
             log.warning(
                 "ADMIN_EMAILS is empty in production — /admin/usage will "

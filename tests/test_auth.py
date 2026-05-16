@@ -94,6 +94,18 @@ async def _empty_sse():
 
 
 @pytest.fixture
+def anyio_backend():
+    """Force AnyIO-marked tests onto asyncio.
+
+    The TestAtomicCapEnforcement tests use `asyncio.gather` directly, which
+    breaks if AnyIO parameterises onto trio. Today this passes under both
+    backends only because pytest-asyncio in auto mode preempts trio — but
+    that's fragile to a config change, so pin asyncio explicitly here.
+    """
+    return "asyncio"
+
+
+@pytest.fixture
 def client():
     """TestClient that runs lifespan (init_db + cleanup)."""
     with TestClient(app, raise_server_exceptions=True) as c:
@@ -326,6 +338,48 @@ class TestCounterIncrement:
 
 
 # ── Daily caps ────────────────────────────────────────────────────────────────
+
+class TestRateLimitBeforeAuth:
+    """The per-IP rate limiter must run BEFORE require_user — otherwise a
+    429'd request still verifies the JWT, upserts the user row, and bumps
+    the per-user counter, all of which are pure waste for a rejected call.
+    The fix declares _rate_limit() as an earlier FastAPI dep than
+    require_user() in the route signature."""
+
+    def test_rate_limited_request_does_not_increment_counter(
+        self, client, gate_enabled, monkeypatch
+    ):
+        # Allow exactly 1 /recommend per window; make the cap easy to hit.
+        monkeypatch.setattr(settings, "rate_limit_enabled", True)
+        monkeypatch.setattr(settings, "rate_limit_recommend", 1)
+        monkeypatch.setattr(settings, "admin_emails", ["admin@example.org"])
+
+        with patch("app.main._do_recommend", new=AsyncMock(return_value=[])):
+            r1 = client.post(
+                "/recommend", json=RECOMMEND_BODY,
+                headers=_auth("ratelimit@example.org"),
+            )
+            r2 = client.post(
+                "/recommend", json=RECOMMEND_BODY,
+                headers=_auth("ratelimit@example.org"),
+            )
+
+        assert r1.status_code == 200
+        assert r2.status_code == 429
+        assert "Rate limit exceeded" in r2.json()["detail"]
+
+        # require_user must NOT have run on r2 — recommend_count should still
+        # be 1 (the success), not 2. If this regresses, the dep order in
+        # main.py has slipped back to running require_user first.
+        rows = client.get(
+            "/admin/usage", headers=_auth("admin@example.org")
+        ).json()["users"]
+        row = next(u for u in rows if u["email"] == "ratelimit@example.org")
+        assert row["recommend_count"] == 1, (
+            "Rate-limited request bumped recommend_count — _rate_limit dep "
+            "is running AFTER require_user, defeating the whole point."
+        )
+
 
 class TestDailyOptimizeCap:
     def test_third_optimize_returns_429_when_cap_is_2(

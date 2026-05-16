@@ -23,7 +23,7 @@ from datetime import UTC, datetime
 from math import ceil
 
 import httpx
-from fastapi import Depends, FastAPI, File, Header, HTTPException, Request, UploadFile, status
+from fastapi import Body, Depends, FastAPI, File, Header, HTTPException, Request, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
@@ -141,17 +141,7 @@ _limiter = _RateLimiter()
 
 
 async def _rate_check(request: Request, key: str, max_calls: int) -> None:
-    """
-    Enforce per-IP rate limits for an incoming request and raise an HTTP 429 when the caller is over the limit.
-    
-    Parameters:
-    	request (Request): Incoming request used to identify the caller's IP.
-    	key (str): Namespace or bucket name for rate limiting (e.g., "optimize", "parse").
-    	max_calls (int): Maximum allowed calls within the configured rate-limit window.
-    
-    Raises:
-    	HTTPException: 429 Too Many Requests with a `Retry-After` header indicating how many seconds to wait.
-    """
+    """Enforce per-IP rate limits; raise 429 if the caller is over the limit."""
     ip   = request.client.host if request.client else "unknown"
     wait = await _limiter.check(ip, key, max_calls, settings.rate_limit_window)
     if wait is not None:
@@ -160,6 +150,26 @@ async def _rate_check(request: Request, key: str, max_calls: int) -> None:
             detail=f"Rate limit exceeded. Try again in {ceil(wait)}s.",
             headers={"Retry-After": str(ceil(wait))},
         )
+
+
+def _rate_limit(key: str):
+    """FastAPI dep factory: rate-limit a route by IP before any auth runs.
+
+    MUST be declared BEFORE `require_user` in the route signature so a 429
+    short-circuits before the JWT is verified and the per-user counter is
+    incremented. The previous inline `await _rate_check(...)` in the handler
+    body ran AFTER `require_user`, which left a rate-limited caller with an
+    already-bumped counter row.
+
+    settings.rate_limit_<key> is read at request time (via getattr) so
+    monkeypatched test values take effect without a re-import.
+    """
+    cap_attr = f"rate_limit_{key}"
+
+    async def _dep(request: Request) -> None:
+        await _rate_check(request, key, getattr(settings, cap_attr))
+
+    return _dep
 
 
 # ── Admin secret helper ───────────────────────────────────────────────────────
@@ -403,6 +413,7 @@ async def health_check():
 )
 async def parse_cv(
     request: Request,
+    _rl: None = Depends(_rate_limit("parse")),
     file: UploadFile = File(...),
     _user: User | None = Depends(require_user("parse")),
 ):
@@ -418,7 +429,6 @@ async def parse_cv(
     Returns:
         StreamingResponse: A `text/event-stream` response that emits SSE-formatted `StreamChunk` objects for each event.
     """
-    await _rate_check(request, "parse", settings.rate_limit_parse)
     if not file.filename:
         raise HTTPException(status_code=400, detail="No filename provided.")
 
@@ -481,7 +491,8 @@ async def parse_cv(
 )
 async def recommend(
     request: Request,
-    body: RecommendRequest,
+    _rl: None = Depends(_rate_limit("recommend")),
+    body: RecommendRequest = Body(...),
     _user: User | None = Depends(require_user("recommend")),
 ):
     """
@@ -492,7 +503,6 @@ async def recommend(
     Returns:
         RecommendResponse: Contains `recommendations` — a list of scored projects with `recommended` flags and one-line reasoning for each.
     """
-    await _rate_check(request, "recommend", settings.rate_limit_recommend)
     try:
         recs = await _do_recommend(
             projects=body.projects,
@@ -520,7 +530,8 @@ async def recommend(
 )
 async def optimize(
     request: Request,
-    body: OptimizationRequest,
+    _rl: None = Depends(_rate_limit("optimize")),
+    body: OptimizationRequest = Body(...),
     user: User | None = Depends(require_user("optimize")),
     session: AsyncSession = Depends(get_session),
 ):
@@ -537,7 +548,6 @@ async def optimize(
           - `error`: `{ "error_message": "<string>" }` — pipeline or runtime error information.
           - `done`: `{ "data": { "elapsed_seconds": <number> } }` — completion metadata.
     """
-    await _rate_check(request, "optimize", settings.rate_limit_optimize)
     # H3: guard hosted-LLM quota before starting the stream.
     # 429 backoff is handled inside chains.py, but the best defence is not
     # sending 200+ LLM calls in the first place. Applies to whichever hosted
