@@ -319,7 +319,7 @@ GOLD_STANDARD_BULLETS = [
         "sentence_structure": "verb → tool stack → metric → scale",
     },
     {
-        "text": "• Refactored monolith into 8 microservices w/ FastAPI | ↑ deploy frequency 3× & ↓ incident rate by 60%",
+        "text": "• Refactored monolith into 8 microservices w/ FastAPI | ↑ deploy frequency 3x & ↓ incident rate by 60%",
         "role_type": "data_engineering",
         "uses_separator": "|",
         "uses_arrow": True,
