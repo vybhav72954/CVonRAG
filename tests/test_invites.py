@@ -53,10 +53,14 @@ RECOMMEND_BODY = {
     "top_k": 1,
 }
 
-# A minimal payload that passes /parse's magic-byte + 100-byte length check.
-# 200 bytes of filler keeps it well above the 100-byte floor.
-_PDF_MAGIC = b"%PDF-1.4\n"
-_VALID_PDF_FILE = ("cv.pdf", _PDF_MAGIC + b"x" * 200, "application/pdf")
+# A minimal payload that passes /parse's docx-only gate + magic-byte +
+# 100-byte length check. 200 bytes of filler keeps it well above the floor.
+# Switched from .pdf to .docx in issue #28 — /parse now rejects PDFs with 415
+# before any auth/rate-limit logic runs, so the old PDF fixture stopped
+# exercising the invite gate entirely.
+_DOCX_MAGIC = b"PK\x03\x04"
+_DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+_VALID_PARSE_FILE = ("cv.docx", _DOCX_MAGIC + b"x" * 200, _DOCX_MIME)
 
 
 async def _mock_parse_stream(file_bytes, filename):
@@ -171,13 +175,13 @@ class TestInviteAuth:
     # wiring is caught here, not at runtime.
 
     def test_parse_missing_header_returns_401(self, client, gate_enabled):
-        resp = client.post("/parse", files={"file": _VALID_PDF_FILE})
+        resp = client.post("/parse", files={"file": _VALID_PARSE_FILE})
         assert resp.status_code == 401
         assert "X-Invite-Code" in resp.json()["detail"]
 
     def test_parse_unknown_code_returns_401(self, client, gate_enabled):
         resp = client.post(
-            "/parse", files={"file": _VALID_PDF_FILE},
+            "/parse", files={"file": _VALID_PARSE_FILE},
             headers={"X-Invite-Code": "BOGUS-CODE"},
         )
         assert resp.status_code == 401
@@ -187,7 +191,7 @@ class TestInviteAuth:
         _create_invite(client, "PARSE-OK")
         with patch("app.main.parse_and_stream", side_effect=_mock_parse_stream):
             resp = client.post(
-                "/parse", files={"file": _VALID_PDF_FILE},
+                "/parse", files={"file": _VALID_PARSE_FILE},
                 headers={"X-Invite-Code": "PARSE-OK"},
             )
         assert resp.status_code == 200
@@ -202,7 +206,7 @@ class TestInviteAuth:
         _create_invite(client, "PTRIM")
         with patch("app.main.parse_and_stream", side_effect=_mock_parse_stream):
             resp = client.post(
-                "/parse", files={"file": _VALID_PDF_FILE},
+                "/parse", files={"file": _VALID_PARSE_FILE},
                 headers={"X-Invite-Code": " PTRIM "},
             )
         assert resp.status_code == 200
@@ -290,7 +294,7 @@ class TestCounterIncrement:
         _create_invite(client, "PCNT")
         with patch("app.main.parse_and_stream", side_effect=_mock_parse_stream):
             client.post(
-                "/parse", files={"file": _VALID_PDF_FILE},
+                "/parse", files={"file": _VALID_PARSE_FILE},
                 headers={"X-Invite-Code": "PCNT"},
             )
         row = next(

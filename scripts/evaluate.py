@@ -315,7 +315,7 @@ def load_eval_set(path: Path) -> list[dict]:
 async def parse_cv_to_projects(cv_path: Path) -> list[ProjectData]:
     """Run the full parser pipeline (extract bullets → LLM facts) on one CV."""
     file_bytes = cv_path.read_bytes()
-    raw_projects = parse_document_bytes(file_bytes, cv_path.name)
+    raw_projects = parse_document_bytes(file_bytes, cv_path.name, caller="admin")
     if not raw_projects:
         raise RuntimeError(f"Parser produced no projects from {cv_path.name}")
 

@@ -4,7 +4,7 @@ FastAPI application with async SSE streaming.
 
 Endpoints:
   POST /optimize   →  SSE stream (tokens + bullets + metadata)
-  POST /parse      →  SSE stream (parse docx/pdf → structured projects + facts)
+  POST /parse      →  SSE stream (parse .docx biodata → structured projects + facts)
   POST /ingest     →  Admin: seed Qdrant with Gold Standard bullets
   GET  /health     →  Liveness probe
   GET  /           →  Welcome
@@ -264,7 +264,13 @@ _UPLOAD_CHUNK     = 64 * 1024            # 64 KB read chunk
 
 
 def _validate_file_magic(file_bytes: bytes, fname: str) -> bool:
-    """Return True when the file's leading bytes match the declared extension."""
+    """Return True when the file's leading bytes match the declared extension.
+
+    Kept format-agnostic so the same helper can serve admin / eval paths if
+    they ever flow through the request layer. The user upload route (POST
+    /parse) only ever calls this with a ``.docx`` filename — the
+    docx-only gate sits in the route handler above this check.
+    """
     if fname.endswith(".docx"):
         return file_bytes[:4] == _MAGIC_DOCX
     if fname.endswith(".pdf"):
@@ -402,10 +408,16 @@ async def health_check():
 
 # ── Document parsing ──────────────────────────────────────────────────────────
 
+_DOCX_ONLY_ERROR = (
+    "Only .docx biodata files are supported. "
+    "Please convert your biodata to Word format before uploading."
+)
+
+
 @app.post(
     "/parse",
     tags=["parsing"],
-    summary="Parse a .docx or .pdf CV file into structured projects + facts",
+    summary="Parse a .docx biodata file into structured projects + facts",
     status_code=status.HTTP_200_OK,
 )
 async def parse_cv(
@@ -414,14 +426,23 @@ async def parse_cv(
     _invite: Invite | None = Depends(require_invite("parse")),
 ):
     """
-    Stream extraction progress and parsed project data from an uploaded .docx or .pdf CV as Server-Sent Events.
-    
-    Streams SSE `StreamChunk` envelopes describing parsing progress, discovered projects, completion, or errors:
+    Stream extraction progress and parsed project data from an uploaded .docx biodata as Server-Sent Events.
+
+    PDF biodata uploads were removed in issue #28: ``parse_pdf_bytes`` is
+    calibrated for the PGDBA Gold-CV template, not arbitrary user biodata,
+    and accepting PDFs encouraged users to upload an existing polished CV
+    instead of the project-list workflow the app is designed around. PDFs
+    are rejected with 415 + a clear conversion message. The admin Gold-CV
+    seeding path (``scripts/ingest_pdfs.py``) and eval pipeline still parse
+    PDFs via ``parse_document_bytes(..., caller="admin")``.
+
+    Streams SSE `StreamChunk` envelopes describing parsing progress,
+    discovered projects, completion, or errors:
     - `progress`: `{"message", "current", "total"}` — extraction progress update
     - `project`: `{"project": ProjectData, "index", "total"}` — a completed project
     - `done`: `{"total_projects", "total_facts"}` — parsing finished
     - `error`: `null` (see `error_message`) — parse failure
-    
+
     Returns:
         StreamingResponse: A `text/event-stream` response that emits SSE-formatted `StreamChunk` objects for each event.
     """
@@ -430,11 +451,8 @@ async def parse_cv(
         raise HTTPException(status_code=400, detail="No filename provided.")
 
     fname = file.filename.lower()
-    if not (fname.endswith(".docx") or fname.endswith(".pdf")):
-        raise HTTPException(
-            status_code=415,
-            detail="Unsupported file type. Upload a .docx or .pdf file.",
-        )
+    if not fname.endswith(".docx"):
+        raise HTTPException(status_code=415, detail=_DOCX_ONLY_ERROR)
 
     # Cheap pre-check: reject before reading the body when Content-Length is sent.
     declared = request.headers.get("content-length")
@@ -449,12 +467,16 @@ async def parse_cv(
     if len(file_bytes) < 100:
         raise HTTPException(status_code=400, detail="File appears to be empty or corrupt.")
 
+    # Magic-byte sniff: catches a PDF (or anything else) renamed to .docx.
+    # Combined with the extension gate above, no PDF can reach parse_and_stream.
+    if file_bytes[:4] == _MAGIC_PDF:
+        raise HTTPException(status_code=415, detail=_DOCX_ONLY_ERROR)
     if not _validate_file_magic(file_bytes, fname):
         raise HTTPException(
             status_code=415,
             detail=(
                 "File content does not match the declared type. "
-                "Upload a genuine .docx or .pdf — not a renamed file."
+                "Upload a genuine .docx — not a renamed file."
             ),
         )
 

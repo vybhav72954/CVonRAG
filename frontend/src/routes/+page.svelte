@@ -104,15 +104,45 @@
   let dragOver  = false;
   let fileInput;
 
+  // Mirror the backend's docx-only gate (issue #28). Catches PDFs before any
+  // network round-trip so users see a clear local message instead of a 415,
+  // and reproduces the exact backend wording so the experience is uniform
+  // whether the rejection happens locally or server-side.
+  const DOCX_ONLY_MESSAGE =
+    'Only .docx biodata files are supported. ' +
+    'Please convert your biodata to Word format before uploading.';
+
+  function isDocxLike(file) {
+    if (!file) return false;
+    const name = (file.name || '').toLowerCase();
+    return name.endsWith('.docx');
+  }
+
+  function rejectNonDocx() {
+    // Mirror uploadFile()'s success-path reset surface so stale recommendations
+    // from a prior cycle don't survive a rejected re-upload and bleed through
+    // to step 2/3 if the user proceeds with a different file later.
+    resetParse();
+    resetRecommend();
+    parseStatus.set('error');
+    parseError.set(DOCX_ONLY_MESSAGE);
+    if (fileInput) fileInput.value = '';
+    return false;
+  }
+
   function onDrop(e) {
     e.preventDefault(); dragOver = false;
     const f = e.dataTransfer?.files?.[0];
-    if (f) uploadFile(f);
+    if (!f) return;
+    if (!isDocxLike(f)) { rejectNonDocx(); return; }
+    uploadFile(f);
   }
 
   function onFileChange(e) {
     const f = e.target.files?.[0];
-    if (f) uploadFile(f);
+    if (!f) return;
+    if (!isDocxLike(f)) { rejectNonDocx(); return; }
+    uploadFile(f);
   }
 
   async function uploadFile(file) {
@@ -431,8 +461,8 @@
         </svg>
       </div>
       <p class="drop-text">Drop your BioData here or <span class="gradient-text">browse files</span></p>
-      <p class="drop-hint mono">.docx (recommended) or .pdf · max 10 MB</p>
-      <input bind:this={fileInput} type="file" accept=".docx,.pdf" class="hidden" on:change={onFileChange} id="cv-upload" />
+      <p class="drop-hint mono">Word document (.docx) · max 10 MB</p>
+      <input bind:this={fileInput} type="file" accept=".docx" class="hidden" on:change={onFileChange} id="cv-upload" />
     </div>
   </div>
 

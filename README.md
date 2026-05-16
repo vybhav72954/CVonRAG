@@ -27,7 +27,7 @@
 A batchmate uploads a simple biodata `.docx` (project list with brief descriptions — see `docs/Vybhav Chaturvedi_Biodata.docx` for the canonical shape) and pastes a target job description. The system parses their projects, scores each against the JD, retrieves stylistic patterns from a curated Qdrant corpus, and generates polished resume-ready bullets at a target character budget — preserving every number, tool, and outcome from the biodata, while only the sentence structure is borrowed from the Gold Standard exemplars.
 
 ```
-You upload:    your biodata (.docx or .pdf)
+You upload:    your biodata (Word .docx)
                a job description (pasted in browser)
 
 System does:   extracts your projects + facts (tools, metrics, outcome)
