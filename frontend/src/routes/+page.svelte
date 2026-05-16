@@ -261,6 +261,23 @@
         }
       },
     });
+
+    // Safety net: the stream can end without a `done` event in three cases —
+    //   1. backend yields an `error` event then returns (e.g. quota exhausted
+    //      mid-extraction) after at least one project already streamed,
+    //   2. the SSE connection drops after the first project, or
+    //   3. the backend closes the stream cleanly without sending `done`.
+    // In all three, parseStatus stays at 'streaming' indefinitely (the spinner
+    // runs forever and 'Continue to JD' never enables). Reconcile to a
+    // definitive state based on whether anything actually parsed.
+    if (get(parseStatus) === 'streaming') {
+      if (get(parsedProjects).length > 0) {
+        parseStatus.set('done');
+      } else {
+        parseStatus.set('error');
+        parseError.set('Parse ended without producing any projects. Try uploading again.');
+      }
+    }
   }
 
   // ── Fact editing ──────────────────────────────────────────────────────────
