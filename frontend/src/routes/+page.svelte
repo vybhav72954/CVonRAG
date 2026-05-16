@@ -442,7 +442,7 @@
     download="sample-biodata.docx"
     aria-label="Download a sample biodata to see the expected format"
   >
-    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
       <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
       <polyline points="7 10 12 15 17 10"/>
       <line x1="12" y1="15" x2="12" y2="3"/>
@@ -1055,13 +1055,13 @@
   .sample-capsule {
     display: inline-flex;
     align-items: center;
-    gap: 0.5rem;
-    margin: 0.75rem auto 0;
-    padding: 0.45rem 0.95rem;
-    font-size: 0.75rem;
+    gap: 0.7rem;
+    margin: 1.1rem auto 0;
+    padding: 0.7rem 1.4rem;
+    font-size: 0.9rem;
     color: var(--muted);
     background: var(--accent-dim);
-    border: 1px solid rgba(124,58,237,0.18);
+    border: 1px solid rgba(124,58,237,0.22);
     border-radius: 999px;
     text-decoration: none;
     width: fit-content;
