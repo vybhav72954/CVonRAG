@@ -435,6 +435,21 @@
     </div>
   </div>
 
+  <!-- Sample biodata download capsule (issue #29 / closes #7) -->
+  <a
+    class="sample-capsule"
+    href="/sample-biodata.docx"
+    download="sample-biodata.docx"
+    aria-label="Download a sample biodata to see the expected format"
+  >
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+      <polyline points="7 10 12 15 17 10"/>
+      <line x1="12" y1="15" x2="12" y2="3"/>
+    </svg>
+    <span>Not sure what to upload? <strong>Download a sample biodata</strong></span>
+  </a>
+
   {#if $parseStatus === 'error'}
     <div class="error-banner">
       <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -1034,6 +1049,33 @@
     font-size: 0.7rem;
     color: var(--muted);
     text-align: center;
+  }
+
+  /* ── Sample biodata capsule (tertiary CTA below dropzone) ──────────── */
+  .sample-capsule {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.5rem;
+    margin: 0.75rem auto 0;
+    padding: 0.45rem 0.95rem;
+    font-size: 0.75rem;
+    color: var(--muted);
+    background: var(--accent-dim);
+    border: 1px solid rgba(124,58,237,0.18);
+    border-radius: 999px;
+    text-decoration: none;
+    width: fit-content;
+    transition: color 160ms ease, border-color 160ms ease, transform 160ms ease;
+  }
+  .sample-capsule:hover,
+  .sample-capsule:focus-visible {
+    color: var(--accent-light);
+    border-color: rgba(124,58,237,0.45);
+    transform: translateY(-1px);
+  }
+  .sample-capsule strong {
+    color: var(--accent-light);
+    font-weight: 600;
   }
 
   /* ── Parse progress ─────────────────────────────────────────────────── */
