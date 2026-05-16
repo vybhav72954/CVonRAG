@@ -3,6 +3,7 @@
   import { get } from 'svelte/store';
   import { base } from '$app/paths';
   import { parseCV, recommendProjects, optimizeResume, checkHealth, abortInFlight } from '$lib/api';
+  import { SAMPLE_JDS } from '$lib/sampleJDs';
   import {
     step,
     inviteCode,
@@ -194,6 +195,17 @@
   }
 
   // ── Step 2: JD → Recommend → Generate ────────────────────────────────────
+  // Prefill the JD textarea with a role-targeted sample whenever the user
+  // picks a new role (issue #30). "general" is intentionally absent from
+  // SAMPLE_JDS so picking it is a no-op — preserves any custom JD the user
+  // may already have typed. Bind already runs first, so $roleType reflects
+  // the new value, but we read straight from the event target to sidestep
+  // any bind/on:change ordering concerns.
+  function onRoleChange(e) {
+    const sample = SAMPLE_JDS[e.target.value];
+    if (sample) jdText.set(sample);
+  }
+
   async function analyseJD() {
     if ($jdText.length < 50) return;
     resetRecommend();
@@ -657,7 +669,7 @@
     <div class="settings-grid">
       <div>
         <label for="role-select" class="field-label">Role type</label>
-        <select id="role-select" bind:value={$roleType} class="field" style="font-size:0.75rem">
+        <select id="role-select" bind:value={$roleType} on:change={onRoleChange} class="field" style="font-size:0.75rem">
           {#each ROLES as r}<option value={r.value}>{r.label}</option>{/each}
         </select>
       </div>
